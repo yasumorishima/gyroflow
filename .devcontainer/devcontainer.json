@@ -17,6 +17,7 @@
 	// "postCreateCommand": "sudo apt update && just install-deps",
 	"features": {
 		"ghcr.io/devcontainers/features/python:1": {},
-		"ghcr.io/guiyomh/features/just:0": {}
+		"ghcr.io/guiyomh/features/just:0": {},
+		"ghcr.io/devcontainers/features/sshd:1": {}
 	}
 }
