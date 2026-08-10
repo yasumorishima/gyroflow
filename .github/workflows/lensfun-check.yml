@@ -1,0 +1,22 @@
+name: lensfun-import check
+
+# Fork-only verification branch. This workflow must never reach the upstream
+# pull request; it exists because gyroflow has no PR CI to prove the change
+# compiles and its tests pass.
+on:
+  push:
+    branches: [ ci/lensfun-check ]
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo check without the feature
+        run: cargo check --manifest-path src/core/Cargo.toml --no-default-features
+      - name: cargo check with the feature
+        run: cargo check --manifest-path src/core/Cargo.toml --no-default-features --features lensfun-import
+      - name: cargo test
+        run: cargo test --manifest-path src/core/Cargo.toml --no-default-features --features lensfun-import lensfun_import
