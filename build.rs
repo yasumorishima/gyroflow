@@ -20,6 +20,10 @@ fn compile_qml(dir: &str, qt_include_path: &str, qt_library_path: &str) {
         config.flag(f);
     }
 
+    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") && matches!(env::var("CARGO_CFG_TARGET_OS").as_deref(), Ok("ios") | Ok("macos")) {
+        config.flag("-include").flag("arm_acle.h");
+    }
+
     println!("cargo:rerun-if-changed={}", dir);
 
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -90,6 +94,10 @@ fn main() {
 
     for f in env::var("DEP_QT_COMPILE_FLAGS").unwrap().split_terminator(';') {
         config.flag(f);
+    }
+
+    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") && (target_os == "ios" || target_os == "macos") {
+        config.flag("-include").flag("arm_acle.h");
     }
     // config.define("QT_QML_DEBUG", None);
     println!("cargo:rerun-if-changed=src/qt_gpu/qrhi_undistort.cpp");
@@ -192,19 +200,25 @@ fn main() {
 
     match target_os.as_str() {
         "android" => {
-            println!("cargo:rustc-link-search={}/lib/arm64-v8a", std::env::var("FFMPEG_DIR").unwrap());
-            println!("cargo:rustc-link-search={}/lib", std::env::var("FFMPEG_DIR").unwrap());
-            config.include(format!("{}/include", std::env::var("FFMPEG_DIR").unwrap()));
+            if let Ok(ffmpeg_dir) = std::env::var("FFMPEG_DIR") && !ffmpeg_dir.is_empty() {
+                println!("cargo:rustc-link-search={ffmpeg_dir}/lib/arm64-v8a");
+                println!("cargo:rustc-link-search={ffmpeg_dir}/lib");
+                config.include(format!("{ffmpeg_dir}/include"));
+            }
         },
         "macos" | "ios" => {
-            println!("cargo:rustc-link-search={}/lib", std::env::var("FFMPEG_DIR").unwrap());
+            if let Ok(ffmpeg_dir) = std::env::var("FFMPEG_DIR") && !ffmpeg_dir.is_empty() {
+                println!("cargo:rustc-link-search={ffmpeg_dir}/lib");
+            }
             println!("cargo:rustc-link-lib=static:+whole-archive=x264");
             println!("cargo:rustc-link-lib=static=x265");
         },
         "linux" => {
             println!("cargo:rustc-link-search={}", std::env::var("OPENCV_LINK_PATHS").unwrap());
-            println!("cargo:rustc-link-search={}/lib/{}", std::env::var("FFMPEG_DIR").unwrap(), std::env::var("FFMPEG_ARCH").unwrap_or("amd64".into()));
-            println!("cargo:rustc-link-search={}/lib", std::env::var("FFMPEG_DIR").unwrap());
+            if let Ok(ffmpeg_dir) = std::env::var("FFMPEG_DIR") && !ffmpeg_dir.is_empty() {
+                println!("cargo:rustc-link-search={ffmpeg_dir}/lib/{}", std::env::var("FFMPEG_ARCH").unwrap_or("amd64".into()));
+                println!("cargo:rustc-link-search={ffmpeg_dir}/lib");
+            }
             println!("cargo:rustc-link-lib=static:+whole-archive=z");
             if std::env::var("OPENCV_LINK_PATHS").unwrap_or_default().contains("vcpkg") {
                 std::env::var("OPENCV_LINK_LIBS").unwrap().split(',').for_each(|lib| println!("cargo:rustc-link-lib=static:+whole-archive={}", lib.trim()));
@@ -216,8 +230,10 @@ fn main() {
             println!("cargo:rustc-link-arg=/EXPORT:NvOptimusEnablement");
             println!("cargo:rustc-link-arg=/EXPORT:AmdPowerXpressRequestHighPerformance");
             println!("cargo:rustc-link-search={}", std::env::var("OPENCV_LINK_PATHS").unwrap());
-            println!("cargo:rustc-link-search={}\\lib\\{}", std::env::var("FFMPEG_DIR").unwrap(), std::env::var("FFMPEG_ARCH").unwrap_or("x64".into()));
-            println!("cargo:rustc-link-search={}\\lib", std::env::var("FFMPEG_DIR").unwrap());
+            if let Ok(ffmpeg_dir) = std::env::var("FFMPEG_DIR") && !ffmpeg_dir.is_empty() {
+                println!("cargo:rustc-link-search={ffmpeg_dir}\\lib\\{}", std::env::var("FFMPEG_ARCH").unwrap_or("x64".into()));
+                println!("cargo:rustc-link-search={ffmpeg_dir}\\lib");
+            }
             let mut res = winres::WindowsResource::new();
             res.set_icon("resources/app_icon.ico");
             res.set("FileVersion", env!("CARGO_PKG_VERSION"));
@@ -227,6 +243,12 @@ fn main() {
             res.compile().unwrap();
         }
         tos => panic!("unknown target os {:?}!", tos)
+    }
+
+    if let Ok(link_paths) = std::env::var("EXTRA_LINK_PATHS") && !link_paths.is_empty() {
+        for dir in link_paths.split(';') {
+            println!("cargo:rustc-link-search={dir}");
+        }
     }
 
     if let Ok(time) = std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH) {
