@@ -1,0 +1,17 @@
+[package]
+name = "gmflow-burn022"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone: not part of the gyroflow workspace.
+[workspace]
+
+[dependencies]
+burn = { version = "=0.22.0", default-features = false, features = ["flex", "std", "store"] }
+
+[build-dependencies]
+burn-onnx = "=0.22.0"
+
+[profile.release]
+debug = false

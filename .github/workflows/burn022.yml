@@ -1,0 +1,104 @@
+# Work branch only (never part of #1143): checks whether gmflow can move from burn 0.21.0-pre.3 to
+# burn 0.22 by regenerating the ONNX and comparing burn 0.21 and 0.22 against PyTorch.
+name: burn 0.22 check
+
+on:
+  push:
+    branches: ['wip/burn-022']
+    paths: ['ci-burn022/**', '.github/workflows/burn022.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: burn022
+  cancel-in-progress: true
+
+env:
+  PTH_URL: https://s3.eu-central-1.amazonaws.com/avg-projects/unimatch/pretrained/gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth
+  UNIMATCH_SHA: da140fa
+  BPK_URL: https://github.com/yasumorishima/gyroflow-models/releases/download/v1.0.0/gmflow-scale2-regrefine6-320x576-opset16-sim.bpk
+  BPK_SHA256: 31feee698842928715e9ba693b69a492d85ace31c646df6f3eabd53e240cd5e9
+  CARGO_TERM_COLOR: never
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    defaults:
+      run:
+        working-directory: ci-burn022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            ci-burn022
+            .github
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Python packages
+        run: |
+          pip install --quiet torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet numpy==1.26.4 onnx==1.16.2 onnxsim==0.4.36 onnxruntime==1.19.2
+
+      - name: Regenerate the ONNX and the PyTorch reference
+        run: |
+          git clone -q https://github.com/AdrianEddy/unimatch.git unimatch
+          git -C unimatch checkout -q "$UNIMATCH_SHA"
+          curl -fsSL --retry 3 -o gmflow.pth "$PTH_URL"
+          python export_onnx.py gmflow.pth unimatch
+          ls -la *.onnx *.f32
+
+      - name: Published weights
+        run: |
+          curl -fsSL --retry 3 -o published.bpk "$BPK_URL"
+          echo "$BPK_SHA256  published.bpk" | sha256sum -c -
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: burn 0.21.0-pre.3 (what #1143 ships)
+        id: old
+        continue-on-error: true
+        working-directory: ci-burn022/old
+        env:
+          GMFLOW_ONNX: ${{ github.workspace }}/ci-burn022/gmflow-scale2-regrefine6-320x576-opset16-sim.onnx
+        run: |
+          cargo build --release
+          ./target/release/gmflow-burn021 ../published.bpk ../in0.f32 ../in1.f32 ../old_published.f32
+
+      - name: burn 0.22 build
+        id: newbuild
+        continue-on-error: true
+        working-directory: ci-burn022/new
+        env:
+          GMFLOW_ONNX: ${{ github.workspace }}/ci-burn022/gmflow-scale2-regrefine6-320x576-opset16-sim.onnx
+        run: cargo build --release
+
+      - name: burn 0.22 with the published .bpk
+        id: newpub
+        if: steps.newbuild.outcome == 'success'
+        continue-on-error: true
+        working-directory: ci-burn022/new
+        run: ./target/release/gmflow-burn022 published ../published.bpk ../in0.f32 ../in1.f32 ../new_published.f32
+
+      - name: burn 0.22 with its own regenerated .bpk
+        id: newgen
+        if: steps.newbuild.outcome == 'success'
+        continue-on-error: true
+        working-directory: ci-burn022/new
+        run: ./target/release/gmflow-burn022 generated - ../in0.f32 ../in1.f32 ../new_generated.f32
+
+      - name: Compare
+        if: always()
+        run: |
+          python compare.py
+          echo "old=${{ steps.old.outcome }} newbuild=${{ steps.newbuild.outcome }} newpub=${{ steps.newpub.outcome }} newgen=${{ steps.newgen.outcome }}"
+          ls -la new/target/release/build/*/out/model/ 2>/dev/null | head || true
