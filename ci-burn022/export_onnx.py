@@ -75,3 +75,20 @@ got.astype(np.float32).tofile("ort_flow.f32")
 d = np.abs(got - ref)
 print("ort vs torch: max %.6f mean %.2e p99 %.2e" % (d.max(), d.mean(), np.quantile(d, 0.99)))
 print("onnx nodes", len(sim.graph.node), "initializers", len(sim.graph.initializer))
+
+
+def high_rank(model, tag):
+    """List nodes whose output rank is above 6 (burn's NdArray backend stops at 6 dimensions)."""
+    inf = onnx.shape_inference.infer_shapes(model)
+    rank = {v.name: len(v.type.tensor_type.shape.dim) for v in
+            list(inf.graph.value_info) + list(inf.graph.output) + list(inf.graph.input)
+            if v.type.tensor_type.HasField("shape")}
+    hits = [(n.op_type, n.name, o, rank[o]) for n in inf.graph.node for o in n.output if rank.get(o, 0) > 6]
+    print(f"{tag}: {len(hits)} node outputs with rank > 6")
+    for h in hits[:20]:
+        print("   ", h)
+    return hits
+
+
+high_rank(onnx.load("raw.onnx"), "raw ONNX")
+high_rank(sim, "simplified ONNX")

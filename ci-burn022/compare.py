@@ -31,3 +31,6 @@ text = "\n".join(rows) + "\n\nTrue flow of the synthetic pair: dx = +4, dy = 0.\
 print(text)
 with open(os.environ.get("GITHUB_STEP_SUMMARY", "summary.md"), "a") as fh:
     fh.write(text)
+bad = [f for f, v in status.items() if not isinstance(v, float)]
+if bad:
+    raise SystemExit(f"no usable output from: {bad}")
