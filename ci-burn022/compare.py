@@ -31,6 +31,14 @@ text = "\n".join(rows) + "\n\nTrue flow of the synthetic pair: dx = +4, dy = 0.\
 print(text)
 with open(os.environ.get("GITHUB_STEP_SUMMARY", "summary.md"), "a") as fh:
     fh.write(text)
-bad = [f for f, v in status.items() if not isinstance(v, float)]
+# burn 0.21 + NdArray is expected to fail (7-D reshape); it is reported, not required.
+required = ["ort_flow.f32", "new_published.f32", "new_generated.f32"]
+bad = [f for f in required if not isinstance(status.get(f), float)]
 if bad:
     raise SystemExit(f"no usable output from: {bad}")
+ref_dx = float(np.median(ref.reshape(1, 2, 320, 576)[0, 0]))
+for f in required:
+    x = np.fromfile(f, dtype="<f4").reshape(1, 2, 320, 576)
+    if status[f] >= 1e-3 or abs(float(np.median(x[0, 0])) - ref_dx) >= 0.05:
+        raise SystemExit(f"{f} is not close to PyTorch: mean diff {status[f]:.2e}, median dx {np.median(x[0, 0]):.4f}")
+print("all required outputs match PyTorch (mean diff < 1e-3, median dx within 0.05)")

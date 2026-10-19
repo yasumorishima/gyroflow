@@ -5,7 +5,7 @@ name: burn 0.22 check
 on:
   push:
     branches: ['wip/burn-022']
-    paths: ['ci-burn022/**', '.github/workflows/burn022.yml']
+    paths: ['ci-burn022/**', '.github/workflows/burn022.yml', 'src/core/**']
   workflow_dispatch:
 
 permissions:
@@ -31,10 +31,6 @@ jobs:
         working-directory: ci-burn022
     steps:
       - uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            ci-burn022
-            .github
 
       - uses: actions/setup-python@v5
         with:
@@ -96,9 +92,22 @@ jobs:
         working-directory: ci-burn022/new
         run: ./target/release/gmflow-burn022 generated - ../in0.f32 ../in1.f32 ../new_generated.f32
 
+      # gyroflow-core itself, ported to burn 0.22, with the regenerated ONNX where build.rs expects it.
+      - name: gyroflow-core with use-burn (check, and gmflow's own known-shift test)
+        id: core
+        continue-on-error: true
+        working-directory: src/core
+        run: |
+          mkdir -p ../../resources/gmflow
+          cp ../../ci-burn022/gmflow-scale2-regrefine6-320x576-opset16-sim.onnx ../../resources/gmflow/
+          cargo check
+          cargo test --release --features use-burn gmflow -- --ignored --nocapture
+          git -C ../.. diff --stat -- src/core/Cargo.lock Cargo.lock
+
       - name: Compare
         if: always()
         run: |
           python compare.py
-          echo "old=${{ steps.old.outcome }} newbuild=${{ steps.newbuild.outcome }} newpub=${{ steps.newpub.outcome }} newgen=${{ steps.newgen.outcome }}"
+          echo "old=${{ steps.old.outcome }} newbuild=${{ steps.newbuild.outcome }} newpub=${{ steps.newpub.outcome }} newgen=${{ steps.newgen.outcome }} core=${{ steps.core.outcome }}"
+          test "${{ steps.core.outcome }}" = success
           ls -la new/target/release/build/*/out/model/ 2>/dev/null | head || true

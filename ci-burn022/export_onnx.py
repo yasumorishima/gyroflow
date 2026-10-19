@@ -49,7 +49,7 @@ base = rng.random((H + 8, W + SHIFT + 8)).astype(np.float64)
 for _ in range(3):  # smooth so the texture has structure at several scales
     base = (base + np.roll(base, 1, 0) + np.roll(base, -1, 0) + np.roll(base, 1, 1) + np.roll(base, -1, 1)) / 5
 base = base[4:4 + H, 4:4 + W + SHIFT]
-base = (base - base.min()) / (base.max() - base.min()) * 255.0
+base = np.round((base - base.min()) / (base.max() - base.min()) * 255.0)  # integer 0-255, like gmflow.rs
 img0 = base[:, SHIFT:SHIFT + W]
 img1 = base[:, 0:W]
 t0 = torch.from_numpy(np.repeat(img0[None, None], 3, 1).astype(np.float32))
