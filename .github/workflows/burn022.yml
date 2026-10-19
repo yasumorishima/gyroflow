@@ -104,6 +104,25 @@ jobs:
           cargo test --release --features use-burn gmflow -- --ignored --nocapture
           git -C ../.. diff --stat -- src/core/Cargo.lock Cargo.lock
 
+      # The root workspace locks gyroflow-core's optional burn deps too; resolve it without building.
+      - name: Resolve the root lockfile
+        id: rootlock
+        if: steps.core.outcome == 'success'
+        working-directory: .
+        run: |
+          cargo metadata --format-version 1 > /dev/null
+          git diff --stat -- Cargo.lock src/core/Cargo.lock
+
+      - name: Lockfiles for the PR commit
+        if: steps.rootlock.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lockfiles
+          retention-days: 3
+          path: |
+            Cargo.lock
+            src/core/Cargo.lock
+
       - name: Compare
         if: always()
         run: |
