@@ -1,0 +1,50 @@
+# Work branch only (never part of #1143): measures and checks gmflow for GPU-only inference.
+name: gmflow gpu-only
+
+on:
+  push:
+    branches: [wip/gpu-only]
+    paths: [ci-gpu/**, .github/workflows/gpuonly.yml, src/core/**, Cargo.toml, Cargo.lock]
+  workflow_dispatch:
+    inputs:
+      memo:
+        description: why this run
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpuonly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PTH_URL: https://s3.eu-central-1.amazonaws.com/avg-projects/unimatch/pretrained/gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth
+  UNIMATCH_SHA: da140fa
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: ci-gpu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: 3.11
+      - name: Python packages
+        run: |
+          pip install --quiet torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet numpy==1.26.4 onnx==1.16.2 onnxsim==0.4.36 onnxruntime==1.19.2
+      - name: Export the ONNX as #1143 builds it
+        run: |
+          git clone -q https://github.com/AdrianEddy/unimatch.git unimatch
+          git -C unimatch checkout -q "$UNIMATCH_SHA"
+          curl -fsSL --retry 3 -o gmflow.pth "$PTH_URL"
+          python export_onnx.py gmflow.pth unimatch
+      - name: Big intermediate tensors (raw and simplified)
+        run: |
+          python profile_onnx.py raw.onnx 16
+          python profile_onnx.py gmflow-scale2-regrefine6-320x576-opset16-sim.onnx 16
