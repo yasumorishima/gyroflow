@@ -1,18 +1,19 @@
-# Work branch only (never part of #1143): checks whether gmflow can move from burn 0.21.0-pre.3 to
-# burn 0.22 by regenerating the ONNX and comparing burn 0.21 and 0.22 against PyTorch.
+# Work branch only (never part of #1143): runs gmflow on burn 0.22's wgpu path (Mesa lavapipe, the
+# software Vulkan driver, since runners have no GPU) and on flex, and compares both with PyTorch.
+# The burn 0.21 -> 0.22 move itself was settled by run 39232499330 (the steps for it were removed).
 name: burn 0.22 check
 
 on:
   push:
-    branches: ['wip/burn-022']
-    paths: ['ci-burn022/**', '.github/workflows/burn022.yml', 'src/core/**']
+    branches: ['wip/burn-022', 'ccr-612a9450-yr0djw']
+    paths: ['ci-burn022/**', '.github/workflows/burn022.yml', 'src/core/**', 'Cargo.toml', 'Cargo.lock']
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: burn022
+  group: burn022-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -25,7 +26,7 @@ env:
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 340
     defaults:
       run:
         working-directory: ci-burn022
@@ -60,73 +61,95 @@ jobs:
           rustup default stable
           rustc --version
 
-      - name: burn 0.21.0-pre.3 (what #1143 ships)
-        id: old
-        continue-on-error: true
-        working-directory: ci-burn022/old
-        env:
-          GMFLOW_ONNX: ${{ github.workspace }}/ci-burn022/gmflow-scale2-regrefine6-320x576-opset16-sim.onnx
+      - name: Software Vulkan (lavapipe)
         run: |
-          cargo build --release
-          ./target/release/gmflow-burn021 ../published.bpk ../in0.f32 ../in1.f32 ../old_published.f32
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mesa-vulkan-drivers libvulkan1 vulkan-tools > /dev/null
+          vulkaninfo --summary | sed -n '/Devices:/,$p'
 
-      - name: burn 0.22 build
+      - name: burn 0.22 build (flex + wgpu)
         id: newbuild
-        continue-on-error: true
         working-directory: ci-burn022/new
         env:
           GMFLOW_ONNX: ${{ github.workspace }}/ci-burn022/gmflow-scale2-regrefine6-320x576-opset16-sim.onnx
-        run: cargo build --release
+        run: time cargo build --release
 
-      - name: burn 0.22 with the published .bpk
+      - name: burn 0.22 flex, published .bpk
         id: newpub
-        if: steps.newbuild.outcome == 'success'
         continue-on-error: true
         working-directory: ci-burn022/new
         run: ./target/release/gmflow-burn022 published ../published.bpk ../in0.f32 ../in1.f32 ../new_published.f32
 
-      - name: burn 0.22 with its own regenerated .bpk
-        id: newgen
-        if: steps.newbuild.outcome == 'success'
+      # lavapipe caps a storage buffer at 128 MiB (maxStorageBufferRange, the Vulkan minimum) and
+      # gmflow's global matching needs one of 456 MiB, so on Mesa 25.2 this stops with
+      # "can't allocate buffer of size: 477757440". That is accepted (and checked for); if a later
+      # lavapipe can run it, its output must match PyTorch like the others.
+      - name: burn 0.22 wgpu on lavapipe, published .bpk
+        id: newgpu
         continue-on-error: true
+        timeout-minutes: 120
         working-directory: ci-burn022/new
-        run: ./target/release/gmflow-burn022 generated - ../in0.f32 ../in1.f32 ../new_generated.f32
+        env:
+          GMFLOW_DEVICE: gpu
+        run: |
+          if ./target/release/gmflow-burn022 published ../published.bpk ../in0.f32 ../in1.f32 ../new_gpu.f32 2> err.log; then
+            cat err.log
+            echo "ran=1" >> "$GITHUB_OUTPUT"
+          else
+            tail -n 5 err.log
+            grep -q "can't allocate buffer of size" err.log
+            echo "::notice::lavapipe cannot hold gmflow's largest buffer; the GPU output is not compared on this runner"
+          fi
 
-      # gyroflow-core itself, ported to burn 0.22, with the regenerated ONNX where build.rs expects it.
-      - name: gyroflow-core with use-burn (check, and gmflow's own known-shift test)
-        id: core
+      - name: Compare with PyTorch
+        id: compare
+        continue-on-error: true
+        env:
+          REQUIRED: ort_flow.f32 new_published.f32 ${{ steps.newgpu.outputs.ran == '1' && 'new_gpu.f32' || '' }}
+        run: python compare.py
+
+      # gyroflow-core itself, with the regenerated ONNX where build.rs expects it. The known-shift
+      # test runs three ways: forced GPU (lavapipe: picked, then out of buffer room, so the pair
+      # must be redone on flex and still be right), forced CPU, and automatic, which must not take
+      # a software adapter and so has to land on flex here.
+      - name: gyroflow-core builds without the GPU feature
+        id: corecpu
         continue-on-error: true
         working-directory: src/core
         run: |
           mkdir -p ../../resources/gmflow
           cp ../../ci-burn022/gmflow-scale2-regrefine6-320x576-opset16-sim.onnx ../../resources/gmflow/
-          cargo check
-          cargo test --release --features use-burn gmflow -- --ignored --nocapture
-          git -C ../.. diff --stat -- src/core/Cargo.lock Cargo.lock
+          cargo check --locked
+          cargo check --locked --features use-burn
 
-      # The root workspace locks gyroflow-core's optional burn deps too; resolve it without building.
-      - name: Resolve the root lockfile
-        id: rootlock
-        if: steps.core.outcome == 'success'
-        working-directory: .
+      - name: gyroflow-core use-burn-gpu, gmflow test on the GPU (lavapipe)
+        id: coregpu
+        continue-on-error: true
+        timeout-minutes: 150
+        working-directory: src/core
+        env:
+          GYROFLOW_GMFLOW_DEVICE: gpu
         run: |
-          cargo metadata --format-version 1 > /dev/null
-          git diff --stat -- Cargo.lock src/core/Cargo.lock
+          set -o pipefail
+          time cargo test --locked --release --features use-burn-gpu gmflow -- --ignored --nocapture | tee gpu.log
+          grep -E 'gmflow device: (flex \(CPU\) after )?wgpu: llvmpipe' gpu.log
 
-      - name: Lockfiles for the PR commit
-        if: steps.rootlock.outcome == 'success'
-        uses: actions/upload-artifact@v4
-        with:
-          name: lockfiles
-          retention-days: 3
-          path: |
-            Cargo.lock
-            src/core/Cargo.lock
+      - name: gyroflow-core use-burn-gpu, gmflow test forced to the CPU, then automatic
+        id: corefallback
+        continue-on-error: true
+        timeout-minutes: 60
+        working-directory: src/core
+        run: |
+          set -o pipefail
+          GYROFLOW_GMFLOW_DEVICE=cpu cargo test --locked --release --features use-burn-gpu gmflow -- --ignored --nocapture
+          cargo test --locked --release --features use-burn-gpu gmflow -- --ignored --nocapture | tee auto.log
+          grep -qx 'gmflow device: flex (CPU)' auto.log
 
-      - name: Compare
+      - name: Result
         if: always()
         run: |
-          python compare.py
-          echo "old=${{ steps.old.outcome }} newbuild=${{ steps.newbuild.outcome }} newpub=${{ steps.newpub.outcome }} newgen=${{ steps.newgen.outcome }} core=${{ steps.core.outcome }}"
-          test "${{ steps.core.outcome }}" = success
-          ls -la new/target/release/build/*/out/model/ 2>/dev/null | head || true
+          echo "newpub=${{ steps.newpub.outcome }} newgpu=${{ steps.newgpu.outcome }} compare=${{ steps.compare.outcome }} corecpu=${{ steps.corecpu.outcome }} coregpu=${{ steps.coregpu.outcome }} corefallback=${{ steps.corefallback.outcome }}"
+          test "${{ steps.compare.outcome }}" = success
+          test "${{ steps.corecpu.outcome }}" = success
+          test "${{ steps.coregpu.outcome }}" = success
+          test "${{ steps.corefallback.outcome }}" = success

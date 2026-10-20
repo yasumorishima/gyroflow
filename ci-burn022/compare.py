@@ -12,7 +12,8 @@ status = {}
 for name, f in [("torch (reference)", "torch_flow.f32"), ("onnxruntime", "ort_flow.f32"),
                 ("burn 0.21, published .bpk", "old_published.f32"),
                 ("burn 0.22, published .bpk", "new_published.f32"),
-                ("burn 0.22, regenerated .bpk", "new_generated.f32")]:
+                ("burn 0.22, regenerated .bpk", "new_generated.f32"),
+                ("burn 0.22 wgpu (lavapipe), published .bpk", "new_gpu.f32")]:
     if not os.path.exists(f):
         rows.append(f"| {name} | missing | | | | |")
         status[f] = "missing"
@@ -31,8 +32,8 @@ text = "\n".join(rows) + "\n\nTrue flow of the synthetic pair: dx = +4, dy = 0.\
 print(text)
 with open(os.environ.get("GITHUB_STEP_SUMMARY", "summary.md"), "a") as fh:
     fh.write(text)
-# burn 0.21 + NdArray is expected to fail (7-D reshape); it is reported, not required.
-required = ["ort_flow.f32", "new_published.f32", "new_generated.f32"]
+# Only what this run builds is required (REQUIRED, space-separated); the rest is reported if present.
+required = os.environ.get("REQUIRED", "ort_flow.f32 new_published.f32 new_generated.f32").split()
 bad = [f for f in required if not isinstance(status.get(f), float)]
 if bad:
     raise SystemExit(f"no usable output from: {bad}")

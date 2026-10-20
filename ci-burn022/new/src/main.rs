@@ -1,5 +1,5 @@
 // burn 0.22: run the regenerated model and write the flow.
-// usage: gmflow-burn022 <published|generated> <weights.bpk or -> <in0.f32> <in1.f32> <out.f32>
+// usage: [GMFLOW_DEVICE=gpu] gmflow-burn022 <published|generated> <weights.bpk or -> <in0.f32> <in1.f32> <out.f32>
 //   published: load the .bpk #1143 downloads today (made with burn-onnx 0.21.0-pre.3) via from_bytes
 //   generated: load the .bpk burn-onnx 0.22 wrote at build time (Model::default)
 use burn::tensor::{Bytes, Device, Tensor, TensorData};
@@ -19,7 +19,15 @@ fn read_f32(p: &str) -> Vec<f32> {
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     assert_eq!(a.len(), 6, "usage: <published|generated> <weights.bpk|-> <in0.f32> <in1.f32> <out.f32>");
-    let device = Device::flex();
+    // GMFLOW_DEVICE=gpu runs on wgpu's default adapter (lavapipe on CI); anything else on flex.
+    let device = if std::env::var("GMFLOW_DEVICE").as_deref() == Ok("gpu") {
+        let (d, setup) = Device::wgpu_options().init_with_setup().expect("wgpu init");
+        let i = setup.adapter.get_info();
+        eprintln!("wgpu adapter: {} ({:?}, {:?}), driver {} {}", i.name, i.device_type, i.backend, i.driver, i.driver_info);
+        d
+    } else {
+        Device::flex()
+    };
     let m = match a[1].as_str() {
         "published" => {
             let bytes = Bytes::from_bytes_vec(std::fs::read(&a[2]).expect("read weights"));

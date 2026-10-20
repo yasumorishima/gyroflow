@@ -38,3 +38,12 @@
 ## 参考
 - burn 0.22：CPU は `flex`（次元の上限なし）、GPU は `wgpu`／`vulkan`／`metal`／`cuda` の各 feature。
 - 生成モデルは `LoadStrategy::Bytes`。重みは `Model::new` → `BurnpackStore::from_bytes` → `load_from` で読み、失敗は log を出して None を返す。
+
+## 進捗（2026-10-20・クラウド）
+- 作業ブランチは `ccr-612a9450-yr0djw`（`wip/burn-022` の先頭から）。release.yml は `ccr-*` も push 対象外にした（CI 用 commit）。
+- 手順 1：wgpu の重複なし（burn 0.22 → cubecl-wgpu 0.11 → wgpu ^30、gyroflow-core も 30）。ただし burn の `wgpu` で依存が 373 → 524 個（+151。cubecl、オートチューン保存用の DB turso、nvml など。burn 内部の既定設定なので gyroflow 側では外せない）。burn 部分の release ビルドは flex のみ 165 秒 → +wgpu 652 秒（4 コア）。→ 別 feature `use-burn-gpu`（上位は `ai-optical-flow-gpu`）にした。
+- 手順 2：PR 用 commit（`gmflow: run on the GPU ...`、author 指定・trailer なし）。独立 GPU → 内蔵 GPU → flex。ソフトウェア GPU は自動では選ばない。`GYROFLOW_GMFLOW_DEVICE=cpu|gpu` で上書き。GPU の無い環境で flex に戻ることは確認済み。監査（opus）の指摘で、推論中に GPU が失敗（シェーダ・デバイス喪失・メモリ不足の error / panic）したら GPU を止めて CPU で同じ組を計算し直すようにした。device_name はテスト専用、テストの環境変数は大文字小文字を区別しない。
+- 手順 3：burn022.yml を GPU 確認用に縮めた（burn 0.21 比較は削除）。lavapipe で wgpu 経路を PyTorch と比較、core のテストを gpu / cpu / 自動の 3 通り。CI は `--locked`、ブランチごとの concurrency。結果待ち。
+- CI run 39346645161 で判明：lavapipe（Mesa 25.2.8）は 1 バッファ 128 MiB まで（maxStorageBufferRange、Vulkan の最低値）。gmflow の大域マッチングは 456 MiB（477,757,440 バイト）の 1 バッファが要るので、lavapipe では GPU 経路が最後まで走らない。実 GPU は普通 1〜4 GiB なので収まるはずだが、**実 GPU での数値（PyTorch との一致）と速度は未確認**。
+- そのため CI の期待を変更：単体バイナリは「完走して PyTorch と一致」か「この容量エラーで止まる」のどちらか。core のテストは「GPU が選ばれ → 容量で失敗 → CPU でやり直して正しい値」を確認。
+- クラウド環境にも lavapipe と Python 3.11（uv）を入れ、ONNX 生成・core のビルド・3 通りのテストをローカルで通した（gpu 53 秒：失敗まで約 30 秒＋CPU、cpu 23 秒、自動 24 秒。いずれも median dx 3.977）。アプリ内のモデル取得はクラウドの proxy で失敗するので、キャッシュ（~/.local/share/Gyroflow/ai_models）に手で置いた。

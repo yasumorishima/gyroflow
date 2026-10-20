@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    branches-ignore: ['wip/**']  # work branches build only what they test
+    branches-ignore: ['wip/**', 'ccr-*']  # work branches build only what they test
   pull_request:
   workflow_dispatch:
 
