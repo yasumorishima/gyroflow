@@ -47,3 +47,4 @@
 - CI run 39346645161 で判明：lavapipe（Mesa 25.2.8）は 1 バッファ 128 MiB まで（maxStorageBufferRange、Vulkan の最低値）。gmflow の大域マッチングは 456 MiB（477,757,440 バイト）の 1 バッファが要るので、lavapipe では GPU 経路が最後まで走らない。実 GPU は普通 1〜4 GiB なので収まるはずだが、**実 GPU での数値（PyTorch との一致）と速度は未確認**。
 - そのため CI の期待を変更：単体バイナリは「完走して PyTorch と一致」か「この容量エラーで止まる」のどちらか。core のテストは「GPU が選ばれ → 容量で失敗 → CPU でやり直して正しい値」を確認。
 - クラウド環境にも lavapipe と Python 3.11（uv）を入れ、ONNX 生成・core のビルド・3 通りのテストをローカルで通した（gpu 53 秒：失敗まで約 30 秒＋CPU、cpu 23 秒、自動 24 秒。いずれも median dx 3.977）。アプリ内のモデル取得はクラウドの proxy で失敗するので、キャッシュ（~/.local/share/Gyroflow/ai_models）に手で置いた。
+- 2026-10-20：user の承認で、PR 用 commit を #1143（feature/ai-optical-flow）へ push 済み（a6684f7 → afeb817、fast-forward）。PR 本文の追記はクラウドから upstream に届かないので PC 側で行う（文面は会話で渡した）。
