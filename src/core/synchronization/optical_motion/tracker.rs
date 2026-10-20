@@ -59,6 +59,8 @@ enum Dense {
 
 pub struct Tracker {
     dense: Dense,
+    /// Whether to give up on the frame being tracked (cancelled), checked between the passes of gmflow
+    stop: Box<dyn Fn() -> bool + Send + Sync>,
     prev: Option<Mat>,
     size: (i32, i32),
     points: Vec<Point2f>,
@@ -81,7 +83,13 @@ impl Tracker {
             #[cfg(not(feature = "use-burn"))]
             TrackingMethod::Gmflow => return Err(opencv::Error::new(core::StsNotImplemented, "gmflow tracking needs a build with the ai-optical-flow feature")),
         };
-        Ok(Self { dense, prev: None, size: (0, 0), points: Vec::new(), ids: Vec::new(), next_id: 0, max_points })
+        Ok(Self { dense, stop: Box::new(|| false), prev: None, size: (0, 0), points: Vec::new(), ids: Vec::new(), next_id: 0, max_points })
+    }
+
+    /// What says to give up on a frame halfway (gmflow takes tens of seconds per frame without a GPU): it then tracks
+    /// nothing, and whoever stopped it ignores the rest
+    pub fn set_stop(&mut self, stop: Box<dyn Fn() -> bool + Send + Sync>) {
+        self.stop = stop;
     }
 
     /// Forget everything: the next frame starts new tracks (a gap in the decoded frames, a cut)
@@ -107,7 +115,7 @@ impl Tracker {
                     Dense::Klt => Self::klt(&prev, &cur, &self.points)?,
                     Dense::Dis(dis) => Self::dense(dis, &prev, &cur, &self.points)?,
                     #[cfg(feature = "use-burn")]
-                    Dense::Gmflow => Self::gmflow(&prev, &cur, &self.points)?,
+                    Dense::Gmflow => Self::gmflow(&prev, &cur, &self.points, &*self.stop)?,
                 };
                 let mut points = Vec::with_capacity(self.points.len());
                 let mut ids = Vec::with_capacity(self.points.len());
@@ -177,10 +185,11 @@ impl Tracker {
 
     /// Where each point went, by gmflow's dense flow (Xu et al. 2022, see `optical_flow::GmflowDenseFlow`) from this
     /// frame to the next and back, like `dense`: None where the two don't agree at the point (`GMFLOW_FB_MAX`). Two
-    /// passes of the model per frame: a fraction of a second on a GPU, tens of seconds on the CPU. An error when it
-    /// can't run at all (no model), which stops the analysis: every frame after it would fail the same way
+    /// passes of the model per frame: a fraction of a second on a GPU, tens of seconds on the CPU, with `stop` asked
+    /// before each. An error when it can't run at all, which stops the analysis: every frame after it would fail the
+    /// same way
     #[cfg(feature = "use-burn")]
-    fn gmflow(prev: &Mat, cur: &Mat, points: &[Point2f]) -> Result<Vec<Option<Point2f>>, opencv::Error> {
+    fn gmflow(prev: &Mat, cur: &Mat, points: &[Point2f], stop: &dyn Fn() -> bool) -> Result<Vec<Option<Point2f>>, opencv::Error> {
         use crate::synchronization::optical_flow::GmflowDenseFlow;
         let to_image = |m: &Mat| -> Result<image::GrayImage, opencv::Error> {
             let (w, h) = (m.cols() as u32, m.rows() as u32);
@@ -189,8 +198,10 @@ impl Tracker {
             image::GrayImage::from_raw(w, h, data).ok_or_else(|| opencv::Error::new(core::StsBadArg, "frame size"))
         };
         let (a, b) = (to_image(prev)?, to_image(cur)?);
-        let failed = || opencv::Error::new(core::StsError, "gmflow could not run, see the log");
+        let failed = || opencv::Error::new(core::StsError, "gmflow could not compute the flow, see the log");
+        if stop() { return Ok(vec![None; points.len()]); }
         let forward = GmflowDenseFlow::compute(&a, &b).ok_or_else(failed)?;
+        if stop() { return Ok(vec![None; points.len()]); }
         let backward = GmflowDenseFlow::compute(&b, &a).ok_or_else(failed)?;
         let (w, h) = (prev.cols() as f32, prev.rows() as f32);
         let inside = |p: Point2f| p.x >= 0.0 && p.y >= 0.0 && p.x <= w - 1.0 && p.y <= h - 1.0;
@@ -260,8 +271,8 @@ impl Tracker {
         Ok(())
     }
 
-    /// DIS's and gmflow's points: a regular grid, a new point in the middle of every cell (of about the size `max_points` of them fill
-    /// the frame with) that has none left. The dense flow doesn't need a corner there, only something to see: where
+    /// DIS's and gmflow's points: a regular grid, a new point in the middle of every cell (of about the size
+    /// `max_points` of them fill the frame with) that has none left. The dense flow doesn't need a corner there, only something to see: where
     /// there's no detail at all (clear sky, clipped highlights) it only has what it smoothed in from around, so those
     /// cells stay empty - a point there would count as a measurement of rows nothing was seen in
     fn replenish_grid(&mut self, img: &Mat) -> Result<(), opencv::Error> {
