@@ -323,6 +323,44 @@ mod inference {
     }
 }
 
+/// gmflow's dense flow from one frame to another, for the optical analysis (Motion data -> Optical correction ->
+/// Tracking: gmflow). The model sees the frames letterboxed into 576x320, so the flow is that coarse: `at` maps a point
+/// of the frame into it and back
+#[cfg(feature = "use-burn")]
+pub struct GmflowDenseFlow {
+    flow: Vec<f32>,
+    scale: f32,
+    pad_x: f32,
+    pad_y: f32,
+}
+
+#[cfg(feature = "use-burn")]
+impl GmflowDenseFlow {
+    /// The flow from `a` to `b` (same size), on the GPU or the CPU, see `inference`. None, logged, when gmflow can't run
+    pub fn compute(a: &image::GrayImage, b: &image::GrayImage) -> Option<Self> {
+        let (flow, lb) = inference::compute_flow(a, b)?;
+        if flow.len() < 2 * inference::MODEL_H * inference::MODEL_W { return None; }
+        Some(Self { flow, scale: lb.scale.max(1e-6), pad_x: lb.pad_x as f32, pad_y: lb.pad_y as f32 })
+    }
+
+    /// How far the point (x, y) of the first frame, in its pixels, moved by in the second one: bilinear between the
+    /// model's pixels, pixel centres matched as the resize does. None outside of what the model saw
+    pub fn at(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        let (w, h) = (inference::MODEL_W, inference::MODEL_H);
+        let mx = (x + 0.5) * self.scale - 0.5 + self.pad_x;
+        let my = (y + 0.5) * self.scale - 0.5 + self.pad_y;
+        if !(mx >= 0.0 && my >= 0.0 && mx <= (w - 1) as f32 && my <= (h - 1) as f32) { return None; }
+        let (x0, y0) = (mx.floor() as usize, my.floor() as usize);
+        let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+        let (fx, fy) = (mx - x0 as f32, my - y0 as f32);
+        let plane = |k: usize| {
+            let at = |x: usize, y: usize| self.flow[k * w * h + y * w + x];
+            (at(x0, y0) * (1.0 - fx) + at(x1, y0) * fx) * (1.0 - fy) + (at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx) * fy
+        };
+        Some((plane(0) / self.scale, plane(1) / self.scale))
+    }
+}
+
 #[derive(Clone)]
 #[cfg_attr(not(feature = "use-burn"), allow(dead_code))]
 pub struct OFGmflow {

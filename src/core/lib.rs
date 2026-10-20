@@ -1229,7 +1229,8 @@ impl StabilizationManager {
         self.recompute_gyro();
         Ok(true)
     }
-    /// How the next "Analyze image optically" follows the points, "klt" or "dis". False for neither
+    /// How the next "Analyze image optically" follows the points, "klt", "dis" or "gmflow". False for none of them, or
+    /// for one this build doesn't have
     pub fn set_optical_tracking(&self, name: &str) -> bool {
         let Some(method) = gyro_source::TrackingMethod::from_name(name) else { return false };
         *self.optical_tracking.write() = method;
