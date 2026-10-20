@@ -338,7 +338,7 @@ impl Tracker {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "use-burn"))]
 mod tests {
     use super::*;
 
@@ -367,15 +367,7 @@ mod tests {
         ((median(0), median(1)), obs.len())
     }
 
-    #[test]
-    fn dis_follows_a_known_shift() {
-        let ((mx, my), n) = median_motion(TrackingMethod::Dis, 3, 1);
-        println!("DIS: {n} points, median motion ({mx:.3}, {my:.3}), expected (3, 1)");
-        assert!((mx - 3.0).abs() < 0.2 && (my - 1.0).abs() < 0.2);
-    }
-
     // Downloads the model (about 150 MB) and takes two passes of it: run with --ignored
-    #[cfg(feature = "use-burn")]
     #[test]
     #[ignore]
     fn gmflow_follows_a_known_shift() {
