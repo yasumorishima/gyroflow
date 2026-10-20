@@ -49,3 +49,4 @@
 - クラウド環境にも lavapipe と Python 3.11（uv）を入れ、ONNX 生成・core のビルド・3 通りのテストをローカルで通した（gpu 53 秒：失敗まで約 30 秒＋CPU、cpu 23 秒、自動 24 秒。いずれも median dx 3.977）。アプリ内のモデル取得はクラウドの proxy で失敗するので、キャッシュ（~/.local/share/Gyroflow/ai_models）に手で置いた。
 - 2026-10-20：user の承認で、PR 用 commit を #1143（feature/ai-optical-flow）へ push 済み（a6684f7 → afeb817、fast-forward）。PR 本文の追記はクラウドから upstream に届かないので PC 側で行う（文面は会話で渡した）。
 - 2026-10-20：メンテナ（AdrianEddy）の依頼「Motion data -> Optical correction の 3 つ目の選択肢に」に対応。gmflow を Tracking の 3 つ目（KLT / DIS / gmflow）として実装し、#1143 に 2 commit を push（afeb817 → 7da9751）。合成画像 (3,1)px のずれを 1213 点・中央値 (3.085, 1.057) で追跡。FB 閾値 0.3px は DIS の値のまま（実映像で未調整）。
+- 2026-10-20：GoPro HERO6 テスト映像（公式 Test Files）で KLT/DIS/gmflow を比較。映像だけの動き vs ジャイロの 1 フレーム回転誤差 rms：区間1（300〜）KLT 0.0625° DIS 0.0585° gmflow@0.2 0.062° @0.3 0.067°、区間2（600〜）KLT 0.052° DIS 0.055° gmflow@0.2 0.061° @0.3 0.204°。閾値を 0.2px に変更。CPU で gmflow 47 秒/フレーム。比較用ハーネスは scratch の ocmp（コミットしない）。
