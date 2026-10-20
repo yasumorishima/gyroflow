@@ -52,3 +52,7 @@ if unknown:
     for u in unknown[:30]:
         print("   ", u)
     sys.exit(1)
+# Optional third argument: fail if any output reaches this size (MiB)
+if len(sys.argv) > 3 and mib(rows[0][0]) >= float(sys.argv[3]):
+    print(f"FAIL: largest output {mib(rows[0][0]):.1f} MiB >= {sys.argv[3]} MiB")
+    sys.exit(1)

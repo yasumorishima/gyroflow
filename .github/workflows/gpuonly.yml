@@ -3,8 +3,8 @@ name: gmflow gpu-only
 
 on:
   push:
-    branches: [wip/gpu-only]
-    paths: [ci-gpu/**, .github/workflows/gpuonly.yml, src/core/**, Cargo.toml, Cargo.lock]
+    branches: ['wip/gpu-only']
+    paths: ['ci-gpu/**', '.github/workflows/gpuonly.yml', 'src/core/**', 'Cargo.toml', 'Cargo.lock']
   workflow_dispatch:
     inputs:
       memo:
@@ -21,11 +21,13 @@ concurrency:
 env:
   PTH_URL: https://s3.eu-central-1.amazonaws.com/avg-projects/unimatch/pretrained/gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth
   UNIMATCH_SHA: da140fa
+  VIDEO_URL: https://github.com/intel-iot-devkit/sample-videos/raw/master/person-bicycle-car-detection.mp4
+  CARGO_TERM_COLOR: never
 
 jobs:
-  profile:
+  export:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: ci-gpu
@@ -33,20 +35,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: 3.11
+          python-version: '3.11'
       - name: Python packages
         run: |
           pip install --quiet torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
-          pip install --quiet numpy==1.26.4 onnx==1.16.2 onnxsim==0.4.36 onnxruntime==1.19.2
-      - name: Export the ONNX as #1143 builds it
+          pip install --quiet numpy==1.26.4 onnx==1.16.2 onnxsim==0.4.36 onnxruntime==1.19.2 opencv-python-headless==4.10.0.84
+      - name: Export (memory-light local correlation) and check against the unchanged model
         run: |
           git clone -q https://github.com/AdrianEddy/unimatch.git unimatch
           git -C unimatch checkout -q "$UNIMATCH_SHA"
           curl -fsSL --retry 3 -o gmflow.pth "$PTH_URL"
-          python export_onnx.py gmflow.pth unimatch
-      - name: Big intermediate tensors (raw and simplified)
-        run: |
-          # What burn-onnx compiles; every shape must be static here
-          python profile_onnx.py gmflow-scale2-regrefine6-320x576-opset16-sim.onnx 16
-          # The unsimplified export has dynamic shapes, so only part of it can be sized
-          python profile_onnx.py raw.onnx 64 || true
+          curl -fsSL --retry 3 -o video.mp4 "$VIDEO_URL"
+          python export_gpu.py gmflow.pth unimatch video.mp4
+      - name: No intermediate tensor reaches 128 MiB, the storage buffer size Vulkan guarantees
+        run: python profile_onnx.py gmflow-scale2-regrefine6-320x576-opset16-sim.onnx 32 128
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gmflow-gpu-onnx
+          retention-days: 5
+          path: |
+            ci-gpu/gmflow-scale2-regrefine6-320x576-opset16-sim.onnx
+            ci-gpu/pair*.f32
