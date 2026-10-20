@@ -2,6 +2,7 @@ name: Release
 
 on:
   push:
+    branches-ignore: ['wip/**']  # work branch only, never part of #1143
   pull_request:
   workflow_dispatch:
 
