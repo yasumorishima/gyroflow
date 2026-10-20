@@ -1,4 +1,4 @@
-# Work branch only (never part of #1143): measures and checks gmflow for GPU-only inference.
+# Work branch only (never part of #1143): checks gmflow's GPU-only inference.
 name: gmflow gpu-only
 
 on:
@@ -22,6 +22,7 @@ env:
   PTH_URL: https://s3.eu-central-1.amazonaws.com/avg-projects/unimatch/pretrained/gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth
   UNIMATCH_SHA: da140fa
   VIDEO_URL: https://github.com/intel-iot-devkit/sample-videos/raw/master/person-bicycle-car-detection.mp4
+  ONNX: gmflow-scale2-regrefine6-320x576-opset16-sim.onnx
   CARGO_TERM_COLOR: never
 
 jobs:
@@ -48,7 +49,13 @@ jobs:
           curl -fsSL --retry 3 -o video.mp4 "$VIDEO_URL"
           python export_gpu.py gmflow.pth unimatch video.mp4
       - name: No intermediate tensor reaches 128 MiB, the storage buffer size Vulkan guarantees
-        run: python profile_onnx.py gmflow-scale2-regrefine6-320x576-opset16-sim.onnx 32 128
+        run: python profile_onnx.py "$ONNX" 32 128
+      - name: The export is the one build.rs pins
+        run: |
+          want=$(grep -o 'ONNX_SHA256: &str = "[0-9a-f]*"' ../src/core/build.rs | grep -o '[0-9a-f]\{64\}')
+          got=$(sha256sum "$ONNX" | cut -d' ' -f1)
+          echo "build.rs pins $want, this export is $got"
+          test "$want" = "$got"
       - uses: actions/upload-artifact@v4
         with:
           name: gmflow-gpu-onnx
@@ -56,3 +63,129 @@ jobs:
           path: |
             ci-gpu/gmflow-scale2-regrefine6-320x576-opset16-sim.onnx
             ci-gpu/pair*.f32
+
+  # Mesa lavapipe: software Vulkan, the only Vulkan a hosted Linux runner has. Checks that the automatic choice (hardware GPUs) finds nothing
+  # and says so, then forces lavapipe (GYROFLOW_GMFLOW_DEVICE=any) to run the model on Vulkan against PyTorch. Not a speed measurement.
+  lavapipe:
+    needs: export
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: gmflow-gpu-onnx
+          path: ci-gpu/out
+      - name: The ONNX where build.rs looks for it
+        run: mkdir -p resources/gmflow && cp "ci-gpu/out/$ONNX" resources/gmflow/
+      - name: Software Vulkan (lavapipe)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mesa-vulkan-drivers libvulkan1 vulkan-tools > /dev/null
+          vulkaninfo --summary | sed -n '/Devices:/,$p'
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustc --version
+      - name: Build the tests
+        working-directory: src/core
+        run: time cargo test --locked --release --features use-burn --lib --no-run
+      - name: Automatic choice refuses the software renderer and says so
+        working-directory: src/core
+        env:
+          GMFLOW_EXPECT_ERROR: no usable Vulkan GPU
+        run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_refuses_without_a_gpu
+      - name: Vulkan (lavapipe, forced) against PyTorch
+        working-directory: src/core
+        env:
+          GYROFLOW_GMFLOW_DEVICE: any
+          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
+          GMFLOW_WARM_RUNS: '1'
+        run: |
+          bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_matches_pytorch pytorch.log
+          grep -q 'on wgpu: llvmpipe' pytorch.log
+      - name: Vulkan (lavapipe, forced), known shift
+        working-directory: src/core
+        env:
+          GYROFLOW_GMFLOW_DEVICE: any
+        run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_detects_known_shift
+
+  # Apple GPU of the hosted macOS arm64 runner (paravirtualised), Metal. Its speed is a virtual machine's, not a Mac's.
+  metal:
+    needs: export
+    runs-on: macos-14
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: gmflow-gpu-onnx
+          path: ci-gpu/out
+      - name: The ONNX where build.rs looks for it
+        run: mkdir -p resources/gmflow && cp "ci-gpu/out/$ONNX" resources/gmflow/
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustc --version
+      - name: Build the tests
+        working-directory: src/core
+        run: time cargo test --locked --release --features use-burn --lib --no-run
+      - name: Metal against PyTorch (automatic choice)
+        id: auto
+        continue-on-error: true
+        working-directory: src/core
+        env:
+          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
+        run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_matches_pytorch
+      - name: Metal against PyTorch (default adapter), only if the automatic choice found nothing
+        if: steps.auto.outcome == 'failure'
+        working-directory: src/core
+        env:
+          GYROFLOW_GMFLOW_DEVICE: any
+          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
+        run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_matches_pytorch
+      - name: Metal, known shift
+        working-directory: src/core
+        env:
+          GYROFLOW_GMFLOW_DEVICE: ${{ steps.auto.outcome == 'failure' && 'any' || '' }}
+        run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_detects_known_shift
+      - name: iOS compiles (WGSL kernels on Metal)
+        working-directory: src/core
+        run: rustup target add aarch64-apple-ios && cargo check --locked --features use-burn --target aarch64-apple-ios
+
+  check-windows:
+    needs: export
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: gmflow-gpu-onnx
+          path: ci-gpu/out
+      - name: The ONNX where build.rs looks for it
+        shell: bash
+        run: mkdir -p resources/gmflow && cp "ci-gpu/out/$ONNX" resources/gmflow/
+      - name: Windows compiles (Vulkan)
+        working-directory: src/core
+        run: cargo check --locked --features use-burn
+
+  check-android:
+    needs: export
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: gmflow-gpu-onnx
+          path: ci-gpu/out
+      - name: The ONNX where build.rs looks for it
+        run: mkdir -p resources/gmflow && cp "ci-gpu/out/$ONNX" resources/gmflow/
+      - name: Android aarch64 compiles (Vulkan)
+        working-directory: src/core
+        run: |
+          rustup toolchain install stable --profile minimal && rustup default stable
+          rustup target add aarch64-linux-android
+          bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$bin/aarch64-linux-android26-clang"
+          export CXX_aarch64_linux_android="$bin/aarch64-linux-android26-clang++"
+          export AR_aarch64_linux_android="$bin/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$bin/aarch64-linux-android26-clang"
+          cargo check --locked --features use-burn --target aarch64-linux-android
