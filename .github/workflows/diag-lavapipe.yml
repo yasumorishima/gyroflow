@@ -1,0 +1,20 @@
+# Work branch only (never part of #1143): what limits Mesa lavapipe on ubuntu-24.04 reports.
+name: lavapipe limits
+on:
+  push:
+    branches: ["wip/gpu-only"]
+    paths: [".github/workflows/diag-lavapipe.yml"]
+permissions:
+  contents: read
+jobs:
+  limits:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mesa-vulkan-drivers libvulkan1 vulkan-tools > /dev/null
+          dpkg -s mesa-vulkan-drivers | grep Version
+          vulkaninfo > v.txt 2>/dev/null || true
+          grep -E "deviceName|deviceType|maxStorageBufferRange|maxBufferSize|maxMemoryAllocationSize|maxUniformBufferRange" v.txt | sort -u
+          grep -c "VK_EXT_shader_64bit_indexing" v.txt || echo "no VK_EXT_shader_64bit_indexing"
+          grep -A3 -i "memoryHeaps\[0\]" v.txt | head -8
