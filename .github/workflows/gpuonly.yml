@@ -88,10 +88,28 @@ jobs:
       - name: Build the tests
         working-directory: src/core
         run: time cargo test --locked --release --features use-burn --lib --no-run
-      - name: Automatic choice refuses the software renderer and says so
+      - name: The weights burn-onnx built from the ONNX, against the pin in gmflow.rs
+        working-directory: src/core
+        shell: bash
+        run: |
+          bpk=$(find target/release/build -path '*/out/model/gmflow-scale2-regrefine6-320x576-opset16-sim.bpk' | head -n 1)
+          test -n "$bpk"
+          got=$(shasum -a 256 "$bpk" | cut -d' ' -f1)
+          want=$(grep -o 'MODEL_SHA256: &str = "[0-9a-f]*"' synchronization/optical_flow/gmflow.rs | grep -o '[0-9a-f]\{64\}')
+          echo "built $bpk: $(wc -c < "$bpk") bytes, SHA-256 $got; gmflow.rs pins $want"
+          mkdir -p "$RUNNER_TEMP/bpk" && cp "$bpk" "$RUNNER_TEMP/bpk/"
+          echo "GYROFLOW_GMFLOW_WEIGHTS=$RUNNER_TEMP/bpk/gmflow-scale2-regrefine6-320x576-opset16-sim.bpk" >> "$GITHUB_ENV"
+          test "$got" = "$want"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gmflow-bpk-linux
+          retention-days: 5
+          path: ${{ runner.temp }}/bpk/
+      - name: Automatic choice skips the software renderer and says so
         working-directory: src/core
         env:
-          GMFLOW_EXPECT_ERROR: no usable Vulkan GPU
+          GMFLOW_EXPECT_ERROR: llvmpipe
         run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_refuses_without_a_gpu
       - name: Vulkan (lavapipe, forced) against PyTorch
         working-directory: src/core
@@ -107,6 +125,11 @@ jobs:
         env:
           GYROFLOW_GMFLOW_DEVICE: any
         run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_detects_known_shift
+      - name: Vulkan (lavapipe) with buffers of at most 128 MiB, against PyTorch
+        working-directory: src/core
+        env:
+          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
+        run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_runs_within_128_mib_buffers
 
   # Apple GPU of the hosted macOS arm64 runner (paravirtualised), Metal. Its speed is a virtual machine's, not a Mac's.
   metal:
@@ -126,6 +149,27 @@ jobs:
       - name: Build the tests
         working-directory: src/core
         run: time cargo test --locked --release --features use-burn --lib --no-run
+      - name: The weights burn-onnx built from the ONNX, against the pin in gmflow.rs
+        working-directory: src/core
+        shell: bash
+        run: |
+          bpk=$(find target/release/build -path '*/out/model/gmflow-scale2-regrefine6-320x576-opset16-sim.bpk' | head -n 1)
+          test -n "$bpk"
+          got=$(shasum -a 256 "$bpk" | cut -d' ' -f1)
+          want=$(grep -o 'MODEL_SHA256: &str = "[0-9a-f]*"' synchronization/optical_flow/gmflow.rs | grep -o '[0-9a-f]\{64\}')
+          echo "built $bpk: $(wc -c < "$bpk") bytes, SHA-256 $got; gmflow.rs pins $want"
+          mkdir -p "$RUNNER_TEMP/bpk" && cp "$bpk" "$RUNNER_TEMP/bpk/"
+          echo "GYROFLOW_GMFLOW_WEIGHTS=$RUNNER_TEMP/bpk/gmflow-scale2-regrefine6-320x576-opset16-sim.bpk" >> "$GITHUB_ENV"
+          test "$got" = "$want"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gmflow-bpk-macos
+          retention-days: 5
+          path: ${{ runner.temp }}/bpk/
+      - name: iOS compiles (WGSL kernels on Metal)
+        working-directory: src/core
+        run: rustup target add aarch64-apple-ios && cargo check --locked --features use-burn --target aarch64-apple-ios
       - name: Metal against PyTorch (automatic choice)
         id: auto
         continue-on-error: true
@@ -145,9 +189,11 @@ jobs:
         env:
           GYROFLOW_GMFLOW_DEVICE: ${{ steps.auto.outcome == 'failure' && 'any' || '' }}
         run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_detects_known_shift
-      - name: iOS compiles (WGSL kernels on Metal)
+      - name: Metal with buffers of at most 128 MiB, against PyTorch
         working-directory: src/core
-        run: rustup target add aarch64-apple-ios && cargo check --locked --features use-burn --target aarch64-apple-ios
+        env:
+          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
+        run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_runs_within_128_mib_buffers
 
   check-windows:
     needs: export
