@@ -7,7 +7,6 @@ Writes gmflow-scale2-regrefine6-320x576-opset16-sim.onnx, and for each test pair
 pair{k}_in0.f32, pair{k}_in1.f32 ([1,3,320,576], raw 0-255 grey in all 3 channels) and
 pair{k}_torch.f32 ([1,2,320,576], the unchanged PyTorch model). Exits 1 if a gate fails.
 """
-import copy
 import hashlib
 import sys
 
@@ -21,11 +20,13 @@ import torch
 PTH, UNIMATCH, VIDEO = sys.argv[1], sys.argv[2], sys.argv[3]
 H, W, SHIFT = 320, 576, 4
 OUT = "gmflow-scale2-regrefine6-320x576-opset16-sim.onnx"
-# Gates (px). That the patch changes no value is checked in float64, where float reordering is ~1e-12 and the
-# check is sharp: the first version checked it in float32 with a mean limit of 1e-5 set before measuring the noise,
-# and on a second runner float32 reordering alone was 1e-5 (onnxruntime vs PyTorch too). float32 results, the ones
-# that ship, are held to the margin the unpatched export had in onnxruntime (max 5.7e-4, mean 1.9e-5).
-EXACT64 = 1e-6
+# Gates. That the patch computes the same values is checked function by function, on random features of the real
+# shapes: the only difference is how the window's matmul is split, so the outputs agree to float32 rounding
+# (FUNC_MAX) with nothing downstream to amplify it. The whole model is then held to the margin the unpatched export
+# had in onnxruntime (max 5.7e-4, mean 1.9e-5). The first version held patched vs unchanged PyTorch to a mean of
+# 1e-5, set before measuring the noise; on a second runner float32 reordering alone was 1e-5 (onnxruntime vs
+# PyTorch too). (float64 is not an option: unimatch builds its sampling grids in float32.)
+FUNC_MAX = 1e-4
 F32_MAX, F32_MEAN = 2e-3, 5e-5
 ORT_MAX, ORT_MEAN = 2e-3, 5e-5
 
@@ -82,8 +83,6 @@ pairs += [(as_input(frames[0]), as_input(frames[1])), (as_input(frames[60]), as_
 wrap = Flow(net).eval()
 with torch.no_grad():
     refs = [wrap(a, b).numpy() for a, b in pairs]
-    wrap64 = Flow(copy.deepcopy(net).double()).eval()
-    refs64 = [wrap64(a.double(), b.double()).numpy() for a, b in pairs]
 for k, ((a, b), r) in enumerate(zip(pairs, refs)):
     a.numpy().tofile(f"pair{k}_in0.f32")
     b.numpy().tofile(f"pair{k}_in1.f32")
@@ -102,11 +101,27 @@ def gate(tag, got, ref, max_lim, mean_lim):
         failed.append(tag)
 
 
+import unimatch.matching as matching  # noqa: E402
+
+g = torch.Generator().manual_seed(1)
+f0, f1 = torch.randn(1, 128, 80, 144, generator=g), torch.randn(1, 128, 80, 144, generator=g)
+fl = 3.0 * torch.randn(1, 2, 80, 144, generator=g)
+with torch.no_grad():
+    orig_sm, low_sm = matching.local_correlation_softmax(f0, f1, 4), lowmem.local_correlation_softmax(f0, f1, 4)
+    checks = {
+        "local_correlation_softmax flow": (orig_sm[0], low_sm[0]),
+        "local_correlation_softmax prob": (orig_sm[1], low_sm[1]),
+        "local_correlation_with_flow": (matching.local_correlation_with_flow(f0, f1, fl, 4),
+                                        lowmem.local_correlation_with_flow(f0, f1, fl, 4)),
+    }
+    for tag, (want, got) in checks.items():
+        assert want.shape == got.shape, (tag, want.shape, got.shape)
+        gate(f"{tag} (random features, 80x144x128)", got.numpy(), want.numpy(), FUNC_MAX, FUNC_MAX)
+
 lowmem.install()
 with torch.no_grad():
-    for k, ((a, b), r, r64) in enumerate(zip(pairs, refs, refs64)):
-        gate(f"pair {k} patched vs unchanged, float64", wrap64(a.double(), b.double()).numpy(), r64, EXACT64, EXACT64)
-        gate(f"pair {k} patched vs unchanged, float32", wrap(a, b).numpy(), r, F32_MAX, F32_MEAN)
+    for k, ((a, b), r) in enumerate(zip(pairs, refs)):
+        gate(f"pair {k} patched vs unchanged torch, whole model", wrap(a, b).numpy(), r, F32_MAX, F32_MEAN)
 
 t0, t1 = pairs[0]
 torch.onnx.export(wrap, (t0, t1), "raw.onnx", opset_version=16, input_names=["img0", "img1"],
