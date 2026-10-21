@@ -29,6 +29,7 @@ def normalized(path):
     return hashlib.sha256(b).hexdigest(), count, len(b)
 
 
+assert len(sys.argv) >= 3, "usage: bpk_ids.py FILE FILE..."
 got = [normalized(p) for p in sys.argv[1:]]
 for p, (h, count, size) in zip(sys.argv[1:], got):
     print(f"{p}: {size} bytes, {count} tensors, SHA-256 with ids zeroed {h}")
