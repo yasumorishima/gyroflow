@@ -342,6 +342,8 @@ mod inference {
         // share the GPU while each holding its own activations (out of memory on small GPUs)
         static ONE_PASS: Mutex<()> = Mutex::new(());
         let _one = ONE_PASS.lock();
+        // Waited while another pass failed on the GPU: don't run on it again
+        if let Some(why) = &*GPU_FAILED.lock() { return Err(why.clone()); }
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Result<Vec<f32>, String>, String> {
             // No weights is not the GPU's fault: Err on the outside
             let model = model_on(device)?;
@@ -675,26 +677,45 @@ mod tests {
         println!("warm: {:.3} s per pass on {} (mean of {runs})", started.elapsed().as_secs_f64() / runs as f64, inference::device_name());
     }
 
-    // The whole model with no buffer over 128 MiB, which is all that Vulkan guarantees and what many Android GPUs have:
-    // the default adapter (GYROFLOW_GMFLOW_DEVICE doesn't apply), its limits lowered to that, against PyTorch
+    // The whole model with no buffer over 128 MiB, which is all that Vulkan guarantees and what many Android GPUs have,
+    // against PyTorch. Vulkan: cubecl makes the device itself, as in Gyroflow (its SPIR-V kernels need the extensions it
+    // enables), with the adapter's own limits, so this needs a device with no more than 128 MiB of its own, such as Mesa
+    // lavapipe (maxStorageBufferRange 128 MiB, no 64-bit indexing). Metal: the device cubecl makes for its WGSL kernels,
+    // with lower limits. Either way the limits the device ended up with are checked before the model runs.
     #[test]
     #[ignore]
     fn gmflow_runs_within_128_mib_buffers() {
-        use burn::tensor::wgpu::{ WgpuSetup, wgpu };
         const MIB_128: u64 = 128 << 20;
-        #[cfg(target_vendor = "apple")]
-        let backend = wgpu::Backend::Metal;
         #[cfg(not(target_vendor = "apple"))]
-        let backend = wgpu::Backend::Vulkan;
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: backend.into(), ..wgpu::InstanceDescriptor::new_without_display_handle() });
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })).expect("no adapter");
-        let mut limits = adapter.limits();
-        limits.max_buffer_size = limits.max_buffer_size.min(MIB_128);
-        limits.max_storage_buffer_binding_size = limits.max_storage_buffer_binding_size.min(MIB_128 as _);
-        let features = adapter.features().difference(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_features: features, required_limits: limits.clone(), ..Default::default() })).expect("device");
-        println!("adapter {:?}, buffers up to {} MiB, bindings up to {} MiB", adapter.get_info().name, limits.max_buffer_size >> 20, (limits.max_storage_buffer_binding_size as u64) >> 20);
-        let device = burn::tensor::Device::wgpu_options().setup(WgpuSetup { instance, adapter, device, queue, backend }).init().expect("burn on that device");
+        let (device, limits, name) = {
+            let (device, setup) = burn::tensor::Device::wgpu_options().graphics_api(burn::tensor::wgpu::WgpuBackend::Vulkan).device_kind(burn::tensor::DeviceKind::DefaultDevice).init_with_setup().expect("Vulkan");
+            (device, setup.device.limits(), setup.adapter.get_info().name)
+        };
+        #[cfg(target_vendor = "apple")]
+        let (device, limits, name) = {
+            use burn::tensor::wgpu::{ WgpuSetup, wgpu };
+            let backend = wgpu::Backend::Metal;
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: backend.into(), ..wgpu::InstanceDescriptor::new_without_display_handle() });
+            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })).expect("no adapter");
+            let mut limits = adapter.limits();
+            limits.max_buffer_size = limits.max_buffer_size.min(MIB_128);
+            limits.max_storage_buffer_binding_size = limits.max_storage_buffer_binding_size.min(MIB_128 as _);
+            let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: None,
+                required_features: adapter.features().difference(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
+                required_limits: limits,
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+                // As cubecl does: the features it asks for include the experimental ones the adapter has
+                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+            })).expect("device");
+            let (limits, name) = (device.limits(), adapter.get_info().name);
+            let device = burn::tensor::Device::wgpu_options().setup(WgpuSetup { instance, adapter, device, queue, backend }).init().expect("burn on that device");
+            (device, limits, name)
+        };
+        let room = (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size);
+        println!("adapter {:?}, buffers up to {} MiB, bindings up to {} MiB", name, limits.max_buffer_size >> 20, (limits.max_storage_buffer_binding_size as u64) >> 20);
+        assert!(room <= MIB_128, "this device allows buffers of {} MiB; the test needs one that allows at most 128 MiB", room >> 20);
         let dir = std::path::PathBuf::from(std::env::var("GMFLOW_REF_DIR").expect("GMFLOW_REF_DIR"));
         let read = |name: &str| -> Vec<f32> { std::fs::read(dir.join(name)).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect() };
         let flow = inference::forward_on(&device, read("pair1_in0.f32"), read("pair1_in1.f32")).expect("gmflow did not run within 128 MiB buffers");
