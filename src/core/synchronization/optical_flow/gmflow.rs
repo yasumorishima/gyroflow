@@ -38,11 +38,13 @@ mod inference {
     // Model weights are hosted separately rather than embedded to avoid a ~145 MB library bloat
     // for users who do not enable the ai-optical-flow feature. The .bpk is the weights file that burn-onnx 0.22 writes
     // next to the generated code, from the ONNX that build.rs pins (gmflow-scale2-regrefine6, MIT, derived from
-    // autonomousvision/unimatch): its tensors are named after that graph, so the two go together. The SHA-256 pin
-    // defends against tampering on the download path. GYROFLOW_GMFLOW_WEIGHTS=<path> takes the file from there
-    // instead of downloading it (offline installs, packaging, tests); it must still match the pin.
+    // autonomousvision/unimatch): its tensors are named after that graph, so the two go together. Each build writes
+    // fresh random parameter ids into it and nothing else differs; loading matches tensors by name, so the hosted file
+    // is one such build. The SHA-256 pin defends against tampering on the download path. GYROFLOW_GMFLOW_WEIGHTS=<path>
+    // takes the file from there instead of downloading it (offline installs, packaging, tests); it must still match
+    // the pin.
     const MODEL_URL: &str = "https://github.com/yasumorishima/gyroflow-models/releases/download/v1.1.0/gmflow-scale2-regrefine6-320x576-opset16-sim.bpk";
-    const MODEL_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const MODEL_SHA256: &str = "4f89e462a8457023fdadb9383c9b04d8fd56420329e56aa7c36d5e7387f269d5";
     const MODEL_FILENAME: &str = "gmflow-scale2-regrefine6-320x576-opset16-sim.bpk";
 
     // gmflow runs on the GPU only: Vulkan on Windows, Linux and Android, Metal on macOS and iOS (the graphics API is
