@@ -14,16 +14,27 @@ use std::time::Instant;
 const H: usize = 320;
 const W: usize = 576;
 
+/// The tilings of kernels::gemm the ceiling test times (block / k step / outputs per thread per side), the default first;
+/// kernels_match_plain checks every one of them against burn's matmul
+const GEMM_TILES: [kernels::GemmTile; 5] = [
+    kernels::GEMM_DEFAULT,
+    kernels::GemmTile { block: 64, kstep: 8, per: 4 },
+    kernels::GemmTile { block: 32, kstep: 16, per: 2 },
+    kernels::GemmTile { block: 32, kstep: 32, per: 2 },
+    kernels::GemmTile { block: 128, kstep: 8, per: 8 },
+];
+
 /// The configurations measured: (label, ops)
 fn configs() -> Vec<(&'static str, model::Ops)> {
-    let o = |kernels, conv_im2col, gru_factored, own_gemm| model::Ops { kernels, conv_im2col, gru_factored, own_gemm };
+    let o = |kernels, conv_im2col, gru_factored, own_gemm, gemm_linear| model::Ops { kernels, conv_im2col, gru_factored, own_gemm, gemm_linear };
     vec![
-        ("plain", o(false, false, false, false)),
-        ("kernels", o(true, false, false, false)),
-        ("kernels+gru", o(true, false, true, false)),
-        ("kernels+im2col", o(true, true, false, false)),
-        ("kernels+im2col+gru", o(true, true, true, false)),
-        ("kernels+im2col+gru+gemm", o(true, true, true, true)),
+        ("plain", o(false, false, false, false, false)),
+        ("kernels", o(true, false, false, false, false)),
+        ("kernels+gru", o(true, false, true, false, false)),
+        ("kernels+im2col", o(true, true, false, false, false)),
+        ("kernels+im2col+gru", o(true, true, true, false, false)),
+        ("kernels+im2col+gru+gemm", o(true, true, true, true, false)),
+        ("kernels+im2col+gru+gemm+linear", o(true, true, true, true, true)),
     ]
 }
 
@@ -102,7 +113,7 @@ fn matches_pytorch() {
             let flow = to_vec(model.forward(inp(k, 0), inp(k, 1), &st));
             let secs = started.elapsed().as_secs_f64();
             let (max, mean, _) = diff(&flow, &read_f32(&dir.join(format!("pair{k}_torch.f32"))));
-            println!("{label:24} pair {k}: max |burn - torch| {max:.2e} px, mean {mean:.2e} px, one pass {secs:.3} s");
+            println!("{label:30} pair {k}: max |burn - torch| {max:.2e} px, mean {mean:.2e} px, one pass {secs:.3} s");
             assert!(max <= 1e-2 && mean <= 1e-4, "pair {k}: max {max:e}, mean {mean:e}");
             checked += 1;
         }
@@ -115,7 +126,7 @@ fn matches_pytorch() {
     let im2col = std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true);
     let mut bad = Vec::new();
     for (what, kernels_on) in [("kernels", true), ("plain ops", false)] {
-        st.ops = model::Ops { kernels: kernels_on, conv_im2col: im2col, gru_factored: true, own_gemm: im2col && kernels_on };
+        st.ops = model::Ops { kernels: kernels_on, conv_im2col: im2col, gru_factored: true, own_gemm: im2col && kernels_on, gemm_linear: false };
         for k in 0..3 {
             let fa = model.features(inp(k, 0), &st);
             let fb = model.features(inp(k, 1), &st);
@@ -131,7 +142,7 @@ fn matches_pytorch() {
             }
         }
     }
-    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col };
+    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col, gemm_linear: false };
     assert!(bad.is_empty(), "bidirectional: {bad:?}");
 
     // The tracker, per frame: before, two one-way passes (each through the CNN with both frames); now, the CNN of the new
@@ -230,23 +241,34 @@ fn kernels_match_plain() {
         let got = kernels::conv2d_im2col(x, wt, Some(bias), stride, [ph, pw], 120 << 20, true);
         check(&format!("conv {cin}->{cout} {kh}x{kw}/{stride} im2col gemm"), got, want);
     }
-    // kernels::gemm against burn's matmul: the shapes of the model (a of 1 shared by the batch, rows and columns not
-    // multiples of the 128 x 128 block, k not a multiple of its 8 step) and both batched; a scaled by 1/sqrt(K) so that
-    // the outputs are of order 1
+    // kernels::gemm against burn's matmul, with every tiling the ceiling test times (the default first): the shapes of the
+    // model (a of 1 shared by the batch) and both batched, some with rows and columns not multiples of the 32, 64 or 128
+    // block and k not a multiple of the 8, 16 or 32 step (every tiling meets partial tiles in all three); a scaled by 1/sqrt(K) so that the outputs are of order 1
     let rnd3 = |shape: [usize; 3], sd: f64| Tensor::<3>::random(shape, Distribution::Normal(0.0, sd), &device);
+    assert_eq!(GEMM_TILES[0], kernels::GEMM_DEFAULT, "the default tiling comes first");
     for (ba, bb, m, k, nn) in [(1usize, 1usize, 192usize, 2304usize, 11520usize), (1, 2, 126, 1152, 11520), (1, 2, 384, 640, 11520), (1, 1, 64, 147, 46080), (2, 2, 180, 128, 180), (1, 2, 2, 1152, 11520), (2, 1, 100, 256, 500)] {
         let a = rnd3([ba, m, k], 1.0 / (k as f64).sqrt());
         let bm = rnd3([bb, k, nn], 1.0);
-        let label = format!("gemm [{ba},{m},{k}]x[{bb},{k},{nn}]");
-        let got = kernels::gemm(a.clone(), bm.clone(), None).unsqueeze_dim::<4>(0);
-        check(&label, got, a.matmul(bm).unsqueeze_dim::<4>(0));
+        let want = a.clone().matmul(bm.clone()).unsqueeze_dim::<4>(0);
+        check(&format!("gemm [{ba},{m},{k}]x[{bb},{k},{nn}]"), kernels::gemm(a.clone(), bm.clone(), None).unsqueeze_dim::<4>(0), want.clone());
+        // gemm is gemm_tiled with GEMM_TILES[0]: the others
+        for tile in &GEMM_TILES[1..] {
+            let tile = *tile;
+            let label = format!("gemm {}/{}/{} [{ba},{m},{k}]x[{bb},{k},{nn}]", tile.block, tile.kstep, tile.per);
+            check(&label, kernels::gemm_tiled(a.clone(), bm.clone(), None, tile).unsqueeze_dim::<4>(0), want.clone());
+        }
     }
     {
         let a = rnd3([1, 100, 300], 0.06);
         let bm = rnd3([2, 300, 333], 1.0);
         let bias = Tensor::<1>::random([100], Distribution::Normal(0.0, 0.1), &device);
-        let want = a.clone().matmul(bm.clone()) + bias.clone().reshape([1, 100, 1]);
-        check("gemm with bias [1,100,300]x[2,300,333]", kernels::gemm(a, bm, Some(bias)).unsqueeze_dim::<4>(0), want.unsqueeze_dim::<4>(0));
+        let want = (a.clone().matmul(bm.clone()) + bias.clone().reshape([1, 100, 1])).unsqueeze_dim::<4>(0);
+        check("gemm with bias [1,100,300]x[2,300,333]", kernels::gemm(a.clone(), bm.clone(), Some(bias.clone())).unsqueeze_dim::<4>(0), want.clone());
+        for tile in &GEMM_TILES[1..] {
+            let tile = *tile;
+            let label = format!("gemm {}/{}/{} with bias [1,100,300]x[2,300,333]", tile.block, tile.kstep, tile.per);
+            check(&label, kernels::gemm_tiled(a.clone(), bm.clone(), Some(bias.clone()), tile).unsqueeze_dim::<4>(0), want.clone());
+        }
     }
     assert!(failed.is_empty(), "kernels that differ from the plain operations: {failed:?}");
 }
@@ -445,6 +467,16 @@ fn matmul_ceiling() {
     let a = rnd2([tokens, 256]);
     let fc1 = rnd2([256, 1024]);
     time("FFN fc1 @1/4 x2: [2L,256]@[256,1024]", 2.0 * (tokens * 256 * 1024) as f64, &|| first2(a.clone().matmul(fc1.clone())));
+    let a3 = a.clone().unsqueeze_dim::<3>(0);
+    let fc1_3 = fc1.clone().unsqueeze_dim::<3>(0);
+    time("FFN fc1 @1/4 x2: kernels::gemm", 2.0 * (tokens * 256 * 1024) as f64, &|| first(kernels::gemm(a3.clone(), fc1_3.clone(), None)));
+    // Tilings of kernels::gemm (block / k step / outputs per thread per side), on the conv, the GRU and the FFN shapes
+    for tile in GEMM_TILES {
+        let kernels::GemmTile { block, kstep, per } = tile;
+        time(&format!("tile {block}/{kstep}/{per} conv [1,192,2304]@[1,2304,L]"), conv_flops, &|| first(kernels::gemm_tiled(w.clone(), cols.clone(), None, tile)));
+        time(&format!("tile {block}/{kstep}/{per} GRU [1,384,640]@[2,640,L]"), 2.0 * (2 * 384 * 640 * l) as f64, &|| first(kernels::gemm_tiled(gw.clone(), gc.clone(), None, tile)));
+        time(&format!("tile {block}/{kstep}/{per} FFN [1,2L,256]@[1,256,1024]"), 2.0 * (tokens * 256 * 1024) as f64, &|| first(kernels::gemm_tiled(a3.clone(), fc1_3.clone(), None, tile)));
+    }
     let q = rnd3([2 * 64, 180, 128]);
     let kt = rnd3([2 * 64, 128, 180]);
     time("window attention @1/4 x2: [128,180,128]@[128,128,180]", 2.0 * (128 * 180 * 180 * 128) as f64, &|| first(q.clone().matmul(kt.clone())));
@@ -466,7 +498,7 @@ fn bidirectional_repeat() {
     let model = load(&device);
     let mut st = Statics::new(H, W, &device);
     let im2col = std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true);
-    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col };
+    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col, gemm_linear: false };
     let inp = |k: usize, i: usize| tensor4(&dir.join(format!("pair{k}_in{i}.f32")), [1, 3, H, W], &device);
     let mut bad = Vec::new();
     for k in 0..3 {

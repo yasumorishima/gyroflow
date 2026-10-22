@@ -55,6 +55,8 @@ pub struct Ops {
     /// The matmuls of the im2col convolutions and of the factored GRU by kernels::gemm instead of burn's (for devices
     /// without f32 matrix units)
     pub own_gemm: bool,
+    /// The transformer's linear layers by kernels::gemm too
+    pub gemm_linear: bool,
 }
 
 /// A convolution of this model: 1x1 ones and the plain path through burn, the others as im2col + matmul if asked
@@ -207,12 +209,12 @@ impl TransformerLayer {
     }
 
     /// source, target: [B, H*W, C]
-    fn forward(&self, source: Tensor<3>, target: Tensor<3>, win: &Windows, with_shift: bool) -> Tensor<3> {
-        let q = self.q_proj.forward(source.clone());
-        let k = self.k_proj.forward(target.clone());
-        let v = self.v_proj.forward(target);
+    fn forward(&self, source: Tensor<3>, target: Tensor<3>, win: &Windows, with_shift: bool, own: bool) -> Tensor<3> {
+        let q = lin(&self.q_proj, source.clone(), own);
+        let k = lin(&self.k_proj, target.clone(), own);
+        let v = lin(&self.v_proj, target, own);
         let message = split_window_attention(q, k, v, win, with_shift);
-        let message = self.norm1.forward(self.merge.forward(message));
+        let message = self.norm1.forward(lin(&self.merge, message, own));
         let message = match (&self.mlp, &self.norm2) {
             (Some(mlp), Some(norm2)) => {
                 let x = Tensor::cat(vec![source.clone(), message], 2);
@@ -221,7 +223,7 @@ impl TransformerLayer {
                 let [nb, l, _] = x.dims();
                 let per_image = l * mlp.fc1.weight.val().dims()[1] * 4;
                 let chunk = (IM2COL_MAX_BYTES / per_image).max(1);
-                let ffn = |x: Tensor<3>| norm2.forward(mlp.fc2.forward(gelu(mlp.fc1.forward(x))));
+                let ffn = |x: Tensor<3>| norm2.forward(lin(&mlp.fc2, gelu(lin(&mlp.fc1, x, own)), own));
                 if nb <= chunk {
                     ffn(x)
                 } else {
@@ -231,6 +233,21 @@ impl TransformerLayer {
             _ => message,
         };
         source + message
+    }
+}
+
+/// A linear layer on [B, L, C]: burn's, or kernels::gemm on the B * L rows at once (as burn folds them)
+fn lin(l: &Linear, x: Tensor<3>, own: bool) -> Tensor<3> {
+    if !own {
+        return l.forward(x);
+    }
+    let [b, n, k] = x.dims();
+    let w = l.weight.val(); // [d_input, d_output]
+    let d_out = w.dims()[1];
+    let out = kernels::gemm(x.reshape([1, b * n, k]), w.unsqueeze_dim::<3>(0), None).reshape([b, n, d_out]);
+    match &l.bias {
+        Some(bias) => out + bias.val().reshape([1, 1, d_out]),
+        None => out,
     }
 }
 
@@ -251,7 +268,7 @@ impl FeatureTransformer {
     }
 
     /// feature0, feature1: [B, C, H, W] (position added) -> the same, after self- and cross-attention
-    pub fn forward(&self, feature0: Tensor<4>, feature1: Tensor<4>, win: &Windows) -> (Tensor<4>, Tensor<4>) {
+    pub fn forward(&self, feature0: Tensor<4>, feature1: Tensor<4>, win: &Windows, own: bool) -> (Tensor<4>, Tensor<4>) {
         let [b, c, h, w] = feature0.dims();
         let tokens = |f: Tensor<4>| f.reshape([b, c, h * w]).swap_dims(1, 2);
         let (f0, f1) = (tokens(feature0), tokens(feature1));
@@ -260,8 +277,8 @@ impl FeatureTransformer {
         for (i, layer) in self.layers.iter().enumerate() {
             let with_shift = i % 2 == 1;
             let concat1 = swap_halves(concat0.clone());
-            let s = layer.self_attn.forward(concat0.clone(), concat0, win, with_shift);
-            concat0 = layer.cross_attn_ffn.forward(s, concat1, win, with_shift);
+            let s = layer.self_attn.forward(concat0.clone(), concat0, win, with_shift, own);
+            concat0 = layer.cross_attn_ffn.forward(s, concat1, win, with_shift, own);
         }
         let back = |t: Tensor<3>| t.swap_dims(1, 2).reshape([b, c, h, w]);
         (back(concat0.clone().narrow(0, 0, b)), back(concat0.narrow(0, b, b)))
@@ -809,7 +826,7 @@ impl Statics {
             quarter: Windows::new(h / 4, w / 4, 8, device),
             mean: c3([0.485, 0.456, 0.406]),
             std: c3([0.229, 0.224, 0.225]),
-            ops: Ops { kernels: true, conv_im2col: false, gru_factored: false, own_gemm: false },
+            ops: Ops { kernels: true, conv_im2col: false, gru_factored: false, own_gemm: false, gemm_linear: false },
         }
     }
 }
@@ -893,7 +910,7 @@ impl Gmflow {
         let (f0, f1) = (a.eighth.clone() + pos.clone(), b.eighth.clone() + pos);
         put(&mut trace, "pos_f0_0", &f0);
         put(&mut trace, "pos_f1_0", &f1);
-        let (f0, f1) = self.transformer.forward(f0, f1, &st.eighth);
+        let (f0, f1) = self.transformer.forward(f0, f1, &st.eighth, ops.gemm_linear);
         put(&mut trace, "transformer_f0_0", &f0);
         put(&mut trace, "transformer_f1_0", &f1);
         let flow = global_correlation_softmax(f0.clone(), f1.clone(), bidirectional);
@@ -916,7 +933,7 @@ impl Gmflow {
         let (f0, f1) = (f0_ori.clone() + pos.clone(), f1w + pos);
         put(&mut trace, "pos_f0_1", &f0);
         put(&mut trace, "pos_f1_1", &f1);
-        let (f0, f1) = self.transformer.forward(f0, f1, &st.quarter);
+        let (f0, f1) = self.transformer.forward(f0, f1, &st.quarter, ops.gemm_linear);
         put(&mut trace, "transformer_f0_1", &f0);
         put(&mut trace, "transformer_f1_1", &f1);
         let flow_pred = if ops.kernels { kernels::local_corr_softmax(f0.clone(), f1) } else { local_correlation_softmax(f0.clone(), f1, LOCAL_RADIUS) };
