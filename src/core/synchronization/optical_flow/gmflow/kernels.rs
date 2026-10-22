@@ -440,8 +440,8 @@ fn gemm_kernel<F: Float>(
 ) {
     let (m_n, k_n, n_n) = (a.shape(1), a.shape(2), b.shape(2));
     let batch = CUBE_POS_Z as usize;
-    let a_off = if a.shape(0) == 1 { 0 } else { batch * m_n * k_n };
-    let b_off = if b.shape(0) == 1 { 0 } else { batch * k_n * n_n };
+    let a_off = if a.shape(0) == 1usize { 0usize } else { batch * m_n * k_n };
+    let b_off = if b.shape(0) == 1usize { 0usize } else { batch * k_n * n_n };
     let bm = comptime!(GEMM_BLOCK);
     let bk = comptime!(GEMM_K);
     let th = comptime!(GEMM_THREADS);
@@ -462,7 +462,7 @@ fn gemm_kernel<F: Float>(
     for i in 0..per * per {
         acc[i] = zero;
     }
-    let k_tiles = (k_n + bk - 1) / bk;
+    let k_tiles = (k_n + bk - 1usize) / bk;
     for kt in 0..k_tiles {
         let k0 = kt * bk;
         // Every thread loads the same number of values of each tile; out of range: 0
