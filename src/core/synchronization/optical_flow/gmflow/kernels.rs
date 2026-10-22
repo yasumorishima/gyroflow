@@ -323,6 +323,60 @@ fn launch_convex_upsample(flow: CubeTensor, mask: CubeTensor) -> CubeTensor {
     out
 }
 
+// ---------------------------------------------------------------- convolution as im2col + matmul
+
+/// The columns of a convolution (F.unfold): out[n, (c * KH + ky) * KW + kx, oy * OW + ox] = x[n, c, oy * s - ph + ky,
+/// ox * s - pw + kx], zero outside. Multiplied by the weights [Cout, C*KH*KW], they give the convolution. One thread per
+/// output value.
+#[cube(launch)]
+fn im2col_kernel<F: Float>(
+    x: &Tensor<F>,       // [N, C, H, W]
+    out: &mut Tensor<F>, // [N, C*KH*KW, OH*OW]
+    #[comptime] kh: usize,
+    #[comptime] kw: usize,
+    #[comptime] stride: usize,
+    #[comptime] ph: usize,
+    #[comptime] pw: usize,
+    #[define(F)] _dtype: ElemType,
+) {
+    let idx = ABSOLUTE_POS as usize;
+    let (n_n, k_n, l_n) = (out.shape(0), out.shape(1), out.shape(2));
+    if idx >= n_n * k_n * l_n {
+        terminate!();
+    }
+    let (c_n, h, w) = (x.shape(1), x.shape(2), x.shape(3));
+    let ow = (w + 2 * pw - kw) / stride + 1;
+    let l = idx % l_n;
+    let k = (idx / l_n) % k_n;
+    let n = idx / (l_n * k_n);
+    let kx = k % kw;
+    let ky = (k / kw) % kh;
+    let c = k / (kw * kh);
+    let iy = ((l / ow) * stride + ky) as i32 - ph as i32;
+    let ix = ((l % ow) * stride + kx) as i32 - pw as i32;
+    let mut v = F::new(0.0);
+    if iy >= 0 && iy < h as i32 && ix >= 0 && ix < w as i32 {
+        v = x[((n * c_n + c) * h + iy as usize) * w + ix as usize];
+    }
+    out[idx] = v;
+}
+
+fn im2col_shape(x: &Shape, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> Shape {
+    let oh = (x[2] + 2 * ph - kh) / stride + 1;
+    let ow = (x[3] + 2 * pw - kw) / stride + 1;
+    Shape::new([x[0], x[1] * kh * kw, oh * ow])
+}
+
+fn launch_im2col(x: CubeTensor, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> CubeTensor {
+    let x = into_contiguous(x);
+    let shape = im2col_shape(x.meta.shape(), kh, kw, stride, ph, pw);
+    let n = shape.num_elements();
+    let dtype = x.dtype;
+    let (out, count, dim) = output_for(&x, shape, n);
+    im2col_kernel::launch(&out.client, count, dim, x.into_tensor_arg(), out.clone().into_tensor_arg(), kh, kw, stride, ph, pw, dtype_to_storage_type(dtype));
+    out
+}
+
 // ---------------------------------------------------------------- the backend extension
 
 /// The kernels as backend operations: on the CubeCL backends (Vulkan, Metal), and lazily under burn fusion
@@ -336,6 +390,8 @@ pub trait GmflowKernels: burn::backend::Backend {
     fn local_propagation(q: FloatTensor<Self>, k: FloatTensor<Self>, flow: FloatTensor<Self>) -> FloatTensor<Self>;
     #[fusion(dtype = flow, shape = upsampled_shape(flow))]
     fn convex_upsample(flow: FloatTensor<Self>, mask: FloatTensor<Self>) -> FloatTensor<Self>;
+    #[fusion(dtype = x, shape = im2col_shape(x, *kh, *kw, *stride, *ph, *pw))]
+    fn im2col(x: FloatTensor<Self>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> FloatTensor<Self>;
 }
 
 impl GmflowKernels for CubeBackend {
@@ -350,6 +406,9 @@ impl GmflowKernels for CubeBackend {
     }
     fn convex_upsample(flow: FloatTensor<Self>, mask: FloatTensor<Self>) -> FloatTensor<Self> {
         launch_convex_upsample(flow, mask)
+    }
+    fn im2col(x: FloatTensor<Self>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> FloatTensor<Self> {
+        launch_im2col(x, kh, kw, stride, ph, pw)
     }
 }
 
@@ -373,4 +432,36 @@ pub fn local_propagation(q: Tensor<4>, k: Tensor<4>, flow: Tensor<4>) -> Tensor<
 /// flow [B, 2, H, W], mask [B, 144, H, W] -> [B, 2, 4H, 4W]
 pub fn convex_upsample(flow: Tensor<4>, mask: Tensor<4>) -> Tensor<4> {
     Tensor::from_dispatch(Dispatch::convex_upsample(flow.into_dispatch(), mask.into_dispatch()))
+}
+
+/// A 2D convolution (symmetric zero padding, no dilation or groups) as im2col + one batched matmul, the columns made in
+/// chunks of images so that none is over `max_bytes` (Vulkan guarantees 128 MiB for one buffer). x [N, C, H, W],
+/// weight [Cout, C, KH, KW] -> [N, Cout, OH, OW]
+pub fn conv2d_im2col(x: Tensor<4>, weight: Tensor<4>, bias: Option<Tensor<1>>, stride: usize, padding: [usize; 2], max_bytes: usize) -> Tensor<4> {
+    let [n, c, h, w] = x.dims();
+    let [cout, cin, kh, kw] = weight.dims();
+    assert_eq!(c, cin, "conv2d_im2col: channels");
+    let (ph, pw) = (padding[0], padding[1]);
+    let oh = (h + 2 * ph - kh) / stride + 1;
+    let ow = (w + 2 * pw - kw) / stride + 1;
+    let k = c * kh * kw;
+    let per_image = k * oh * ow * 4;
+    assert!(per_image <= max_bytes, "conv2d_im2col: the columns of one image ({per_image} bytes) exceed {max_bytes}");
+    let chunk = (max_bytes / per_image).max(1);
+    let wmat = weight.reshape([1, cout, k]);
+    let mut outs = Vec::new();
+    let mut start = 0;
+    while start < n {
+        let len = chunk.min(n - start);
+        let part = if len == n { x.clone() } else { x.clone().narrow(0, start, len) };
+        let cols: Tensor<3> = Tensor::from_dispatch(Dispatch::im2col(part.into_dispatch(), kh, kw, stride, ph, pw));
+        outs.push(wmat.clone().matmul(cols)); // [len, Cout, OH*OW]
+        start += len;
+    }
+    let out = if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(outs, 0) };
+    let out = out.reshape([n, cout, oh, ow]);
+    match bias {
+        Some(b) => out + b.reshape([1, cout, 1, 1]),
+        None => out,
+    }
 }

@@ -41,6 +41,28 @@ pub const FEATURE_CHANNELS: usize = 128;
 pub const REFINE_ITERATIONS: usize = 6;
 const LOCAL_RADIUS: usize = 4; // matching at 1/4 and the correlation of the refinement
 const UPSAMPLE: usize = 4;
+/// The largest buffer the im2col convolutions make: Vulkan guarantees 128 MiB for one storage buffer
+const IM2COL_MAX_BYTES: usize = 120 << 20;
+
+/// Which implementation runs the operations that have more than one: the CubeCL kernels of kernels.rs or the plain tensor
+/// operations they replace (the reference), and convolutions as im2col + matmul or as burn convolutions
+#[derive(Clone, Copy, Debug)]
+pub struct Ops {
+    pub kernels: bool,
+    pub conv_im2col: bool,
+}
+
+/// A convolution of this model: 1x1 ones and the plain path through burn, the others as im2col + matmul if asked
+fn conv_fwd(conv: &Conv2d, x: Tensor<4>, ops: Ops) -> Tensor<4> {
+    let [kh, kw] = conv.kernel_size;
+    if !ops.conv_im2col || (kh == 1 && kw == 1) || conv.stride[0] != conv.stride[1] { return conv.forward(x); }
+    match conv.padding {
+        PaddingConfig2d::Explicit(t, l, b, r) if t == b && l == r => {
+            kernels::conv2d_im2col(x, conv.weight.val(), conv.bias.as_ref().map(|b| b.val()), conv.stride[0], [t, l], IM2COL_MAX_BYTES)
+        }
+        _ => conv.forward(x),
+    }
+}
 
 fn conv(channels: [usize; 2], kernel: [usize; 2], stride: usize, bias: bool, device: &Device) -> Conv2d {
     let (ph, pw) = (kernel[0] / 2, kernel[1] / 2);
@@ -80,11 +102,11 @@ impl ResidualBlock {
         }
     }
 
-    fn forward(&self, x: Tensor<4>) -> Tensor<4> {
-        let y = relu(self.norm.forward(self.conv1.forward(x.clone())));
-        let y = relu(self.norm.forward(self.conv2.forward(y)));
+    fn forward(&self, x: Tensor<4>, ops: Ops) -> Tensor<4> {
+        let y = relu(self.norm.forward(conv_fwd(&self.conv1, x.clone(), ops)));
+        let y = relu(self.norm.forward(conv_fwd(&self.conv2, y, ops)));
         let x = match &self.downsample {
-            Some(d) => self.norm.forward(d.forward(x)),
+            Some(d) => self.norm.forward(conv_fwd(d, x, ops)),
             None => x,
         };
         relu(x + y)
@@ -125,13 +147,18 @@ impl CnnEncoder {
     }
 
     /// Normalised images [N, 3, H, W] -> features at 1/4 and at 1/8, [N, 128, H/4, W/4] and [N, 128, H/8, W/8]
-    pub fn forward(&self, x: Tensor<4>) -> (Tensor<4>, Tensor<4>) {
-        let mut x = relu(self.norm1.forward(self.conv1.forward(x)));
+    pub fn forward(&self, x: Tensor<4>, ops: Ops) -> (Tensor<4>, Tensor<4>) {
+        let mut x = relu(self.norm1.forward(conv_fwd(&self.conv1, x, ops)));
         for block in self.layer1.iter().chain(&self.layer2).chain(&self.layer3) {
-            x = block.forward(x);
+            x = block.forward(x, ops);
         }
-        let x = self.conv2.forward(x);
+        let x = conv_fwd(&self.conv2, x, ops);
         let w = self.trident_conv.weight.val();
+        if ops.conv_im2col {
+            let quarter = kernels::conv2d_im2col(x.clone(), w.clone(), None, 1, [1, 1], IM2COL_MAX_BYTES);
+            let eighth = kernels::conv2d_im2col(x, w, None, 2, [1, 1], IM2COL_MAX_BYTES);
+            return (quarter, eighth);
+        }
         let quarter = conv2d(x.clone(), w.clone(), None, ConvOptions::new([1, 1], [1, 1], [1, 1], 1));
         let eighth = conv2d(x, w, None, ConvOptions::new([2, 2], [1, 1], [1, 1], 1));
         (quarter, eighth)
@@ -566,21 +593,21 @@ impl BasicUpdateBlock {
         }
     }
 
-    fn motion(&self, flow: Tensor<4>, corr: Tensor<4>) -> Tensor<4> {
+    fn motion(&self, flow: Tensor<4>, corr: Tensor<4>, ops: Ops) -> Tensor<4> {
         let e = &self.encoder;
-        let cor = relu(e.convc2.forward(relu(e.convc1.forward(corr))));
-        let flo = relu(e.convf2.forward(relu(e.convf1.forward(flow.clone()))));
-        let out = relu(e.conv.forward(Tensor::cat(vec![cor, flo], 1)));
+        let cor = relu(conv_fwd(&e.convc2, relu(conv_fwd(&e.convc1, corr, ops)), ops));
+        let flo = relu(conv_fwd(&e.convf2, relu(conv_fwd(&e.convf1, flow.clone(), ops)), ops));
+        let out = relu(conv_fwd(&e.conv, Tensor::cat(vec![cor, flo], 1), ops));
         Tensor::cat(vec![out, flow], 1)
     }
 
-    fn gru(&self, h: Tensor<4>, x: Tensor<4>) -> Tensor<4> {
+    fn gru(&self, h: Tensor<4>, x: Tensor<4>, ops: Ops) -> Tensor<4> {
         let g = &self.gru;
         let half = |h: Tensor<4>, cz: &Conv2d, cr: &Conv2d, cq: &Conv2d| {
             let hx = Tensor::cat(vec![h.clone(), x.clone()], 1);
-            let z = sigmoid(cz.forward(hx.clone()));
-            let r = sigmoid(cr.forward(hx));
-            let q = tanh(cq.forward(Tensor::cat(vec![r * h.clone(), x.clone()], 1)));
+            let z = sigmoid(conv_fwd(cz, hx.clone(), ops));
+            let r = sigmoid(conv_fwd(cr, hx, ops));
+            let q = tanh(conv_fwd(cq, Tensor::cat(vec![r * h.clone(), x.clone()], 1), ops));
             // (1 - z) * h + z * q, in the same order of operations as unimatch
             (z.clone().neg().add_scalar(1.0)) * h + z * q
         };
@@ -589,15 +616,15 @@ impl BasicUpdateBlock {
     }
 
     /// One refinement step: the new hidden state and the flow update
-    fn forward(&self, net: Tensor<4>, inp: Tensor<4>, corr: Tensor<4>, flow: Tensor<4>) -> (Tensor<4>, Tensor<4>) {
-        let motion = self.motion(flow, corr);
-        let net = self.gru(net, Tensor::cat(vec![inp, motion], 1));
-        let delta = self.flow_head.conv2.forward(relu(self.flow_head.conv1.forward(net.clone())));
+    fn forward(&self, net: Tensor<4>, inp: Tensor<4>, corr: Tensor<4>, flow: Tensor<4>, ops: Ops) -> (Tensor<4>, Tensor<4>) {
+        let motion = self.motion(flow, corr, ops);
+        let net = self.gru(net, Tensor::cat(vec![inp, motion], 1), ops);
+        let delta = conv_fwd(&self.flow_head.conv2, relu(conv_fwd(&self.flow_head.conv1, net.clone(), ops)), ops);
         (net, delta)
     }
 
-    fn up_mask(&self, net: Tensor<4>) -> Tensor<4> {
-        self.mask.conv2.forward(relu(self.mask.conv1.forward(net)))
+    fn up_mask(&self, net: Tensor<4>, ops: Ops) -> Tensor<4> {
+        conv_fwd(&self.mask.conv2, relu(conv_fwd(&self.mask.conv1, net, ops)), ops)
     }
 }
 
@@ -640,8 +667,7 @@ pub struct Statics {
     /// ImageNet mean and std, [1, 3, 1, 1]
     pub mean: Tensor<4>,
     pub std: Tensor<4>,
-    /// The CubeCL kernels of kernels.rs where they exist, or else the plain tensor operations they replace (the reference)
-    pub kernels: bool,
+    pub ops: Ops,
 }
 
 impl Statics {
@@ -655,7 +681,7 @@ impl Statics {
             quarter: Windows::new(h / 4, w / 4, 8, device),
             mean: c3([0.485, 0.456, 0.406]),
             std: c3([0.229, 0.224, 0.225]),
-            kernels: true,
+            ops: Ops { kernels: true, conv_im2col: false },
         }
     }
 }
@@ -689,7 +715,8 @@ impl Gmflow {
     pub fn forward_traced(&self, img0: Tensor<4>, img1: Tensor<4>, st: &Statics, mut trace: Option<&mut Trace>) -> Tensor<4> {
         let b = img0.dims()[0];
         let norm = |x: Tensor<4>| (x.div_scalar(255.0) - st.mean.clone()) / st.std.clone();
-        let (quarter, eighth) = self.backbone.forward(Tensor::cat(vec![norm(img0), norm(img1)], 0));
+        let ops = st.ops;
+        let (quarter, eighth) = self.backbone.forward(Tensor::cat(vec![norm(img0), norm(img1)], 0), ops);
         put(&mut trace, "backbone0", &quarter);
         put(&mut trace, "backbone1", &eighth);
 
@@ -720,10 +747,10 @@ impl Gmflow {
         let (f0, f1) = self.transformer.forward(f0, f1, &st.quarter);
         put(&mut trace, "transformer_f0_1", &f0);
         put(&mut trace, "transformer_f1_1", &f1);
-        let flow_pred = if st.kernels { kernels::local_corr_softmax(f0.clone(), f1) } else { local_correlation_softmax(f0.clone(), f1, LOCAL_RADIUS) };
+        let flow_pred = if st.ops.kernels { kernels::local_corr_softmax(f0.clone(), f1) } else { local_correlation_softmax(f0.clone(), f1, LOCAL_RADIUS) };
         put(&mut trace, "local_corr_flow0", &flow_pred);
         let flow = flow + flow_pred;
-        let mut flow = self.feature_flow_attn.local(f0.clone(), flow, 1, st.kernels);
+        let mut flow = self.feature_flow_attn.local(f0.clone(), flow, 1, st.ops.kernels);
         put(&mut trace, "propagated1", &flow);
 
         // Refinement: the context comes from feature 0 of the transformer and is the same in every iteration (unimatch
@@ -734,20 +761,20 @@ impl Gmflow {
         let inp = relu(proj.narrow(1, 128, 128));
         let mut net = net0.clone();
         for i in 0..REFINE_ITERATIONS {
-            let corr = if st.kernels {
+            let corr = if st.ops.kernels {
                 kernels::corr_with_flow(f0_ori.clone(), f1_ori.clone(), flow.clone())
             } else {
                 local_correlation_with_flow(f0_ori.clone(), f1_ori.clone(), flow.clone(), LOCAL_RADIUS)
             };
             put(&mut trace, &format!("corr_with_flow{i}"), &corr);
-            let (n, delta) = self.refine.forward(net0.clone(), inp.clone(), corr, flow.clone());
+            let (n, delta) = self.refine.forward(net0.clone(), inp.clone(), corr, flow.clone(), ops);
             put(&mut trace, &format!("refine_net{i}"), &n);
             put(&mut trace, &format!("refine_delta{i}"), &delta);
             net = n;
             flow = flow + delta;
         }
-        let mask = self.refine.up_mask(net);
-        let up = if st.kernels { kernels::convex_upsample(flow, mask) } else { convex_upsample(flow, mask) };
+        let mask = self.refine.up_mask(net, ops);
+        let up = if st.ops.kernels { kernels::convex_upsample(flow, mask) } else { convex_upsample(flow, mask) };
         put(&mut trace, "upsampled0", &up);
         up
     }

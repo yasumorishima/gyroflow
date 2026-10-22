@@ -59,7 +59,7 @@ fn matches_pytorch() {
     let model = load(&device);
     let mut st = Statics::new(H, W, &device);
     // The stages with the plain tensor operations (the port itself); the kernels are checked against these separately
-    st.kernels = false;
+    st.ops.kernels = false;
 
     // Stage by stage on pair 1, against the intermediates of unimatch (reported, not gated: errors carry over)
     let inp = |k: usize, i: usize| tensor4(&dir.join(format!("pair{k}_in{i}.f32")), [1, 3, H, W], &device);
@@ -80,8 +80,10 @@ fn matches_pytorch() {
 
     // The gate (pre-registered for the ONNX model, the same here): every pair, max <= 1e-2 px and mean <= 1e-4 px, with the
     // plain operations and with the kernels
-    for with_kernels in [false, true] {
-        st.kernels = with_kernels;
+    for (with_kernels, conv_im2col) in [(false, false), (true, false), (true, true)] {
+        st.ops.kernels = with_kernels;
+        st.ops.conv_im2col = conv_im2col;
+        let label = format!("{}{}", if with_kernels { "kernels" } else { "plain  " }, if conv_im2col { "+im2col" } else { "       " });
         let mut checked = 0;
         for k in 0.. {
             if !dir.join(format!("pair{k}_torch.f32")).exists() { break; }
@@ -89,7 +91,7 @@ fn matches_pytorch() {
             let flow = to_vec(model.forward(inp(k, 0), inp(k, 1), &st));
             let secs = started.elapsed().as_secs_f64();
             let (max, mean, _) = diff(&flow, &read_f32(&dir.join(format!("pair{k}_torch.f32"))));
-            println!("{} pair {k}: max |burn - torch| {max:.2e} px, mean {mean:.2e} px, one pass {secs:.3} s", if with_kernels { "kernels" } else { "plain  " });
+            println!("{label} pair {k}: max |burn - torch| {max:.2e} px, mean {mean:.2e} px, one pass {secs:.3} s");
             assert!(max <= 1e-2 && mean <= 1e-4, "pair {k}: max {max:e}, mean {mean:e}");
             checked += 1;
         }
@@ -99,8 +101,10 @@ fn matches_pytorch() {
     // Warm: the same pair again until the time settles (spread of the last 5 under 5 %) or 30 passes
     let runs: usize = std::env::var("GMFLOW_WARM_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
     if runs == 0 { return; }
-    for with_kernels in [false, true] {
-    st.kernels = with_kernels;
+    for (with_kernels, conv_im2col) in [(false, false), (true, false), (true, true)] {
+    st.ops.kernels = with_kernels;
+    st.ops.conv_im2col = conv_im2col;
+    let label = format!("{}{}", if with_kernels { "kernels" } else { "plain" }, if conv_im2col { "+im2col" } else { "" });
     let mut times = Vec::new();
     for _ in 0..30 {
         let started = Instant::now();
@@ -115,7 +119,7 @@ fn matches_pytorch() {
     }
     let last = &times[times.len() - 5..];
     let mean = last.iter().sum::<f64>() / 5.0;
-    println!("warm, {}: {mean:.3} s per pass (mean of the last 5 of {} passes: {:?})", if with_kernels { "kernels" } else { "plain" }, times.len(), last.iter().map(|t| format!("{t:.3}")).collect::<Vec<_>>());
+    println!("warm, {label}: {mean:.3} s per pass (mean of the last 5 of {} passes: {:?})", times.len(), last.iter().map(|t| format!("{t:.3}")).collect::<Vec<_>>());
     }
 }
 
@@ -144,5 +148,14 @@ fn kernels_match_plain() {
     check("local propagation", kernels::local_propagation(f0.clone(), f1.clone(), flow.clone()), model::local_propagation(f0.clone(), f1.clone(), flow.clone(), kernels::PROP_RADIUS));
     let mask = rnd([b, 9 * 16, h, w], 2.0);
     check("convex upsampling", kernels::convex_upsample(flow.clone(), mask.clone()), model::convex_upsample(flow, mask));
+    // Convolutions of the shapes of the model as im2col + matmul, against burn
+    for (cin, cout, kh, kw, stride, ph, pw, hh, ww) in [(3usize, 64usize, 7usize, 7usize, 2usize, 3usize, 3usize, H, W), (64, 64, 3, 3, 1, 1, 1, H / 2, W / 2), (256, 192, 3, 3, 1, 1, 1, h, w), (384, 128, 1, 5, 1, 0, 2, h, w), (384, 128, 5, 1, 1, 2, 0, h, w)] {
+        let x = rnd([2, cin, hh, ww], 1.0);
+        let wt = rnd([cout, cin, kh, kw], 0.02); // outputs of order 1, as the other checks
+        let bias = Tensor::<1>::random([cout], Distribution::Normal(0.0, 0.1), &device);
+        let want = burn::tensor::module::conv2d(x.clone(), wt.clone(), Some(bias.clone()), burn::tensor::ops::ConvOptions::new([stride, stride], [ph, pw], [1, 1], 1));
+        let got = kernels::conv2d_im2col(x, wt, Some(bias), stride, [ph, pw], 120 << 20);
+        check(&format!("conv {cin}->{cout} {kh}x{kw}/{stride} im2col"), got, want);
+    }
     assert!(worst <= 1e-4, "a kernel differs from the plain operations by {worst:e}");
 }
