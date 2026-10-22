@@ -6,7 +6,7 @@ name: gmflow native
 on:
   push:
     branches: ['wip/gmflow-native']
-    paths: ['ci-gpu/**', '.github/workflows/gmflow-native.yml', 'src/core/synchronization/optical_flow/gmflow/**']
+    paths: ['ci-gpu/**', '!ci-gpu/baseline.trigger', '.github/workflows/gmflow-native.yml', 'src/core/synchronization/optical_flow/gmflow/**']
   workflow_dispatch:
     inputs:
       memo:

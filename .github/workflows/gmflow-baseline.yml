@@ -1,8 +1,12 @@
 # Work branch only (never part of #1143): the baseline of the hand-written burn gmflow, run by hand: PyTorch references
-# and the time and per-kernel profile of the model of the PR as it is (ONNX-generated) on Metal.
+# and the time and per-kernel profile of the model of the PR as it is (ONNX-generated) on Metal. Runs when
+# ci-gpu/baseline.trigger changes (a workflow that exists only on this branch cannot be dispatched).
 name: gmflow baseline
 
 on:
+  push:
+    branches: ['wip/gmflow-native']
+    paths: ['ci-gpu/baseline.trigger']
   workflow_dispatch:
     inputs:
       memo:
