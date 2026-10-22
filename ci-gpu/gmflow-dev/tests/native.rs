@@ -189,7 +189,13 @@ fn kernels_match_plain() {
     let mut check = |label: &str, got: Tensor<4>, want: Tensor<4>| {
         assert_eq!(got.dims(), want.dims(), "{label}: shape");
         let (max, mean, scale) = diff(&to_vec(got), &to_vec(want));
-        let limit = if label == "local_correlation_softmax" { 1e-3 } else { 1e-4 };
+        // local_correlation_with_flow: the plain op rounds the sample position x + dx + flow (up to ~160, float32 step
+        // 1.5e-5) before taking its fraction, the kernel takes the fraction of the flow alone; with neighbouring values of
+        // random features differing by up to ~10 that is ~1e-4 (measured 1.10e-4 for flows just under integers on
+        // lavapipe, after the 1e-4 set before measuring): 1e-3 as for local_correlation_softmax, still far under the
+        // errors of order 1 of a wrong tap
+        let rounding_of_positions = label == "local_correlation_softmax" || label.contains("corr_with_flow") || label == "local_correlation_with_flow";
+        let limit = if rounding_of_positions { 1e-3 } else { 1e-4 };
         println!("{label:28}: max |kernel - plain| {max:.2e}, mean {mean:.2e} (values up to {scale:.2e}, limit {limit:e})");
         if !(max <= limit) { failed.push(format!("{label}: {max:e}")); }
     };
