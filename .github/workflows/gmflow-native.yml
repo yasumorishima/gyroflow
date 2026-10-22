@@ -1,0 +1,98 @@
+# Work branch only (never part of #1143): the hand-written burn gmflow. Step 0: PyTorch references (forward, bidirectional,
+# intermediates) and the profile of the current (ONNX-generated) model on Metal, as the baseline.
+name: gmflow native
+
+on:
+  push:
+    branches: ['wip/gmflow-native']
+    paths: ['ci-gpu/**', '.github/workflows/gmflow-native.yml', 'src/core/**', 'Cargo.toml', 'Cargo.lock']
+  workflow_dispatch:
+    inputs:
+      memo:
+        description: why this run
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gmflow-native-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PTH_URL: https://s3.eu-central-1.amazonaws.com/avg-projects/unimatch/pretrained/gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth
+  UNIMATCH_SHA: da140fa
+  VIDEO_URL: https://github.com/intel-iot-devkit/sample-videos/raw/master/person-bicycle-car-detection.mp4
+  CARGO_TERM_COLOR: never
+
+jobs:
+  refs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: ci-gpu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Python packages
+        run: |
+          pip install --quiet torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet numpy==1.26.4 opencv-python-headless==4.10.0.84
+      - name: References from the unchanged PyTorch model
+        run: |
+          git clone -q https://github.com/AdrianEddy/unimatch.git unimatch
+          git -C unimatch checkout -q "$UNIMATCH_SHA"
+          curl -fsSL --retry 3 --max-time 600 -o gmflow.pth "$PTH_URL"
+          curl -fsSL --retry 3 --max-time 600 -o video.mp4 "$VIDEO_URL"
+          python refs_native.py gmflow.pth unimatch video.mp4 out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gmflow-refs
+          retention-days: 7
+          path: ci-gpu/out
+
+  # The model of the PR as it is (burn-onnx codegen), on the paravirtualised Apple GPU of the hosted macOS runner: warm
+  # time per pair, then the same passes with cubecl's per-kernel profile. A virtual machine's speed, not a Mac's.
+  baseline-metal:
+    needs: refs
+    runs-on: macos-14
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: gmflow-refs
+          path: ci-gpu/out
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustc --version
+      - name: Build the tests
+        working-directory: src/core
+        run: time cargo test --locked --release --features use-burn --lib --no-run
+      - name: Metal against PyTorch, 10 warm passes
+        working-directory: src/core
+        env:
+          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
+          GMFLOW_WARM_RUNS: '10'
+        run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_matches_pytorch timing.log
+      - name: The same with cubecl's per-kernel profile (3 warm passes)
+        working-directory: src/core
+        env:
+          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
+          GMFLOW_WARM_RUNS: '3'
+          CUBECL_DEBUG_LOG: stdout
+          CUBECL_DEBUG_OPTION: profile
+        run: |
+          cargo test --locked --release --features use-burn --lib -- --ignored --nocapture --exact synchronization::optical_flow::gmflow::tests::gmflow_matches_pytorch > profile.log 2>&1 || { tail -n 50 profile.log; exit 1; }
+          ls -la profile.log
+          python3 ../../ci-gpu/profile_summary.py profile.log "pair 2 on" "test result:" 3 | tee profile_summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: baseline-metal-profile
+          retention-days: 7
+          path: |
+            src/core/timing.log
+            src/core/profile_summary.txt
