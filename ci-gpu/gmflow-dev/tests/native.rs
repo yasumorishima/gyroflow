@@ -187,6 +187,12 @@ fn kernels_match_plain() {
         if !(max <= limit) { failed.push(format!("{label}: {max:e}")); }
     };
     check("local_correlation_with_flow", kernels::corr_with_flow(f0.clone(), f1.clone(), flow.clone()), model::local_correlation_with_flow(f0.clone(), f1.clone(), flow.clone(), kernels::CORR_RADIUS));
+    // The kernel takes the bilinear weights from the fractional part of the flow alone: integer flows (weight 0 on the
+    // second taps) and flows just under an integer (weight ~1 on them) as well
+    let flow_int = flow.clone().round();
+    check("corr_with_flow, integer flow", kernels::corr_with_flow(f0.clone(), f1.clone(), flow_int.clone()), model::local_correlation_with_flow(f0.clone(), f1.clone(), flow_int.clone(), kernels::CORR_RADIUS));
+    let flow_under = flow_int.sub_scalar(1e-3);
+    check("corr_with_flow, just under", kernels::corr_with_flow(f0.clone(), f1.clone(), flow_under.clone()), model::local_correlation_with_flow(f0.clone(), f1.clone(), flow_under, kernels::CORR_RADIUS));
     check("local_correlation_softmax", kernels::local_corr_softmax(f0.clone(), f1.clone()), model::local_correlation_softmax(f0.clone(), f1.clone(), kernels::CORR_RADIUS));
     check("local propagation", kernels::local_propagation(f0.clone(), f1.clone(), flow.clone()), model::local_propagation(f0.clone(), f1.clone(), flow.clone(), kernels::PROP_RADIUS));
     let mask = rnd([b, 9 * 16, h, w], 2.0);

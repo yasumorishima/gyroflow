@@ -22,12 +22,51 @@ pub const PROP_RADIUS: usize = 1;
 pub const UPSAMPLE: usize = 4;
 
 /// local_correlation_with_flow: out[b, k, y, x] = f0[b, :, y, x] . bilinear(f1[b], (x, y) + flow[b, :, y, x] + offset_k)
-/// / sqrt(C), zeros outside of the map (each of the 4 taps on its own, as F.grid_sample with zeros padding). One thread
-/// per output value.
+/// / sqrt(C), zeros outside of the map (each of the 4 taps on its own, as F.grid_sample with zeros padding).
+/// The offsets are integers, so the (2r+1)^2 sample points of a position share the fractional part of its flow: their
+/// taps are the (2r+2)^2 integer points from floor((x, y) + flow) - r, and each output is the bilinear weighting of the
+/// 4 products of f0 with its taps. Two kernels: the products with the (2r+2)^2 integer points (0 outside of the map),
+/// then the weighting: (2r+2)^2 products of C channels per position instead of 4 (2r+1)^2.
 #[cube(launch)]
-fn corr_with_flow_kernel<F: Float>(
+fn corr_taps_kernel<F: Float>(
     f0: &Tensor<F>,      // [B, C, H, W]
     f1: &Tensor<F>,      // [B, C, H, W]
+    flow: &Tensor<F>,    // [B, 2, H, W]
+    taps: &mut Tensor<F>, // [B, (2r+2)^2, H, W]
+    #[comptime] radius: usize,
+    #[define(F)] _dtype: ElemType,
+) {
+    let idx = ABSOLUTE_POS as usize;
+    let (b_n, k_n, h, w) = (taps.shape(0), taps.shape(1), taps.shape(2), taps.shape(3));
+    if idx >= b_n * k_n * h * w {
+        terminate!();
+    }
+    let hw = h * w;
+    let x = idx % w;
+    let y = (idx / w) % h;
+    let k = (idx / hw) % k_n;
+    let b = idx / (hw * k_n);
+    let n = comptime!(2 * radius + 2);
+    let r = comptime!(radius as i32);
+    let p = y * w + x;
+    let sx = x as i32 + i32::cast_from(flow[b * 2 * hw + p].floor()) - r + (k % n) as i32;
+    let sy = y as i32 + i32::cast_from(flow[b * 2 * hw + hw + p].floor()) - r + (k / n) as i32;
+    let mut acc = F::new(0.0_f32);
+    if sx >= 0 && sx < w as i32 && sy >= 0 && sy < h as i32 {
+        let q = sy as usize * w + sx as usize;
+        let c_n = f0.shape(1);
+        for c in 0..c_n {
+            let base = (b * c_n + c) * hw;
+            acc += f0[base + p] * f1[base + q];
+        }
+        acc = acc / F::sqrt(F::cast_from(c_n as u32));
+    }
+    taps[idx] = acc;
+}
+
+#[cube(launch)]
+fn corr_weight_kernel<F: Float>(
+    taps: &Tensor<F>,    // [B, (2r+2)^2, H, W]
     flow: &Tensor<F>,    // [B, 2, H, W]
     out: &mut Tensor<F>, // [B, (2r+1)^2, H, W]
     #[comptime] radius: usize,
@@ -39,50 +78,23 @@ fn corr_with_flow_kernel<F: Float>(
         terminate!();
     }
     let hw = h * w;
-    let x = idx % w;
-    let y = (idx / w) % h;
+    let p = idx % hw;
     let k = (idx / hw) % k_n;
     let b = idx / (hw * k_n);
     let n = comptime!(2 * radius + 1);
-    let r = comptime!(radius as i32);
-    let dx = (k % n) as i32 - r;
-    let dy = (k / n) as i32 - r;
-
-    let p = y * w + x;
-    let px = F::cast_from(x as i32 + dx) + flow[b * 2 * hw + p];
-    let py = F::cast_from(y as i32 + dy) + flow[b * 2 * hw + hw + p];
-    let x0f = px.floor();
-    let y0f = py.floor();
-    let ax = px - x0f;
-    let ay = py - y0f;
-    let x0 = i32::cast_from(x0f);
-    let y0 = i32::cast_from(y0f);
-    let wi = w as i32;
-    let hi = h as i32;
-    let in_x0 = x0 >= 0 && x0 < wi;
-    let in_x1 = x0 + 1 >= 0 && x0 + 1 < wi;
-    let in_y0 = y0 >= 0 && y0 < hi;
-    let in_y1 = y0 + 1 >= 0 && y0 + 1 < hi;
+    let m = comptime!(2 * radius + 2);
+    let fx = flow[b * 2 * hw + p];
+    let fy = flow[b * 2 * hw + hw + p];
+    let ax = fx - fx.floor();
+    let ay = fy - fy.floor();
     let one = F::new(1.0_f32);
-    let zero = F::new(0.0_f32);
-    let w00 = if in_x0 && in_y0 { (one - ax) * (one - ay) } else { zero };
-    let w01 = if in_x1 && in_y0 { ax * (one - ay) } else { zero };
-    let w10 = if in_x0 && in_y1 { (one - ax) * ay } else { zero };
-    let w11 = if in_x1 && in_y1 { ax * ay } else { zero };
-    // Clamped addresses: a tap outside of the map has weight 0, its address only has to be valid
-    let cx0 = clamp(x0, 0, wi - 1) as usize;
-    let cx1 = clamp(x0 + 1, 0, wi - 1) as usize;
-    let cy0 = clamp(y0, 0, hi - 1) as usize;
-    let cy1 = clamp(y0 + 1, 0, hi - 1) as usize;
-
-    let c_n = f0.shape(1);
-    let mut acc = zero;
-    for c in 0..c_n {
-        let base = (b * c_n + c) * hw;
-        let s = w00 * f1[base + cy0 * w + cx0] + w01 * f1[base + cy0 * w + cx1] + w10 * f1[base + cy1 * w + cx0] + w11 * f1[base + cy1 * w + cx1];
-        acc += f0[base + p] * s;
-    }
-    out[idx] = acc / F::sqrt(F::cast_from(c_n as u32));
+    // Tap (i, j) of output (dy, dx) = (k / n, k % n) is integer point (dy + i, dx + j) of the (2r+2)^2 window
+    let t = (b * m * m + (k / n) * m + k % n) * hw + p;
+    let t00 = taps[t];
+    let t01 = taps[t + hw];
+    let t10 = taps[t + m * hw];
+    let t11 = taps[t + (m + 1) * hw];
+    out[idx] = (one - ay) * ((one - ax) * t00 + ax * t01) + ay * ((one - ax) * t10 + ax * t11);
 }
 
 /// local_correlation_softmax at integer offsets: the correlation of each position with the (2r+1)^2 window around it
@@ -288,11 +300,17 @@ fn output_for(like: &CubeTensor, shape: Shape, threads: usize) -> (CubeTensor, c
 
 fn launch_corr_with_flow(f0: CubeTensor, f1: CubeTensor, flow: CubeTensor) -> CubeTensor {
     let (f0, f1, flow) = (into_contiguous(f0), into_contiguous(f1), into_contiguous(flow));
-    let shape = corr_shape(f0.meta.shape());
-    let n = shape.num_elements();
+    let s = f0.meta.shape().clone();
+    let m = 2 * CORR_RADIUS + 2;
+    let taps_shape = Shape::new([s[0], m * m, s[2], s[3]]);
+    let n_taps = taps_shape.num_elements();
     let dtype = f0.dtype;
-    let (out, count, dim) = output_for(&f0, shape, n);
-    corr_with_flow_kernel::launch(&out.client, count, dim, f0.into_tensor_arg(), f1.into_tensor_arg(), flow.into_tensor_arg(), out.clone().into_tensor_arg(), CORR_RADIUS, dtype_to_storage_type(dtype));
+    let (taps, count, dim) = output_for(&f0, taps_shape, n_taps);
+    corr_taps_kernel::launch(&taps.client, count, dim, f0.into_tensor_arg(), f1.into_tensor_arg(), flow.clone().into_tensor_arg(), taps.clone().into_tensor_arg(), CORR_RADIUS, dtype_to_storage_type(dtype));
+    let shape = corr_shape(&s);
+    let n = shape.num_elements();
+    let (out, count, dim) = output_for(&taps, shape, n);
+    corr_weight_kernel::launch(&out.client, count, dim, taps.into_tensor_arg(), flow.into_tensor_arg(), out.clone().into_tensor_arg(), CORR_RADIUS, dtype_to_storage_type(dtype));
     out
 }
 
