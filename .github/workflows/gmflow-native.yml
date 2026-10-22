@@ -61,8 +61,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: lavapipe, os: ubuntu-24.04, warm: '0' }
-          - { name: metal-wgsl, os: macos-14, warm: '10' }
+          - { name: lavapipe, os: ubuntu-24.04, warm: '0', features: '' }
+          - { name: metal-wgsl, os: macos-14, warm: '10', features: '' }
+          - { name: metal-msl, os: macos-15, warm: '10', features: msl }
     name: native-${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
@@ -84,22 +85,26 @@ jobs:
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable && rustc --version
       - name: Build the tests
-        run: time cargo test --release --test native --no-run
+        run: time cargo test --release --features "${{ matrix.features }}" --test native --no-run
       - name: The checkpoint into the model, written as .bpk
         env:
           GMFLOW_BPK: ${{ runner.temp }}/gmflow.bpk
         run: |
           curl -fsSL --retry 3 --max-time 600 -o "$RUNNER_TEMP/gmflow.pth" "$PTH_URL"
-          GMFLOW_PTH="$RUNNER_TEMP/gmflow.pth" cargo test --release --test native -- --ignored --nocapture --exact convert_weights 2>&1 | tee convert.log
+          GMFLOW_PTH="$RUNNER_TEMP/gmflow.pth" cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact convert_weights 2>&1 | tee convert.log
           grep -q "test result: ok. 1 passed" convert.log
           ls -la "$GMFLOW_BPK"; shasum -a 256 "$GMFLOW_BPK"
+      - name: Each kernel against the plain operations it replaces
+        run: |
+          cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact kernels_match_plain 2>&1 | tee kernels.log
+          grep -q "test result: ok. 1 passed" kernels.log
       - name: Against PyTorch, stage by stage and every pair
         env:
           GMFLOW_BPK: ${{ runner.temp }}/gmflow.bpk
           GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
           GMFLOW_WARM_RUNS: ${{ matrix.warm }}
         run: |
-          cargo test --release --test native -- --ignored --nocapture --exact matches_pytorch 2>&1 | tee pytorch.log
+          cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matches_pytorch 2>&1 | tee pytorch.log
           grep -q "test result: ok. 1 passed" pytorch.log
       - uses: actions/upload-artifact@v4
         if: always()

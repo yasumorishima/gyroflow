@@ -10,11 +10,17 @@ publish = false
 
 [dependencies]
 burn-store = { version = "=0.22.1", default-features = false, features = ["std", "pytorch"] }
+burn-cubecl = { version = "=0.22.1" }
+cubecl = { version = "=0.11.1" }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
-burn = { version = "=0.22.1", default-features = false, features = ["std", "autotune", "fusion", "cubecl", "wgpu"] }
+burn = { version = "=0.22.1", default-features = false, features = ["std", "autotune", "fusion", "cubecl", "extension", "wgpu"] }
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
-burn = { version = "=0.22.1", default-features = false, features = ["std", "autotune", "fusion", "cubecl", "vulkan"] }
+burn = { version = "=0.22.1", default-features = false, features = ["std", "autotune", "fusion", "cubecl", "extension", "vulkan"] }
+
+[features]
+# Native MSL kernels on Metal (cooperative matrices), falling back to WGSL where the device or the compiler lacks it
+msl = ["burn/metal"]
 
 [profile.release]
 debug = false

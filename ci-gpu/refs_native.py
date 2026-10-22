@@ -123,7 +123,16 @@ um.global_correlation_softmax = wrap("global_corr_flow", orig["global_correlatio
 um.local_correlation_softmax = wrap("local_corr_flow", orig["local_correlation_softmax"], lambda o: o[0])
 um.local_correlation_with_flow = wrap("corr_with_flow", orig["local_correlation_with_flow"], lambda o: o)
 um.upsample_flow_with_mask = wrap("upsampled", orig["upsample_flow_with_mask"], lambda o: o)
-um.flow_warp = wrap("warped_feature1", orig["flow_warp"], lambda o: o[0])
+
+
+def warp(*args, **kwargs):
+    record("warp_flow", args[1])
+    out = orig["flow_warp"](*args, **kwargs)
+    record("warped_feature1_", out[0])
+    return out
+
+
+um.flow_warp = warp
 
 
 # A forward hook that returns anything but None replaces the output of the module: these return None
@@ -142,6 +151,7 @@ net.transformer.register_forward_hook(hook(("transformer_f0_", lambda o: o[0]), 
 net.feature_flow_attn.register_forward_hook(hook(("propagated", lambda o: o)))
 net.refine.register_forward_hook(hook(("refine_net", lambda o: o[0]), ("refine_delta", lambda o: o[2])))
 net.refine_proj.register_forward_hook(hook(("refine_proj", lambda o: o)))
+net.feature_add_position.register_forward_hook(hook(("pos_f0_", lambda o: o[0]), ("pos_f1_", lambda o: o[1])))
 with torch.no_grad():
     a, b = pairs[1]
     final = net(a, b, **ARGS)["flow_preds"][-1]

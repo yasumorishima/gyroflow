@@ -1,5 +1,7 @@
 #[path = "../../../src/core/synchronization/optical_flow/gmflow/model.rs"]
 pub mod model;
+#[path = "../../../src/core/synchronization/optical_flow/gmflow/kernels.rs"]
+pub mod kernels;
 
 use burn::tensor::wgpu::WgpuBackend;
 use burn::tensor::{ Device, DeviceKind, Tensor, TensorData };
@@ -10,11 +12,28 @@ pub const GRAPHICS_API: WgpuBackend = WgpuBackend::Metal;
 #[cfg(not(target_vendor = "apple"))]
 pub const GRAPHICS_API: WgpuBackend = WgpuBackend::Vulkan;
 
-/// The default adapter of the graphics API (lavapipe on the Linux runner, the paravirtual GPU on the macOS one)
+/// The default adapter of the graphics API (lavapipe on the Linux runner, the paravirtual GPU on the macOS one). With the
+/// msl feature, Metal is asked for explicitly first, which needs native MSL, then chosen automatically (WGSL fallback)
 pub fn device() -> (Device, String) {
-    let (device, setup) = Device::wgpu_options().graphics_api(GRAPHICS_API).device_kind(DeviceKind::DefaultDevice).init_with_setup().expect("a GPU");
-    let info = setup.adapter.get_info();
-    (device, format!("{} ({:?}, {:?})", info.name, info.device_type, info.backend))
+    let describe = |setup: &burn::tensor::wgpu::WgpuSetup, kernels: &str| {
+        let info = setup.adapter.get_info();
+        format!("{} ({:?}, {:?}, {kernels} kernels)", info.name, info.device_type, info.backend)
+    };
+    #[cfg(feature = "msl")]
+    {
+        match Device::wgpu_options().graphics_api(GRAPHICS_API).device_kind(DeviceKind::DefaultDevice).init_with_setup() {
+            Ok((device, setup)) => return (device, describe(&setup, "MSL")),
+            Err(e) => println!("native MSL not available: {e:?}"),
+        }
+        let (device, setup) = Device::wgpu_options().device_kind(DeviceKind::DefaultDevice).init_with_setup().expect("a GPU");
+        return (device, describe(&setup, "automatic (WGSL)"));
+    }
+    #[allow(unreachable_code)]
+    {
+        let (device, setup) = Device::wgpu_options().graphics_api(GRAPHICS_API).device_kind(DeviceKind::DefaultDevice).init_with_setup().expect("a GPU");
+        let kernels = if cfg!(target_vendor = "apple") { "WGSL" } else { "SPIR-V" };
+        (device, describe(&setup, kernels))
+    }
 }
 
 pub fn read_f32(path: &Path) -> Vec<f32> {
@@ -29,7 +48,7 @@ pub fn tensor4(path: &Path, shape: [usize; 4], device: &Device) -> Tensor<4> {
 }
 
 pub fn to_vec(t: Tensor<4>) -> Vec<f32> {
-    t.into_data().to_vec::<f32>().expect("f32")
+    t.into_data().try_to_vec::<f32>().expect("f32")
 }
 
 /// max |a - b|, mean |a - b|, max |b|

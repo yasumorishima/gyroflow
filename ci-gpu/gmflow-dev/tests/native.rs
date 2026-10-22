@@ -4,7 +4,9 @@
 
 use burn::module::Module;
 use burn_store::{ BurnpackStore, ModuleSnapshot, PytorchStore };
-use gmflow_dev::model::{ Gmflow, Statics, Trace };
+use gmflow_dev::model::{ self, Gmflow, Statics, Trace };
+use gmflow_dev::kernels;
+use burn::tensor::{ Distribution, Tensor };
 use gmflow_dev::*;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -55,7 +57,9 @@ fn matches_pytorch() {
     println!("device: {name}");
     let dir = env_path("GMFLOW_REF_DIR");
     let model = load(&device);
-    let st = Statics::new(H, W, &device);
+    let mut st = Statics::new(H, W, &device);
+    // The stages with the plain tensor operations (the port itself); the kernels are checked against these separately
+    st.kernels = false;
 
     // Stage by stage on pair 1, against the intermediates of unimatch (reported, not gated: errors carry over)
     let inp = |k: usize, i: usize| tensor4(&dir.join(format!("pair{k}_in{i}.f32")), [1, 3, H, W], &device);
@@ -74,23 +78,29 @@ fn matches_pytorch() {
         println!("stage {stage:22}: max |burn - torch| {max:.2e}, mean {mean:.2e} (values up to {scale:.2e})");
     }
 
-    // The gate (pre-registered for the ONNX model, the same here): every pair, max <= 1e-2 px and mean <= 1e-4 px
-    let mut checked = 0;
-    for k in 0.. {
-        if !dir.join(format!("pair{k}_torch.f32")).exists() { break; }
-        let started = Instant::now();
-        let flow = to_vec(model.forward(inp(k, 0), inp(k, 1), &st));
-        let secs = started.elapsed().as_secs_f64();
-        let (max, mean, _) = diff(&flow, &read_f32(&dir.join(format!("pair{k}_torch.f32"))));
-        println!("pair {k}: max |burn - torch| {max:.2e} px, mean {mean:.2e} px, one pass {secs:.3} s");
-        assert!(max <= 1e-2 && mean <= 1e-4, "pair {k}: max {max:e}, mean {mean:e}");
-        checked += 1;
+    // The gate (pre-registered for the ONNX model, the same here): every pair, max <= 1e-2 px and mean <= 1e-4 px, with the
+    // plain operations and with the kernels
+    for with_kernels in [false, true] {
+        st.kernels = with_kernels;
+        let mut checked = 0;
+        for k in 0.. {
+            if !dir.join(format!("pair{k}_torch.f32")).exists() { break; }
+            let started = Instant::now();
+            let flow = to_vec(model.forward(inp(k, 0), inp(k, 1), &st));
+            let secs = started.elapsed().as_secs_f64();
+            let (max, mean, _) = diff(&flow, &read_f32(&dir.join(format!("pair{k}_torch.f32"))));
+            println!("{} pair {k}: max |burn - torch| {max:.2e} px, mean {mean:.2e} px, one pass {secs:.3} s", if with_kernels { "kernels" } else { "plain  " });
+            assert!(max <= 1e-2 && mean <= 1e-4, "pair {k}: max {max:e}, mean {mean:e}");
+            checked += 1;
+        }
+        assert!(checked >= 3, "found {checked} reference pairs");
     }
-    assert!(checked >= 3, "found {checked} reference pairs");
 
     // Warm: the same pair again until the time settles (spread of the last 5 under 5 %) or 30 passes
     let runs: usize = std::env::var("GMFLOW_WARM_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
     if runs == 0 { return; }
+    for with_kernels in [false, true] {
+    st.kernels = with_kernels;
     let mut times = Vec::new();
     for _ in 0..30 {
         let started = Instant::now();
@@ -105,5 +115,34 @@ fn matches_pytorch() {
     }
     let last = &times[times.len() - 5..];
     let mean = last.iter().sum::<f64>() / 5.0;
-    println!("warm: {mean:.3} s per pass (mean of the last 5 of {} passes: {:?})", times.len(), last.iter().map(|t| format!("{t:.3}")).collect::<Vec<_>>());
+    println!("warm, {}: {mean:.3} s per pass (mean of the last 5 of {} passes: {:?})", if with_kernels { "kernels" } else { "plain" }, times.len(), last.iter().map(|t| format!("{t:.3}")).collect::<Vec<_>>());
+    }
+}
+
+/// Each kernel against the plain tensor operations it replaces, on random inputs of the real sizes. Limit set before the
+/// first run: max |kernel - plain| <= 1e-4 (values of order 1; a wrong index or tap gives errors of order 1)
+#[test]
+#[ignore]
+fn kernels_match_plain() {
+    let (device, name) = device();
+    println!("device: {name}");
+    let (b, c, h, w) = (1usize, 128usize, H / 4, W / 4);
+    let rnd = |shape: [usize; 4], sd: f64| Tensor::<4>::random(shape, Distribution::Normal(0.0, sd), &device);
+    let f0 = rnd([b, c, h, w], 1.0);
+    let f1 = rnd([b, c, h, w], 1.0);
+    // Flows of a few pixels, so that the taps cross the borders of the map
+    let flow = rnd([b, 2, h, w], 3.0);
+    let mut worst = 0f32;
+    let mut check = |label: &str, got: Tensor<4>, want: Tensor<4>| {
+        assert_eq!(got.dims(), want.dims(), "{label}: shape");
+        let (max, mean, scale) = diff(&to_vec(got), &to_vec(want));
+        println!("{label:28}: max |kernel - plain| {max:.2e}, mean {mean:.2e} (values up to {scale:.2e})");
+        worst = worst.max(max);
+    };
+    check("local_correlation_with_flow", kernels::corr_with_flow(f0.clone(), f1.clone(), flow.clone()), model::local_correlation_with_flow(f0.clone(), f1.clone(), flow.clone(), kernels::CORR_RADIUS));
+    check("local_correlation_softmax", kernels::local_corr_softmax(f0.clone(), f1.clone()), model::local_correlation_softmax(f0.clone(), f1.clone(), kernels::CORR_RADIUS));
+    check("local propagation", kernels::local_propagation(f0.clone(), f1.clone(), flow.clone()), model::local_propagation(f0.clone(), f1.clone(), flow.clone(), kernels::PROP_RADIUS));
+    let mask = rnd([b, 9 * 16, h, w], 2.0);
+    check("convex upsampling", kernels::convex_upsample(flow.clone(), mask.clone()), model::convex_upsample(flow, mask));
+    assert!(worst <= 1e-4, "a kernel differs from the plain operations by {worst:e}");
 }

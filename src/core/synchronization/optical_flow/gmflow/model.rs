@@ -35,6 +35,8 @@ use burn::tensor::module::{ conv2d, interpolate };
 use burn::tensor::ops::{ ConvOptions, GridSampleOptions, GridSamplePaddingMode, InterpolateMode, InterpolateOptions, PadMode };
 use burn::tensor::{ Device, Tensor, TensorData };
 
+use super::kernels;
+
 pub const FEATURE_CHANNELS: usize = 128;
 pub const REFINE_ITERATIONS: usize = 6;
 const LOCAL_RADIUS: usize = 4; // matching at 1/4 and the correlation of the refinement
@@ -351,7 +353,7 @@ fn offsets(r: usize) -> Vec<(i32, i32)> {
 }
 
 /// global_correlation_softmax: [B, C, H, W] x 2 -> flow [B, 2, H, W]
-fn global_correlation_softmax(f0: Tensor<4>, f1: Tensor<4>) -> Tensor<4> {
+pub fn global_correlation_softmax(f0: Tensor<4>, f1: Tensor<4>) -> Tensor<4> {
     let [b, c, h, w] = f0.dims();
     let device = f0.device();
     let f0 = f0.reshape([b, c, h * w]).swap_dims(1, 2); // [B, HW, C]
@@ -364,7 +366,7 @@ fn global_correlation_softmax(f0: Tensor<4>, f1: Tensor<4>) -> Tensor<4> {
 }
 
 /// The (2r+1)^2 copies of x moved by the window offsets (the value at p + offset), zero outside: one [B, C, H, W] each
-fn shifted(x: Tensor<4>, r: usize) -> Vec<Tensor<4>> {
+pub fn shifted(x: Tensor<4>, r: usize) -> Vec<Tensor<4>> {
     let [_, _, h, w] = x.dims();
     let padded = x.pad([(r, r), (r, r)], PadMode::Constant(0.0));
     offsets(r).into_iter().map(|(dx, dy)| {
@@ -375,7 +377,7 @@ fn shifted(x: Tensor<4>, r: usize) -> Vec<Tensor<4>> {
 
 /// local_correlation_softmax (integer offsets, radius r): flow [B, 2, H, W]. Out-of-image offsets get -1e9 before the
 /// softmax, as in unimatch
-fn local_correlation_softmax(f0: Tensor<4>, f1: Tensor<4>, r: usize) -> Tensor<4> {
+pub fn local_correlation_softmax(f0: Tensor<4>, f1: Tensor<4>, r: usize) -> Tensor<4> {
     let [_, c, h, w] = f0.dims();
     let device = f0.device();
     let scale = 1.0 / (c as f32).sqrt();
@@ -408,24 +410,27 @@ fn local_correlation_softmax(f0: Tensor<4>, f1: Tensor<4>, r: usize) -> Tensor<4
 /// of the coordinates normalised the way unimatch does: (p - c) / c, c = (size - 1) / 2
 fn sample(x: Tensor<4>, positions: Tensor<4>) -> Tensor<4> {
     let [_, _, h, w] = x.dims();
+    let [b, _, ph, pw] = positions.dims();
     let cx = ((w - 1) as f32) / 2.0;
     let cy = ((h - 1) as f32) / 2.0;
-    let nx = positions.clone().narrow(1, 0, 1).sub_scalar(cx).div_scalar(cx);
-    let ny = positions.narrow(1, 1, 1).sub_scalar(cy).div_scalar(cy);
-    let grid = Tensor::cat(vec![nx, ny], 1).permute([0, 2, 3, 1]);
+    // [B, H, W, 2] laid out as such: the grid_sample kernel of burn-cubecl 0.22 reads y right after x (offset + 1), it
+    // does not follow the strides of a permuted view
+    let nx = positions.clone().narrow(1, 0, 1).sub_scalar(cx).div_scalar(cx).reshape([b, ph, pw, 1]);
+    let ny = positions.narrow(1, 1, 1).sub_scalar(cy).div_scalar(cy).reshape([b, ph, pw, 1]);
+    let grid = Tensor::cat(vec![nx, ny], 3);
     x.grid_sample_2d(grid, GridSampleOptions::new(InterpolateMode::Bilinear).with_padding_mode(GridSamplePaddingMode::Zeros).with_align_corners(true))
 }
 
 /// flow_warp: feature [B, C, H, W] sampled at each position + flow. bilinear_sample normalises with 2 x / (w - 1) - 1,
 /// the same as `sample`
-fn flow_warp(feature: Tensor<4>, flow: Tensor<4>) -> Tensor<4> {
+pub fn flow_warp(feature: Tensor<4>, flow: Tensor<4>) -> Tensor<4> {
     let [_, _, h, w] = feature.dims();
     let positions = coords(h, w, &feature.device()) + flow;
     sample(feature, positions)
 }
 
 /// local_correlation_with_flow, radius r: [B, (2r+1)^2, H, W]
-fn local_correlation_with_flow(f0: Tensor<4>, f1: Tensor<4>, flow: Tensor<4>, r: usize) -> Tensor<4> {
+pub fn local_correlation_with_flow(f0: Tensor<4>, f1: Tensor<4>, flow: Tensor<4>, r: usize) -> Tensor<4> {
     let [_, c, h, w] = f0.dims();
     let device = f0.device();
     let scale = 1.0 / (c as f32).sqrt();
@@ -463,12 +468,24 @@ impl SelfAttnPropagation {
 
     /// Local window of radius r. The window comes from F.unfold with zero padding: a neighbour outside the map has a key of
     /// zeros (score 0, still in the softmax) and a flow of zeros
-    fn local(&self, feature0: Tensor<4>, flow: Tensor<4>, r: usize) -> Tensor<4> {
+    fn local(&self, feature0: Tensor<4>, flow: Tensor<4>, r: usize, with_kernels: bool) -> Tensor<4> {
         let [b, c, h, w] = feature0.dims();
         let tokens = feature0.reshape([b, c, h * w]).swap_dims(1, 2);
         let as_map = |t: Tensor<3>| t.swap_dims(1, 2).reshape([b, c, h, w]);
         let q = as_map(self.q_proj.forward(tokens.clone()));
         let k = as_map(self.k_proj.forward(tokens));
+        if with_kernels {
+            assert_eq!(r, kernels::PROP_RADIUS);
+            return kernels::local_propagation(q, k, flow);
+        }
+        local_propagation(q, k, flow, r)
+    }
+}
+
+/// The plain form of the local window propagation, q and k projected: [B, C, H, W]
+pub fn local_propagation(q: Tensor<4>, k: Tensor<4>, flow: Tensor<4>, r: usize) -> Tensor<4> {
+    {
+        let c = q.dims()[1];
         let scale = 1.0 / (c as f32).sqrt();
         let scores: Vec<Tensor<4>> = shifted(k, r).into_iter().map(|s| (q.clone() * s).sum_dim(1).mul_scalar(scale)).collect();
         let prob = softmax(Tensor::cat(scores, 1), 1); // [B, (2r+1)^2, H, W]
@@ -585,7 +602,7 @@ impl BasicUpdateBlock {
 }
 
 /// upsample_flow_with_mask (convex upsampling, factor 4): flow [B, 2, H, W], mask [B, 9*16, H, W] -> [B, 2, 4H, 4W]
-fn convex_upsample(flow: Tensor<4>, mask: Tensor<4>) -> Tensor<4> {
+pub fn convex_upsample(flow: Tensor<4>, mask: Tensor<4>) -> Tensor<4> {
     let [b, _, h, w] = flow.dims();
     let k = UPSAMPLE;
     // mask.view(b, 1, 9, k, k, h, w), softmax over the 9
@@ -623,6 +640,8 @@ pub struct Statics {
     /// ImageNet mean and std, [1, 3, 1, 1]
     pub mean: Tensor<4>,
     pub std: Tensor<4>,
+    /// The CubeCL kernels of kernels.rs where they exist, or else the plain tensor operations they replace (the reference)
+    pub kernels: bool,
 }
 
 impl Statics {
@@ -636,6 +655,7 @@ impl Statics {
             quarter: Windows::new(h / 4, w / 4, 8, device),
             mean: c3([0.485, 0.456, 0.406]),
             std: c3([0.229, 0.224, 0.225]),
+            kernels: true,
         }
     }
 }
@@ -676,7 +696,10 @@ impl Gmflow {
         // 1/8: global matching, global propagation
         let (f0, f1) = (eighth.clone().narrow(0, 0, b), eighth.narrow(0, b, b));
         let pos = st.eighth.position.clone();
-        let (f0, f1) = self.transformer.forward(f0 + pos.clone(), f1 + pos, &st.eighth);
+        let (f0, f1) = (f0 + pos.clone(), f1 + pos);
+        put(&mut trace, "pos_f0_0", &f0);
+        put(&mut trace, "pos_f1_0", &f1);
+        let (f0, f1) = self.transformer.forward(f0, f1, &st.eighth);
         put(&mut trace, "transformer_f0_0", &f0);
         put(&mut trace, "transformer_f1_0", &f1);
         let flow = global_correlation_softmax(f0.clone(), f1);
@@ -687,16 +710,20 @@ impl Gmflow {
         // 1/4: the flow doubled in size, feature 1 warped by it, local matching of what remains, local propagation
         let (f0_ori, f1_ori) = (quarter.clone().narrow(0, 0, b), quarter.narrow(0, b, b));
         let flow = interpolate(flow, InterpolateOptions::new(InterpolateMode::Bilinear).with_align_corners(true).with_scale_factor([2.0, 2.0])).mul_scalar(2.0);
+        put(&mut trace, "warp_flow0", &flow);
         let f1w = flow_warp(f1_ori.clone(), flow.clone());
         put(&mut trace, "warped_feature1_0", &f1w);
         let pos = st.quarter.position.clone();
-        let (f0, f1) = self.transformer.forward(f0_ori.clone() + pos.clone(), f1w + pos, &st.quarter);
+        let (f0, f1) = (f0_ori.clone() + pos.clone(), f1w + pos);
+        put(&mut trace, "pos_f0_1", &f0);
+        put(&mut trace, "pos_f1_1", &f1);
+        let (f0, f1) = self.transformer.forward(f0, f1, &st.quarter);
         put(&mut trace, "transformer_f0_1", &f0);
         put(&mut trace, "transformer_f1_1", &f1);
-        let flow_pred = local_correlation_softmax(f0.clone(), f1, LOCAL_RADIUS);
+        let flow_pred = if st.kernels { kernels::local_corr_softmax(f0.clone(), f1) } else { local_correlation_softmax(f0.clone(), f1, LOCAL_RADIUS) };
         put(&mut trace, "local_corr_flow0", &flow_pred);
         let flow = flow + flow_pred;
-        let mut flow = self.feature_flow_attn.local(f0.clone(), flow, 1);
+        let mut flow = self.feature_flow_attn.local(f0.clone(), flow, 1, st.kernels);
         put(&mut trace, "propagated1", &flow);
 
         // Refinement: the context comes from feature 0 of the transformer and is the same in every iteration (unimatch
@@ -707,7 +734,11 @@ impl Gmflow {
         let inp = relu(proj.narrow(1, 128, 128));
         let mut net = net0.clone();
         for i in 0..REFINE_ITERATIONS {
-            let corr = local_correlation_with_flow(f0_ori.clone(), f1_ori.clone(), flow.clone(), LOCAL_RADIUS);
+            let corr = if st.kernels {
+                kernels::corr_with_flow(f0_ori.clone(), f1_ori.clone(), flow.clone())
+            } else {
+                local_correlation_with_flow(f0_ori.clone(), f1_ori.clone(), flow.clone(), LOCAL_RADIUS)
+            };
             put(&mut trace, &format!("corr_with_flow{i}"), &corr);
             let (n, delta) = self.refine.forward(net0.clone(), inp.clone(), corr, flow.clone());
             put(&mut trace, &format!("refine_net{i}"), &n);
@@ -715,7 +746,8 @@ impl Gmflow {
             net = n;
             flow = flow + delta;
         }
-        let up = convex_upsample(flow, self.refine.up_mask(net));
+        let mask = self.refine.up_mask(net);
+        let up = if st.kernels { kernels::convex_upsample(flow, mask) } else { convex_upsample(flow, mask) };
         put(&mut trace, "upsampled0", &up);
         up
     }
