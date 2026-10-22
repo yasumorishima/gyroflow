@@ -6,3 +6,4 @@ rerun with burn 0.22.1 (fusion binding limit fix) and gpu-allocator on windows 0
 1d088a7 fused qkv removed
 8651318 gmflow: stage times by a device sync at each point (a read of one value did not wait for the stage), and the final read counted core rerun (macOS runners were not acquired)
 91aee51 gmflow: corr_with_flow from the products with the integer window of each position, then the bilinear weighting (100 products of C per position instead of 324); integer flows in the kernel check
+e4259eb gmflow: correlation taps one window row per thread (independent sums); convolutions chosen from the f32 matrix units of the device instead of a timing at load; matmul ceiling test (work branch)
