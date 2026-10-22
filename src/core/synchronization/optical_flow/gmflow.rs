@@ -107,15 +107,15 @@ mod inference {
     // before 15, GPUs before Apple7), the automatic choice, which is Metal with WGSL kernels.
     fn init(kind: DeviceKind) -> Result<(Device, String), String> {
         let label = format!("{:?}", kind);
-        let attempt = |pin: bool| std::panic::catch_unwind(|| {
+        let attempt = |pin: bool, kind: DeviceKind| std::panic::catch_unwind(|| {
             let options = Device::wgpu_options().device_kind(kind);
             if pin { options.graphics_api(GRAPHICS_API).init_with_setup() } else { options.init_with_setup() }
         });
-        let (started, kernels) = match attempt(true) {
+        let (started, kernels) = match attempt(true, kind.clone()) {
             Ok(Ok(found)) => (Ok(Ok(found)), if cfg!(target_vendor = "apple") { "MSL" } else { "SPIR-V" }),
             first if cfg!(target_vendor = "apple") => {
                 if let Ok(Err(e)) = &first { log::info!("gmflow: {}: no native MSL ({}), WGSL kernels", label, e); }
-                (attempt(false), "WGSL")
+                (attempt(false, kind), "WGSL")
             }
             first => (first, "SPIR-V"),
         };
