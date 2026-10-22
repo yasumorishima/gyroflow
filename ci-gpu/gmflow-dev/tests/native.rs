@@ -80,11 +80,13 @@ fn matches_pytorch() {
 
     // The gate (pre-registered for the ONNX model, the same here): every pair, max <= 1e-2 px and mean <= 1e-4 px, with the
     // plain operations and with the kernels
-    for (with_kernels, conv_im2col, gru_factored) in [(false, false, false), (true, false, false), (true, true, false), (true, true, true)] {
+    for (with_kernels, conv_im2col, gru_factored, fused) in [(false, false, false, false), (true, false, false, false), (true, true, false, false), (true, true, true, false), (true, true, true, true)] {
         st.ops.kernels = with_kernels;
         st.ops.conv_im2col = conv_im2col;
         st.ops.gru_factored = gru_factored;
-        let label = format!("{}{}", if with_kernels { "kernels" } else { "plain  " }, if conv_im2col { "+im2col" } else { "       " }) + if gru_factored { "+gru" } else { "    " };
+        st.ops.fused_attention = fused;
+        st.ops.fused_qkv = fused;
+        let label = format!("{}{}", if with_kernels { "kernels" } else { "plain  " }, if conv_im2col { "+im2col" } else { "       " }) + if gru_factored { "+gru" } else { "    " } + if fused { "+attn" } else { "" };
         let mut checked = 0;
         for k in 0.. {
             if !dir.join(format!("pair{k}_torch.f32")).exists() { break; }
@@ -102,11 +104,13 @@ fn matches_pytorch() {
     // Warm: the same pair again until the time settles (spread of the last 5 under 5 %) or 30 passes
     let runs: usize = std::env::var("GMFLOW_WARM_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
     if runs == 0 { return; }
-    for (with_kernels, conv_im2col, gru_factored) in [(false, false, false), (true, false, false), (true, true, false), (true, true, true)] {
+    for (with_kernels, conv_im2col, gru_factored, fused) in [(false, false, false, false), (true, false, false, false), (true, true, false, false), (true, true, true, false), (true, true, true, true)] {
     st.ops.kernels = with_kernels;
     st.ops.conv_im2col = conv_im2col;
     st.ops.gru_factored = gru_factored;
-    let label = format!("{}{}", if with_kernels { "kernels" } else { "plain" }, if conv_im2col { "+im2col" } else { "" }) + if gru_factored { "+gru" } else { "" };
+    st.ops.fused_attention = fused;
+    st.ops.fused_qkv = fused;
+    let label = format!("{}{}", if with_kernels { "kernels" } else { "plain" }, if conv_im2col { "+im2col" } else { "" }) + if gru_factored { "+gru" } else { "" } + if fused { "+attn" } else { "" };
     let mut times = Vec::new();
     for _ in 0..30 {
         let started = Instant::now();
