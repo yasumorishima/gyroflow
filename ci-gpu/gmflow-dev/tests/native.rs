@@ -110,21 +110,28 @@ fn matches_pytorch() {
 
     // Bidirectional, each frame through the CNN on its own (as the tracker will): the flow both ways against unimatch with
     // pred_bidir_flow, the same gate
-    st.ops = model::Ops { kernels: true, conv_im2col: std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true), gru_factored: true };
-    for k in 0..3 {
-        let fa = model.features(inp(k, 0), &st);
-        let fb = model.features(inp(k, 1), &st);
-        let started = Instant::now();
-        let both = model.flow(&fa, &fb, true, &st, None);
-        let fwd = to_vec(both.clone().narrow(0, 0, 1));
-        let bwd = to_vec(both.narrow(0, 1, 1));
-        let secs = started.elapsed().as_secs_f64();
-        for (dir, got, file) in [("a -> b", fwd, format!("pair{k}_torch.f32")), ("b -> a", bwd, format!("pair{k}_bwd_torch.f32"))] {
-            let (max, mean, _) = diff(&got, &read_f32(&env_path("GMFLOW_REF_DIR").join(&file)));
-            println!("bidirectional pair {k} {dir}: max |burn - torch| {max:.2e} px, mean {mean:.2e} px ({secs:.3} s for both, without the CNN)");
-            assert!(max <= 1e-2 && mean <= 1e-4, "bidirectional pair {k} {dir}: max {max:e}, mean {mean:e}");
+    // With the kernels as configured, and without them (which part breaks, if one does); all printed before the assert
+    let im2col = std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true);
+    let mut bad = Vec::new();
+    for (what, kernels_on) in [("kernels", true), ("plain ops", false)] {
+        st.ops = model::Ops { kernels: kernels_on, conv_im2col: im2col, gru_factored: true };
+        for k in 0..3 {
+            let fa = model.features(inp(k, 0), &st);
+            let fb = model.features(inp(k, 1), &st);
+            let started = Instant::now();
+            let both = model.flow(&fa, &fb, true, &st, None);
+            let fwd = to_vec(both.clone().narrow(0, 0, 1));
+            let bwd = to_vec(both.narrow(0, 1, 1));
+            let secs = started.elapsed().as_secs_f64();
+            for (dir, got, file) in [("a -> b", fwd, format!("pair{k}_torch.f32")), ("b -> a", bwd, format!("pair{k}_bwd_torch.f32"))] {
+                let (max, mean, _) = diff(&got, &read_f32(&env_path("GMFLOW_REF_DIR").join(&file)));
+                println!("bidirectional ({what}) pair {k} {dir}: max |burn - torch| {max:.2e} px, mean {mean:.2e} px ({secs:.3} s for both, without the CNN)");
+                if !(max <= 1e-2 && mean <= 1e-4) { bad.push(format!("{what} pair {k} {dir}: max {max:e}, mean {mean:e}")); }
+            }
         }
     }
+    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true };
+    assert!(bad.is_empty(), "bidirectional: {bad:?}");
 
     // The tracker, per frame: before, two one-way passes (each through the CNN with both frames); now, the CNN of the new
     // frame and one bidirectional pass. Warm, mean of 5 after 2
@@ -186,6 +193,14 @@ fn kernels_match_plain() {
         println!("{label:28}: max |kernel - plain| {max:.2e}, mean {mean:.2e} (values up to {scale:.2e}, limit {limit:e})");
         if !(max <= limit) { failed.push(format!("{label}: {max:e}")); }
     };
+    // As a run of the model calls it: batch 1 first (one-way passes), then batch 2 (bidirectional), and flows of tens of
+    // pixels as at 1/4 on real pairs
+    for (bn, sd) in [(1usize, 3.0f64), (2, 3.0), (2, 20.0), (1, 20.0)] {
+        let (g0, g1) = (rnd([bn, c, h, w], 1.0), rnd([bn, c, h, w], 1.0));
+        let fl = rnd([bn, 2, h, w], sd);
+        let label = format!("corr_with_flow b{bn} sd{sd}");
+        check(&label, kernels::corr_with_flow(g0.clone(), g1.clone(), fl.clone()), model::local_correlation_with_flow(g0, g1, fl, kernels::CORR_RADIUS));
+    }
     check("local_correlation_with_flow", kernels::corr_with_flow(f0.clone(), f1.clone(), flow.clone()), model::local_correlation_with_flow(f0.clone(), f1.clone(), flow.clone(), kernels::CORR_RADIUS));
     // The kernel takes the bilinear weights from the fractional part of the flow alone: integer flows (weight 0 on the
     // second taps) and flows just under an integer (weight ~1 on them) as well
