@@ -226,7 +226,7 @@ impl TransformerLayer {
                 // The hidden layer [B, L, 1024] of a bidirectional pass at 1/4 is 189 MB: a few images at a time, so that
                 // no buffer is over IM2COL_MAX_BYTES (each token is on its own here)
                 let [nb, l, _] = x.dims();
-                let per_image = l * mlp.fc1.weight.dims()[1] * 4;
+                let per_image = l * mlp.fc1.weight.val().dims()[1] * 4;
                 let chunk = (IM2COL_MAX_BYTES / per_image).max(1);
                 let ffn = |x: Tensor<3>| norm2.forward(mlp.fc2.forward(gelu(mlp.fc1.forward(x))));
                 if nb <= chunk {
@@ -699,7 +699,7 @@ pub struct GruFactored {
 /// The weight of a GRU convolution [128, 384, KH, KW] as [1, 128, 128 * KH * KW] for one of its three inputs (0 h, 1 inp,
 /// 2 motion), and its bias as [1, 128, 1]
 fn gru_part(conv: &Conv2d, part: usize) -> Tensor<3> {
-    let [cout, cin, kh, kw] = conv.weight.dims();
+    let [cout, cin, kh, kw] = conv.weight.val().dims();
     let k = kh * kw;
     conv.weight.val().reshape([1, cout, cin * k]).narrow(2, part * 128 * k, 128 * k)
 }
