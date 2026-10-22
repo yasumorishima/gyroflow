@@ -8,3 +8,4 @@ rerun with burn 0.22.1 (fusion binding limit fix) and gpu-allocator on windows 0
 91aee51 gmflow: corr_with_flow from the products with the integer window of each position, then the bilinear weighting (100 products of C per position instead of 324); integer flows in the kernel check
 e4259eb gmflow: correlation taps one window row per thread (independent sums); convolutions chosen from the f32 matrix units of the device instead of a timing at load; matmul ceiling test (work branch)
 ab5d253 gmflow: own register-tiled matmul (kernels::gemm) for the im2col convolutions and the GRU where the device has no f32 matrix units (burn: 8-16% of the arithmetic peak on WGSL)
+40fe539 gmflow: gemm kernel with usize literals (an untyped 0 in a branch was taken as i32 by the cube macro)
