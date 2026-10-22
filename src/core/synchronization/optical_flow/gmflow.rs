@@ -273,15 +273,18 @@ mod inference {
         if let Some(r) = &*slot { return Ok(r.clone()); }
         let model = load_model(device)?;
         let mut statics = Statics::new(MODEL_H, MODEL_W, device);
-        statics.ops = Ops { conv_im2col: im2col_is_faster(device), ..OPS };
-        log::info!("gmflow: convolutions {}", if statics.ops.conv_im2col { "as im2col + matmul" } else { "by burn" });
+        // Without f32 matrix units: convolutions as im2col, their matmuls (and the GRU's) by kernels::gemm
+        let own = im2col_is_faster(device);
+        let gemm = own && gemm_fits(device);
+        statics.ops = Ops { conv_im2col: own, own_gemm: gemm, ..OPS };
+        log::info!("gmflow: convolutions {}", match (own, gemm) { (true, true) => "as im2col + kernels::gemm", (true, false) => "as im2col + matmul", _ => "by burn" });
         let r = std::sync::Arc::new(Runner { model, statics });
         *slot = Some(r.clone());
         Ok(r)
     }
 
     // Which implementations run: see model.rs, Ops. The convolutions are chosen per GPU (im2col_is_faster)
-    const OPS: Ops = Ops { kernels: true, conv_im2col: false, gru_factored: true };
+    const OPS: Ops = Ops { kernels: true, conv_im2col: false, gru_factored: true, own_gemm: false };
 
     // burn convolves with implicit GEMM on matrix units only where the device has them for exactly the types of the
     // tensors (f32 inputs, or tf32 that burn stages f32 to, with an f32 accumulator); otherwise its 3x3 convolutions are
@@ -303,10 +306,21 @@ mod inference {
         }
     }
 
+    // kernels::gemm runs 16 x 16 threads per workgroup; Vulkan guarantees 128
+    fn gemm_fits(device: &Device) -> bool {
+        let units = (kernels::GEMM_THREADS * kernels::GEMM_THREADS) as u32;
+        match device.as_dispatch() {
+            burn::backend::DispatchDevice::Cube(d) => d.client().properties().hardware.max_units_per_cube >= units,
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+
     // How the convolutions run on the loaded model, for the tests
     #[cfg(test)]
     pub fn convolutions() -> &'static str {
         match &*RUNNER.lock() {
+            Some(r) if r.statics.ops.own_gemm => "im2col + kernels::gemm",
             Some(r) if r.statics.ops.conv_im2col => "im2col + matmul",
             Some(_) => "by burn",
             None => "model not loaded",

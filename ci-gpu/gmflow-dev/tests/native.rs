@@ -16,13 +16,14 @@ const W: usize = 576;
 
 /// The configurations measured: (label, ops)
 fn configs() -> Vec<(&'static str, model::Ops)> {
-    let o = |kernels, conv_im2col, gru_factored| model::Ops { kernels, conv_im2col, gru_factored };
+    let o = |kernels, conv_im2col, gru_factored, own_gemm| model::Ops { kernels, conv_im2col, gru_factored, own_gemm };
     vec![
-        ("plain", o(false, false, false)),
-        ("kernels", o(true, false, false)),
-        ("kernels+gru", o(true, false, true)),
-        ("kernels+im2col", o(true, true, false)),
-        ("kernels+im2col+gru", o(true, true, true)),
+        ("plain", o(false, false, false, false)),
+        ("kernels", o(true, false, false, false)),
+        ("kernels+gru", o(true, false, true, false)),
+        ("kernels+im2col", o(true, true, false, false)),
+        ("kernels+im2col+gru", o(true, true, true, false)),
+        ("kernels+im2col+gru+gemm", o(true, true, true, true)),
     ]
 }
 
@@ -114,7 +115,7 @@ fn matches_pytorch() {
     let im2col = std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true);
     let mut bad = Vec::new();
     for (what, kernels_on) in [("kernels", true), ("plain ops", false)] {
-        st.ops = model::Ops { kernels: kernels_on, conv_im2col: im2col, gru_factored: true };
+        st.ops = model::Ops { kernels: kernels_on, conv_im2col: im2col, gru_factored: true, own_gemm: im2col && kernels_on };
         for k in 0..3 {
             let fa = model.features(inp(k, 0), &st);
             let fb = model.features(inp(k, 1), &st);
@@ -130,7 +131,7 @@ fn matches_pytorch() {
             }
         }
     }
-    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true };
+    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col };
     assert!(bad.is_empty(), "bidirectional: {bad:?}");
 
     // The tracker, per frame: before, two one-way passes (each through the CNN with both frames); now, the CNN of the new
@@ -224,8 +225,28 @@ fn kernels_match_plain() {
         let wt = rnd([cout, cin, kh, kw], 0.02); // outputs of order 1, as the other checks
         let bias = Tensor::<1>::random([cout], Distribution::Normal(0.0, 0.1), &device);
         let want = burn::tensor::module::conv2d(x.clone(), wt.clone(), Some(bias.clone()), burn::tensor::ops::ConvOptions::new([stride, stride], [ph, pw], [1, 1], 1));
-        let got = kernels::conv2d_im2col(x, wt, Some(bias), stride, [ph, pw], 120 << 20);
-        check(&format!("conv {cin}->{cout} {kh}x{kw}/{stride} im2col"), got, want);
+        let got = kernels::conv2d_im2col(x.clone(), wt.clone(), Some(bias.clone()), stride, [ph, pw], 120 << 20, false);
+        check(&format!("conv {cin}->{cout} {kh}x{kw}/{stride} im2col"), got, want.clone());
+        let got = kernels::conv2d_im2col(x, wt, Some(bias), stride, [ph, pw], 120 << 20, true);
+        check(&format!("conv {cin}->{cout} {kh}x{kw}/{stride} im2col gemm"), got, want);
+    }
+    // kernels::gemm against burn's matmul: the shapes of the model (a of 1 shared by the batch, rows and columns not
+    // multiples of the 64 x 64 block, k not a multiple of its 16 step) and both batched; a scaled by 1/sqrt(K) so that
+    // the outputs are of order 1
+    let rnd3 = |shape: [usize; 3], sd: f64| Tensor::<3>::random(shape, Distribution::Normal(0.0, sd), &device);
+    for (ba, bb, m, k, nn) in [(1usize, 1usize, 192usize, 2304usize, 11520usize), (1, 2, 126, 1152, 11520), (1, 2, 384, 640, 11520), (1, 1, 64, 147, 46080), (2, 2, 180, 128, 180), (1, 2, 2, 1152, 11520), (2, 1, 100, 256, 500)] {
+        let a = rnd3([ba, m, k], 1.0 / (k as f64).sqrt());
+        let bm = rnd3([bb, k, nn], 1.0);
+        let label = format!("gemm [{ba},{m},{k}]x[{bb},{k},{nn}]");
+        let got = kernels::gemm(a.clone(), bm.clone(), None).unsqueeze_dim::<4>(0);
+        check(&label, got, a.matmul(bm).unsqueeze_dim::<4>(0));
+    }
+    {
+        let a = rnd3([1, 100, 300], 0.06);
+        let bm = rnd3([2, 300, 333], 1.0);
+        let bias = Tensor::<1>::random([100], Distribution::Normal(0.0, 0.1), &device);
+        let want = a.clone().matmul(bm.clone()) + bias.clone().reshape([1, 100, 1]);
+        check("gemm with bias [1,100,300]x[2,300,333]", kernels::gemm(a, bm, Some(bias)).unsqueeze_dim::<4>(0), want.unsqueeze_dim::<4>(0));
     }
     assert!(failed.is_empty(), "kernels that differ from the plain operations: {failed:?}");
 }
@@ -412,7 +433,13 @@ fn matmul_ceiling() {
     time("same, transposed: [L,K]@[K,Co]", conv_flops, &|| first2(cols_t.clone().matmul(w_t.clone())));
     let x = rnd4([n, 256, H / 4, W / 4]);
     let wt = rnd4([cout, 256, 3, 3]);
-    time("same conv, im2col kernel + matmul (conv2d_im2col)", conv_flops, &|| first4(kernels::conv2d_im2col(x.clone(), wt.clone(), None, 1, [1, 1], 120 << 20)));
+    time("same conv, im2col kernel + matmul (conv2d_im2col)", conv_flops, &|| first4(kernels::conv2d_im2col(x.clone(), wt.clone(), None, 1, [1, 1], 120 << 20, false)));
+    time("same conv, im2col kernel + kernels::gemm", conv_flops, &|| first4(kernels::conv2d_im2col(x.clone(), wt.clone(), None, 1, [1, 1], 120 << 20, true)));
+    time("kernels::gemm [1,Co,K]@[1,K,L]", conv_flops, &|| first(kernels::gemm(w.clone(), cols.clone(), None)));
+    let gw = rnd3([1, 384, 640]);
+    let gc = rnd3([2, 640, l]);
+    time("GRU [1,384,640]@[2,640,L]: burn", 2.0 * (2 * 384 * 640 * l) as f64, &|| first(gw.clone().matmul(gc.clone())));
+    time("GRU [1,384,640]@[2,640,L]: kernels::gemm", 2.0 * (2 * 384 * 640 * l) as f64, &|| first(kernels::gemm(gw.clone(), gc.clone(), None)));
     time("same conv, burn conv2d", conv_flops, &|| first4(burn::tensor::module::conv2d(x.clone(), wt.clone(), None, burn::tensor::ops::ConvOptions::new([1, 1], [1, 1], [1, 1], 1))));
     let tokens = 2 * l;
     let a = rnd2([tokens, 256]);
@@ -439,7 +466,7 @@ fn bidirectional_repeat() {
     let model = load(&device);
     let mut st = Statics::new(H, W, &device);
     let im2col = std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true);
-    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true };
+    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col };
     let inp = |k: usize, i: usize| tensor4(&dir.join(format!("pair{k}_in{i}.f32")), [1, 3, H, W], &device);
     let mut bad = Vec::new();
     for k in 0..3 {
