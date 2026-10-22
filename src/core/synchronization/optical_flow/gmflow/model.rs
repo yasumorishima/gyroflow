@@ -807,7 +807,7 @@ impl Statics {
 }
 
 /// Intermediates of one pass, named as ci-gpu/refs_native.py names those of unimatch, for checking the port stage by stage
-/// or, with `timed`, when each stage was done (the GPU waited for at each point; nothing is kept)
+/// or, with `timed`, when each stage was done (the device synced at each point; nothing is kept)
 #[derive(Default)]
 pub struct Trace {
     pub tensors: Vec<(String, Tensor<4>)>,
@@ -818,7 +818,7 @@ pub struct Trace {
 fn put(trace: &mut Option<&mut Trace>, name: &str, t: &Tensor<4>) {
     let Some(tr) = trace.as_deref_mut() else { return };
     if tr.timed {
-        let _ = t.clone().slice([0..1, 0..1, 0..1, 0..1]).into_data();
+        t.device().sync().expect("gmflow: GPU sync");
         tr.marks.push((name.to_owned(), std::time::Instant::now()));
     } else {
         tr.tensors.push((name.to_owned(), t.clone()));

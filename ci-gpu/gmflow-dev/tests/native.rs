@@ -317,19 +317,23 @@ fn stage_times() {
     for i in 0..5 {
         let (a, b) = (inp(0), inp(1));
         let _ = to_vec(a.clone() + b.clone());
+        device.sync().expect("sync");
         let mut tr = timed();
         let start = Instant::now();
         let _ = to_vec(model.forward_traced(a, b, &st, Some(&mut tr)));
+        tr.marks.push(("read of the flow".to_owned(), Instant::now()));
         if i >= 2 { runs.push((start, tr.marks)); }
     }
     report("one pass", runs);
     let fa = model.features(inp(0), &st);
     let fb = model.features(inp(1), &st);
+    device.sync().expect("sync");
     let mut runs = Vec::new();
     for i in 0..5 {
         let mut tr = timed();
         let start = Instant::now();
         let _ = to_vec(model.flow(&fa, &fb, true, &st, Some(&mut tr)));
+        tr.marks.push(("read of the flow".to_owned(), Instant::now()));
         if i >= 2 { runs.push((start, tr.marks)); }
     }
     report("bidirectional flow, CNN features given", runs);
