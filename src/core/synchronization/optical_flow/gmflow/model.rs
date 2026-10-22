@@ -31,8 +31,8 @@ use burn::module::{ Module, Param };
 use burn::nn::conv::{ Conv2d, Conv2dConfig };
 use burn::nn::{ InstanceNorm, InstanceNormConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig2d };
 use burn::tensor::activation::{ gelu, relu, sigmoid, softmax, tanh };
-use burn::tensor::module::{ attention, conv2d, interpolate, linear };
-use burn::tensor::ops::{ AttentionModuleOptions, ConvOptions, GridSampleOptions, GridSamplePaddingMode, InterpolateMode, InterpolateOptions, PadMode };
+use burn::tensor::module::{ conv2d, interpolate, linear };
+use burn::tensor::ops::{ ConvOptions, GridSampleOptions, GridSamplePaddingMode, InterpolateMode, InterpolateOptions, PadMode };
 use burn::tensor::{ Device, Tensor, TensorData };
 
 use super::kernels;
@@ -52,8 +52,6 @@ pub struct Ops {
     pub conv_im2col: bool,
     /// The GRU of the refinement with its convolutions split by input (GruFactored); needs the im2col kernel
     pub gru_factored: bool,
-    /// Window attention through burn's attention operation (autotuned among fused kernels and the plain matmuls)
-    pub fused_attention: bool,
     /// The projections of each transformer block that read the same tokens as one matmul (self q, k, v and cross k, v)
     pub fused_qkv: bool,
 }
@@ -218,7 +216,7 @@ impl TransformerLayer {
     /// The layer from its projected query, key and value
     #[allow(clippy::too_many_arguments)]
     fn attend(&self, source: Tensor<3>, q: Tensor<3>, k: Tensor<3>, v: Tensor<3>, win: &Windows, with_shift: bool, ops: Ops) -> Tensor<3> {
-        let message = split_window_attention(q, k, v, win, with_shift, ops.fused_attention);
+        let message = split_window_attention(q, k, v, win, with_shift);
         let message = self.norm1.forward(self.merge.forward(message));
         let message = match (&self.mlp, &self.norm2) {
             (Some(mlp), Some(norm2)) => {
@@ -280,7 +278,7 @@ impl FeatureTransformer {
                 let s = layer.self_attn.forward(concat0.clone(), concat0, win, with_shift, ops);
                 concat0 = layer.cross_attn_ffn.forward(s, concat1, win, with_shift, ops);
             }
-            concat1 = swap_halves(concat0.clone());
+            if !ops.fused_qkv { concat1 = swap_halves(concat0.clone()); }
         }
         let back = |t: Tensor<3>| t.swap_dims(1, 2).reshape([b, c, h, w]);
         (back(concat0.clone().narrow(0, 0, b)), back(concat0.narrow(0, b, b)))
@@ -371,7 +369,7 @@ fn from_windows(x: Tensor<3>, b: usize, h: usize, w: usize, k: usize) -> Tensor<
 }
 
 /// unimatch single_head_split_window_attention: q, k, v [B, H*W, C] -> [B, H*W, C]
-fn split_window_attention(q: Tensor<3>, k: Tensor<3>, v: Tensor<3>, win: &Windows, with_shift: bool, fused: bool) -> Tensor<3> {
+fn split_window_attention(q: Tensor<3>, k: Tensor<3>, v: Tensor<3>, win: &Windows, with_shift: bool) -> Tensor<3> {
     let [b, _, c] = q.dims();
     let (h, w, splits) = (win.h, win.w, win.splits);
     let (sh, sw) = (h / splits / 2, w / splits / 2);
@@ -381,16 +379,6 @@ fn split_window_attention(q: Tensor<3>, k: Tensor<3>, v: Tensor<3>, win: &Window
         to_windows(t, splits)
     };
     let (q, k, v) = (grid(q), grid(k), grid(v));
-    if fused {
-        // softmax(q k^T / sqrt(C) + mask) v, one head
-        let [bn, l, _] = q.dims();
-        let head = |t: Tensor<3>| t.reshape([bn, 1, l, c]);
-        let bias = with_shift.then(|| win.shift_mask.clone().unsqueeze_dim::<4>(1).repeat_dim(0, b));
-        let out = attention(head(q), head(k), head(v), None, bias, AttentionModuleOptions::default()).reshape([bn, l, c]);
-        let out = from_windows(out, b, h, w, splits);
-        let out = if with_shift { out.roll_dim(sh as i64, 1).roll_dim(sw as i64, 2) } else { out };
-        return out.reshape([b, h * w, c]);
-    }
     let mut scores = q.matmul(k.swap_dims(1, 2)).div_scalar((c as f32).sqrt());
     if with_shift {
         let n = splits * splits;
@@ -833,7 +821,7 @@ impl Statics {
             quarter: Windows::new(h / 4, w / 4, 8, device),
             mean: c3([0.485, 0.456, 0.406]),
             std: c3([0.229, 0.224, 0.225]),
-            ops: Ops { kernels: true, conv_im2col: false, gru_factored: false, fused_attention: false, fused_qkv: false },
+            ops: Ops { kernels: true, conv_im2col: false, gru_factored: false, fused_qkv: false },
         }
     }
 }
@@ -900,6 +888,8 @@ impl Gmflow {
     /// [2B, 2, H, W] (a -> b, then b -> a), as unimatch computes them with pred_bidir_flow: the transformer at 1/8 and its
     /// correlation are shared (the correlation the other way is its transpose), the rest runs on both directions batched
     pub fn flow(&self, a: &Features, b: &Features, bidirectional: bool, st: &Statics, mut trace: Option<&mut Trace>) -> Tensor<4> {
+        // The buffers are sized for one pair (bidirectional: the projections at 1/4 are 113 MiB, the 1/8 correlation 66 MB)
+        assert_eq!(a.eighth.dims()[0], 1, "gmflow: one pair at a time");
         let ops = st.ops;
         // 1/8: global matching, global propagation
         let pos = st.eighth.position.clone();

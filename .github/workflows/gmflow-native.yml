@@ -61,9 +61,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: lavapipe, os: ubuntu-24.04, warm: '0', features: '' }
-          - { name: metal-wgsl, os: macos-14, warm: '10', features: '' }
-          - { name: metal-msl, os: macos-15, warm: '10', features: msl }
+          - { name: lavapipe, os: ubuntu-24.04, warm: '0', features: '', im2col: '1', best: '' }
+          - { name: metal-wgsl, os: macos-14, warm: '10', features: '', im2col: '1', best: kernels+im2col+gru+qkv }
+          - { name: metal-msl, os: macos-15, warm: '10', features: msl, im2col: '0', best: kernels+gru+qkv }
     name: native-${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
@@ -107,9 +107,21 @@ jobs:
           GMFLOW_BPK: ${{ runner.temp }}/gmflow.bpk
           GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
           GMFLOW_WARM_RUNS: ${{ matrix.warm }}
+          GMFLOW_IM2COL: ${{ matrix.im2col }}
         run: |
           cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matches_pytorch 2>&1 | tee pytorch.log
           grep -q "test result: ok. 1 passed" pytorch.log
+      - name: Per-kernel profile of the fastest configuration
+        if: matrix.best != ''
+        env:
+          GMFLOW_BPK: ${{ runner.temp }}/gmflow.bpk
+          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
+          GMFLOW_PROFILE_OPS: ${{ matrix.best }}
+          CUBECL_DEBUG_LOG: stdout
+          CUBECL_DEBUG_OPTION: profile-medium
+        run: |
+          cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact profile_passes > profile.raw 2>&1 || { tail -n 40 profile.raw; exit 1; }
+          python3 ../profile_summary.py profile.raw "PROFILE-START" "PROFILE-END" 3 | tee profile.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:

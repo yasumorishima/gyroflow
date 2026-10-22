@@ -473,7 +473,9 @@ fn preprocess_kernel<I: Int, F: Float>(
             }
             t += v * wx;
         }
-        value = clamp(t, zero, F::new(255.0)).round();
+        // f32::round of the image crate rounds half away from zero; WGSL round() rounds half to even: t >= 0, so
+        // floor(t + 0.5) is what the CPU does
+        value = (clamp(t, zero, F::new(255.0)) + half).floor();
     }
     let plane = oh * ow;
     let v = value;

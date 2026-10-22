@@ -14,6 +14,20 @@ use std::time::Instant;
 const H: usize = 320;
 const W: usize = 576;
 
+/// The configurations measured: (label, ops)
+fn configs() -> Vec<(&'static str, model::Ops)> {
+    let o = |kernels, conv_im2col, gru_factored, fused_qkv| model::Ops { kernels, conv_im2col, gru_factored, fused_qkv };
+    vec![
+        ("plain", o(false, false, false, false)),
+        ("kernels", o(true, false, false, false)),
+        ("kernels+gru", o(true, false, true, false)),
+        ("kernels+gru+qkv", o(true, false, true, true)),
+        ("kernels+im2col", o(true, true, false, false)),
+        ("kernels+im2col+gru", o(true, true, true, false)),
+        ("kernels+im2col+gru+qkv", o(true, true, true, true)),
+    ]
+}
+
 fn env_path(name: &str) -> PathBuf {
     PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("{name} not set")))
 }
@@ -80,13 +94,8 @@ fn matches_pytorch() {
 
     // The gate (pre-registered for the ONNX model, the same here): every pair, max <= 1e-2 px and mean <= 1e-4 px, with the
     // plain operations and with the kernels
-    for (with_kernels, conv_im2col, gru_factored, fused) in [(false, false, false, false), (true, false, false, false), (true, true, false, false), (true, true, true, false), (true, true, true, true)] {
-        st.ops.kernels = with_kernels;
-        st.ops.conv_im2col = conv_im2col;
-        st.ops.gru_factored = gru_factored;
-        st.ops.fused_attention = fused;
-        st.ops.fused_qkv = fused;
-        let label = format!("{}{}", if with_kernels { "kernels" } else { "plain  " }, if conv_im2col { "+im2col" } else { "       " }) + if gru_factored { "+gru" } else { "    " } + if fused { "+attn" } else { "" };
+    for (label, ops) in configs() {
+        st.ops = ops;
         let mut checked = 0;
         for k in 0.. {
             if !dir.join(format!("pair{k}_torch.f32")).exists() { break; }
@@ -94,7 +103,7 @@ fn matches_pytorch() {
             let flow = to_vec(model.forward(inp(k, 0), inp(k, 1), &st));
             let secs = started.elapsed().as_secs_f64();
             let (max, mean, _) = diff(&flow, &read_f32(&dir.join(format!("pair{k}_torch.f32"))));
-            println!("{label} pair {k}: max |burn - torch| {max:.2e} px, mean {mean:.2e} px, one pass {secs:.3} s");
+            println!("{label:24} pair {k}: max |burn - torch| {max:.2e} px, mean {mean:.2e} px, one pass {secs:.3} s");
             assert!(max <= 1e-2 && mean <= 1e-4, "pair {k}: max {max:e}, mean {mean:e}");
             checked += 1;
         }
@@ -103,7 +112,7 @@ fn matches_pytorch() {
 
     // Bidirectional, each frame through the CNN on its own (as the tracker will): the flow both ways against unimatch with
     // pred_bidir_flow, the same gate
-    st.ops = model::Ops { kernels: true, conv_im2col: true, gru_factored: true, fused_attention: true, fused_qkv: true };
+    st.ops = model::Ops { kernels: true, conv_im2col: std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true), gru_factored: true, fused_qkv: true };
     for k in 0..3 {
         let fa = model.features(inp(k, 0), &st);
         let fb = model.features(inp(k, 1), &st);
@@ -119,16 +128,22 @@ fn matches_pytorch() {
         }
     }
 
+    // The tracker, per frame: before, two one-way passes (each through the CNN with both frames); now, the CNN of the new
+    // frame and one bidirectional pass. Warm, mean of 5 after 2
+    {
+        let (i0, i1) = (inp(1, 0), inp(1, 1));
+        let time = |f: &dyn Fn()| { for _ in 0..2 { f(); } let t = Instant::now(); for _ in 0..5 { f(); } t.elapsed().as_secs_f64() / 5.0 };
+        let before = time(&|| { let _ = to_vec(model.forward(i0.clone(), i1.clone(), &st)); let _ = to_vec(model.forward(i1.clone(), i0.clone(), &st)); });
+        let fa = model.features(i0.clone(), &st);
+        let after = time(&|| { let fb = model.features(i1.clone(), &st); let _ = to_vec(model.flow(&fa, &fb, true, &st, None)); });
+        println!("tracker per frame ({:?}): two one-way passes {before:.3} s, CNN of one frame + bidirectional pass {after:.3} s", st.ops);
+    }
+
     // Warm: the same pair again until the time settles (spread of the last 5 under 5 %) or 30 passes
     let runs: usize = std::env::var("GMFLOW_WARM_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
     if runs == 0 { return; }
-    for (with_kernels, conv_im2col, gru_factored, fused) in [(false, false, false, false), (true, false, false, false), (true, true, false, false), (true, true, true, false), (true, true, true, true)] {
-    st.ops.kernels = with_kernels;
-    st.ops.conv_im2col = conv_im2col;
-    st.ops.gru_factored = gru_factored;
-    st.ops.fused_attention = fused;
-    st.ops.fused_qkv = fused;
-    let label = format!("{}{}", if with_kernels { "kernels" } else { "plain" }, if conv_im2col { "+im2col" } else { "" }) + if gru_factored { "+gru" } else { "" } + if fused { "+attn" } else { "" };
+    for (label, ops) in configs() {
+    st.ops = ops;
     let mut times = Vec::new();
     for _ in 0..30 {
         let started = Instant::now();
@@ -154,7 +169,8 @@ fn matches_pytorch() {
 fn kernels_match_plain() {
     let (device, name) = device();
     println!("device: {name}");
-    let (b, c, h, w) = (1usize, 128usize, H / 4, W / 4);
+    // Batch 2, as the bidirectional pass runs the kernels
+    let (b, c, h, w) = (2usize, 128usize, H / 4, W / 4);
     let rnd = |shape: [usize; 4], sd: f64| Tensor::<4>::random(shape, Distribution::Normal(0.0, sd), &device);
     let f0 = rnd([b, c, h, w], 1.0);
     let f1 = rnd([b, c, h, w], 1.0);
@@ -231,4 +247,25 @@ fn preprocess_matches_cpu() {
         println!("{w0}x{h0} (stride {stride}) -> {new_w}x{new_h} at ({pad_x}, {pad_y}): max |gpu - cpu| {max}, mean {mean:.2e}, {off} of {} values differ", got.len());
         assert!(max <= 1.0 && mean <= 0.05, "{w0}x{h0}: max {max}, mean {mean}");
     }
+}
+
+/// Three warm passes of one configuration (GMFLOW_PROFILE_OPS, a label of `configs`) between markers, for cubecl's
+/// per-kernel profile (CUBECL_DEBUG_OPTION=profile-medium): what each kernel costs. Times of a profiled run are not speeds
+#[test]
+#[ignore]
+fn profile_passes() {
+    let (device, name) = device();
+    println!("device: {name}");
+    let dir = env_path("GMFLOW_REF_DIR");
+    let model = load(&device);
+    let mut st = Statics::new(H, W, &device);
+    let want = std::env::var("GMFLOW_PROFILE_OPS").expect("GMFLOW_PROFILE_OPS");
+    st.ops = configs().into_iter().find(|(l, _)| *l == want).unwrap_or_else(|| panic!("no configuration {want}")).1;
+    let inp = |i: usize| tensor4(&dir.join(format!("pair1_in{i}.f32")), [1, 3, H, W], &device);
+    for _ in 0..2 { let _ = to_vec(model.forward(inp(0), inp(1), &st)); }
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    println!("PROFILE-START {want}");
+    for _ in 0..3 { let _ = to_vec(model.forward(inp(0), inp(1), &st)); }
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    println!("PROFILE-END");
 }
