@@ -231,7 +231,7 @@ fn kernels_match_plain() {
         check(&format!("conv {cin}->{cout} {kh}x{kw}/{stride} im2col gemm"), got, want);
     }
     // kernels::gemm against burn's matmul: the shapes of the model (a of 1 shared by the batch, rows and columns not
-    // multiples of the 64 x 64 block, k not a multiple of its 16 step) and both batched; a scaled by 1/sqrt(K) so that
+    // multiples of the 128 x 128 block, k not a multiple of its 8 step) and both batched; a scaled by 1/sqrt(K) so that
     // the outputs are of order 1
     let rnd3 = |shape: [usize; 3], sd: f64| Tensor::<3>::random(shape, Distribution::Normal(0.0, sd), &device);
     for (ba, bb, m, k, nn) in [(1usize, 1usize, 192usize, 2304usize, 11520usize), (1, 2, 126, 1152, 11520), (1, 2, 384, 640, 11520), (1, 1, 64, 147, 46080), (2, 2, 180, 128, 180), (1, 2, 2, 1152, 11520), (2, 1, 100, 256, 500)] {

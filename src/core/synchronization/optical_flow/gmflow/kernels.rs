@@ -419,16 +419,17 @@ fn launch_im2col(x: CubeTensor, kh: usize, kw: usize, stride: usize, ph: usize, 
 // ---------------------------------------------------------------- matmul for GPUs without f32 matrix units
 
 /// Rows and columns of the block of the output each cube computes, its k step, and threads per side (16 x 16, each
-/// thread 4 x 4 outputs, strided by 16 so that neighbouring threads read neighbouring values)
-const GEMM_BLOCK: usize = 64;
-const GEMM_K: usize = 16;
+/// thread 8 x 8 outputs, strided by 16 so that neighbouring threads read neighbouring values): 4 multiply-adds per value
+/// read from shared memory (with 4 x 4 a thread, 2: measured 251 GFLOPS on WGSL, 12% of the arithmetic peak)
+const GEMM_BLOCK: usize = 128;
+const GEMM_K: usize = 8;
 pub const GEMM_THREADS: usize = 16;
 
 /// out[b] = a[b] @ b[b] (+ bias per row): a [Ba, M, K], b [Bb, K, N], out [B, M, N], a batch of 1 shared by all. Where the
 /// device has no f32 matrix units, burn's own matmuls use 4 x 4 register tiles indexed at run time (cubek-matmul
 /// instruction/register.rs, UNROLL = false), which reach 8-16% of the arithmetic peak on WGSL: here the register tile is
 /// indexed at compile time (unrolled), with the tiles of a and b staged in shared memory, a transposed (k-major) and its
-/// rows padded by one so that its stores do not hit the same bank. Fixed order of the sums: the same result every run.
+/// rows padded to 4 more than the block (the 32 stores of a warp, k = idx % 8 and row = idx / 8, then fall in 32 banks). Fixed order of the sums: the same result every run.
 #[cube(launch)]
 fn gemm_kernel<F: Float>(
     a: &Tensor<F>,       // [Ba, M, K]
@@ -446,7 +447,7 @@ fn gemm_kernel<F: Float>(
     let bk = comptime!(GEMM_K);
     let th = comptime!(GEMM_THREADS);
     let per = comptime!(GEMM_BLOCK / GEMM_THREADS);
-    let a_row = comptime!(GEMM_BLOCK + 1);
+    let a_row = comptime!(GEMM_BLOCK + 4);
     let loads = comptime!(GEMM_BLOCK * GEMM_K / (GEMM_THREADS * GEMM_THREADS));
     let m0 = CUBE_POS_Y as usize * bm;
     let n0 = CUBE_POS_X as usize * bm;
@@ -454,7 +455,7 @@ fn gemm_kernel<F: Float>(
     let ty = UNIT_POS_Y as usize;
     let t = ty * th + tx;
     let zero = F::new(0.0_f32);
-    let mut a_s = Shared::<[F]>::new_slice(comptime!(GEMM_K * (GEMM_BLOCK + 1)));
+    let mut a_s = Shared::<[F]>::new_slice(comptime!(GEMM_K * (GEMM_BLOCK + 4)));
     let mut b_s = Shared::<[F]>::new_slice(comptime!(GEMM_K * GEMM_BLOCK));
     let mut acc = Array::<F>::new(comptime!(GEMM_BLOCK / GEMM_THREADS * (GEMM_BLOCK / GEMM_THREADS)));
     let mut bv = Array::<F>::new(comptime!(GEMM_BLOCK / GEMM_THREADS));
@@ -773,7 +774,8 @@ pub fn conv2d_im2col(x: BurnTensor<4>, weight: BurnTensor<4>, bias: Option<BurnT
         let len = chunk.min(n - start);
         let part = if len == n { x.clone() } else { x.clone().narrow(0, start, len) };
         let cols: BurnTensor<3> = BurnTensor::from_dispatch(Dispatch::im2col(part.into_dispatch(), kh, kw, stride, ph, pw));
-        outs.push(if own_gemm { gemm(wmat.clone(), cols, None) } else { wmat.clone().matmul(cols) }); // [len, Cout, OH*OW]
+        // Few output channels (the flow head's 2) would leave most of a 128-row block of gemm idle
+        outs.push(if own_gemm && cout >= 32 { gemm(wmat.clone(), cols, None) } else { wmat.clone().matmul(cols) }); // [len, Cout, OH*OW]
         start += len;
     }
     let out = if outs.len() == 1 { outs.pop().unwrap() } else { BurnTensor::cat(outs, 0) };
