@@ -111,6 +111,32 @@ jobs:
         run: |
           cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matches_pytorch 2>&1 | tee pytorch.log
           grep -q "test result: ok. 1 passed" pytorch.log
+      - name: The bidirectional pass 6 times in fresh processes, autotune cache off, its choices logged
+        if: matrix.best != ''
+        env:
+          GMFLOW_BPK: ${{ runner.temp }}/gmflow.bpk
+          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
+          GMFLOW_IM2COL: ${{ matrix.im2col }}
+        run: |
+          failed=0
+          for i in 1 2 3 4 5 6; do
+            {
+              echo '[autotune]'
+              echo 'disable_cache = true'
+              echo '[autotune.logger]'
+              echo 'level = "full"'
+              echo 'file = "autotune_'"$i"'.log"'
+            } > cubecl.toml
+            if cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact bidirectional_repeat > repeat_$i.log 2>&1; then
+              echo "run $i: ok"
+            else
+              echo "run $i: FAILED"; failed=$((failed + 1))
+            fi
+            grep REPEAT repeat_$i.log
+          done
+          rm -f cubecl.toml
+          echo "failed runs: $failed of 6"
+          test "$failed" = 0
       - name: Matmuls at the shapes of the model against the arithmetic peak
         if: matrix.best != ''
         run: |

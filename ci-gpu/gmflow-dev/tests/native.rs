@@ -421,3 +421,32 @@ fn matmul_ceiling() {
     let peak_flops = (16 * gmflow_dev::bench::FMA_ITERS * (1 << 20)) as f64;
     time("arithmetic peak (independent multiply-add chains)", peak_flops, &|| gmflow_dev::bench::fma_peak(like.clone()).slice([0..1]));
 }
+
+/// The bidirectional pass alone, against unimatch with the gate of matches_pytorch: run several times in fresh processes
+/// with the autotune cache off (the workflow), to catch a wrong result that depends on which kernels autotune picks
+#[test]
+#[ignore]
+fn bidirectional_repeat() {
+    let (device, name) = device();
+    println!("device: {name}");
+    let dir = env_path("GMFLOW_REF_DIR");
+    let model = load(&device);
+    let mut st = Statics::new(H, W, &device);
+    let im2col = std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true);
+    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true };
+    let inp = |k: usize, i: usize| tensor4(&dir.join(format!("pair{k}_in{i}.f32")), [1, 3, H, W], &device);
+    let mut bad = Vec::new();
+    for k in 0..3 {
+        let fa = model.features(inp(k, 0), &st);
+        let fb = model.features(inp(k, 1), &st);
+        let both = model.flow(&fa, &fb, true, &st, None);
+        let fwd = to_vec(both.clone().narrow(0, 0, 1));
+        let bwd = to_vec(both.narrow(0, 1, 1));
+        for (d, got, file) in [("a -> b", fwd, format!("pair{k}_torch.f32")), ("b -> a", bwd, format!("pair{k}_bwd_torch.f32"))] {
+            let (max, mean, _) = diff(&got, &read_f32(&dir.join(&file)));
+            println!("REPEAT pair {k} {d}: max |burn - torch| {max:.2e} px, mean {mean:.2e} px");
+            if !(max <= 1e-2 && mean <= 1e-4) { bad.push(format!("pair {k} {d}: max {max:e}, mean {mean:e}")); }
+        }
+    }
+    assert!(bad.is_empty(), "bidirectional: {bad:?}");
+}
