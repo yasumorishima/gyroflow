@@ -1,0 +1,722 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 yasumorishima <fwyasu11@gmail.com>
+//
+// gmflow-scale2-regrefine6 (Xu et al., "Unifying Flow, Stereo and Depth Estimation", TPAMI 2023) written by hand in burn,
+// ported from unimatch (https://github.com/autonomousvision/unimatch, at AdrianEddy/unimatch da140fa), whose code is
+// under this license:
+//
+//   MIT License
+//
+//   Copyright (c) 2022 autonomousvision
+//
+//   Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+//   documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
+//   rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
+//   persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+//   The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
+//   Software.
+//
+//   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+//   WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+//   COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+//   OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+// Only what the flow task runs at inference with the settings Gyroflow uses: 2 scales (1/8 then 1/4), split-window
+// attention with 2 and 8 splits, global matching at 1/8 and local (radius 4) at 1/4, global then local (radius 1)
+// propagation, 6 refinement iterations, convex upsampling. Module and parameter names follow unimatch, so the
+// tensors of the checkpoint map onto them by name (see the weights conversion).
+
+use burn::module::{ Module, Param };
+use burn::nn::conv::{ Conv2d, Conv2dConfig };
+use burn::nn::{ InstanceNorm, InstanceNormConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig2d };
+use burn::tensor::activation::{ gelu, relu, sigmoid, softmax, tanh };
+use burn::tensor::module::{ conv2d, interpolate };
+use burn::tensor::ops::{ ConvOptions, GridSampleOptions, GridSamplePaddingMode, InterpolateMode, InterpolateOptions, PadMode };
+use burn::tensor::{ Device, Tensor, TensorData };
+
+pub const FEATURE_CHANNELS: usize = 128;
+pub const REFINE_ITERATIONS: usize = 6;
+const LOCAL_RADIUS: usize = 4; // matching at 1/4 and the correlation of the refinement
+const UPSAMPLE: usize = 4;
+
+fn conv(channels: [usize; 2], kernel: [usize; 2], stride: usize, bias: bool, device: &Device) -> Conv2d {
+    let (ph, pw) = (kernel[0] / 2, kernel[1] / 2);
+    Conv2dConfig::new(channels, kernel)
+        .with_stride([stride, stride])
+        .with_padding(PaddingConfig2d::Explicit(ph, pw, ph, pw))
+        .with_bias(bias)
+        .init(device)
+}
+
+fn instance_norm(channels: usize, device: &Device) -> InstanceNorm {
+    // The defaults of nn.InstanceNorm2d: no affine parameters, eps 1e-5, statistics of each image
+    InstanceNormConfig::new(channels).with_affine(false).with_epsilon(1e-5).init(device)
+}
+
+// ---------------------------------------------------------------- CNN (unimatch backbone.py)
+
+#[derive(Module, Debug)]
+pub struct ResidualBlock {
+    pub conv1: Conv2d,
+    pub conv2: Conv2d,
+    /// The 1x1 projection of the shortcut where the block changes the channels or the stride (`downsample.0` in unimatch)
+    pub downsample: Option<Conv2d>,
+    pub norm: InstanceNorm,
+}
+
+impl ResidualBlock {
+    fn new(in_planes: usize, planes: usize, stride: usize, device: &Device) -> Self {
+        let downsample = (stride != 1 || in_planes != planes).then(|| {
+            Conv2dConfig::new([in_planes, planes], [1, 1]).with_stride([stride, stride]).with_bias(true).init(device)
+        });
+        Self {
+            conv1: conv([in_planes, planes], [3, 3], stride, false, device),
+            conv2: conv([planes, planes], [3, 3], 1, false, device),
+            downsample,
+            norm: instance_norm(planes, device),
+        }
+    }
+
+    fn forward(&self, x: Tensor<4>) -> Tensor<4> {
+        let y = relu(self.norm.forward(self.conv1.forward(x.clone())));
+        let y = relu(self.norm.forward(self.conv2.forward(y)));
+        let x = match &self.downsample {
+            Some(d) => self.norm.forward(d.forward(x)),
+            None => x,
+        };
+        relu(x + y)
+    }
+}
+
+/// One 3x3 convolution applied at stride 1 and stride 2 with the same weights (MultiScaleTridentConv, no bias)
+#[derive(Module, Debug)]
+pub struct TridentConv {
+    pub weight: Param<Tensor<4>>,
+}
+
+#[derive(Module, Debug)]
+pub struct CnnEncoder {
+    pub conv1: Conv2d,
+    pub norm1: InstanceNorm,
+    pub layer1: Vec<ResidualBlock>,
+    pub layer2: Vec<ResidualBlock>,
+    pub layer3: Vec<ResidualBlock>,
+    pub conv2: Conv2d,
+    pub trident_conv: TridentConv,
+}
+
+impl CnnEncoder {
+    fn new(device: &Device) -> Self {
+        let layer = |a: usize, b: usize, stride: usize| vec![ResidualBlock::new(a, b, stride, device), ResidualBlock::new(b, b, 1, device)];
+        let trident = Tensor::<4>::zeros([FEATURE_CHANNELS, FEATURE_CHANNELS, 3, 3], device);
+        Self {
+            conv1: conv([3, 64], [7, 7], 2, false, device),
+            norm1: instance_norm(64, device),
+            layer1: layer(64, 64, 1),
+            layer2: layer(64, 96, 2),
+            // Two output scales: the highest resolution stays at 1/4
+            layer3: layer(96, 128, 1),
+            conv2: Conv2dConfig::new([128, FEATURE_CHANNELS], [1, 1]).with_bias(true).init(device),
+            trident_conv: TridentConv { weight: Param::from_tensor(trident) },
+        }
+    }
+
+    /// Normalised images [N, 3, H, W] -> features at 1/4 and at 1/8, [N, 128, H/4, W/4] and [N, 128, H/8, W/8]
+    pub fn forward(&self, x: Tensor<4>) -> (Tensor<4>, Tensor<4>) {
+        let mut x = relu(self.norm1.forward(self.conv1.forward(x)));
+        for block in self.layer1.iter().chain(&self.layer2).chain(&self.layer3) {
+            x = block.forward(x);
+        }
+        let x = self.conv2.forward(x);
+        let w = self.trident_conv.weight.val();
+        let quarter = conv2d(x.clone(), w.clone(), None, ConvOptions::new([1, 1], [1, 1], [1, 1], 1));
+        let eighth = conv2d(x, w, None, ConvOptions::new([2, 2], [1, 1], [1, 1], 1));
+        (quarter, eighth)
+    }
+}
+
+// ---------------------------------------------------------------- Transformer (unimatch transformer.py, attention.py)
+
+#[derive(Module, Debug)]
+pub struct Mlp {
+    /// Linear(256, 1024), `mlp.0` in unimatch
+    pub fc1: Linear,
+    /// Linear(1024, 128), `mlp.2`
+    pub fc2: Linear,
+}
+
+#[derive(Module, Debug)]
+pub struct TransformerLayer {
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+    pub v_proj: Linear,
+    pub merge: Linear,
+    pub norm1: LayerNorm,
+    pub mlp: Option<Mlp>,
+    pub norm2: Option<LayerNorm>,
+}
+
+impl TransformerLayer {
+    fn new(with_ffn: bool, device: &Device) -> Self {
+        let c = FEATURE_CHANNELS;
+        let lin = |a: usize, b: usize| LinearConfig::new(a, b).with_bias(false).init(device);
+        Self {
+            q_proj: lin(c, c),
+            k_proj: lin(c, c),
+            v_proj: lin(c, c),
+            merge: lin(c, c),
+            norm1: LayerNormConfig::new(c).init(device),
+            mlp: with_ffn.then(|| Mlp { fc1: lin(2 * c, 2 * c * 4), fc2: lin(2 * c * 4, c) }),
+            norm2: with_ffn.then(|| LayerNormConfig::new(c).init(device)),
+        }
+    }
+
+    /// source, target: [B, H*W, C]
+    fn forward(&self, source: Tensor<3>, target: Tensor<3>, win: &Windows, with_shift: bool) -> Tensor<3> {
+        let q = self.q_proj.forward(source.clone());
+        let k = self.k_proj.forward(target.clone());
+        let v = self.v_proj.forward(target);
+        let message = split_window_attention(q, k, v, win, with_shift);
+        let message = self.norm1.forward(self.merge.forward(message));
+        let message = match (&self.mlp, &self.norm2) {
+            (Some(mlp), Some(norm2)) => {
+                let x = Tensor::cat(vec![source.clone(), message], 2);
+                norm2.forward(mlp.fc2.forward(gelu(mlp.fc1.forward(x))))
+            }
+            _ => message,
+        };
+        source + message
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct TransformerBlock {
+    pub self_attn: TransformerLayer,
+    pub cross_attn_ffn: TransformerLayer,
+}
+
+#[derive(Module, Debug)]
+pub struct FeatureTransformer {
+    pub layers: Vec<TransformerBlock>,
+}
+
+impl FeatureTransformer {
+    fn new(device: &Device) -> Self {
+        Self { layers: (0..6).map(|_| TransformerBlock { self_attn: TransformerLayer::new(false, device), cross_attn_ffn: TransformerLayer::new(true, device) }).collect() }
+    }
+
+    /// feature0, feature1: [B, C, H, W] (position added) -> the same, after self- and cross-attention
+    pub fn forward(&self, feature0: Tensor<4>, feature1: Tensor<4>, win: &Windows) -> (Tensor<4>, Tensor<4>) {
+        let [b, c, h, w] = feature0.dims();
+        let tokens = |f: Tensor<4>| f.reshape([b, c, h * w]).swap_dims(1, 2);
+        let (f0, f1) = (tokens(feature0), tokens(feature1));
+        let mut concat0 = Tensor::cat(vec![f0.clone(), f1.clone()], 0);
+        let mut concat1 = Tensor::cat(vec![f1, f0], 0);
+        for (i, layer) in self.layers.iter().enumerate() {
+            let with_shift = i % 2 == 1;
+            let s = layer.self_attn.forward(concat0.clone(), concat0, win, with_shift);
+            concat0 = layer.cross_attn_ffn.forward(s, concat1, win, with_shift);
+            concat1 = swap_halves(concat0.clone());
+        }
+        let back = |t: Tensor<3>| t.swap_dims(1, 2).reshape([b, c, h, w]);
+        (back(concat0.clone().narrow(0, 0, b)), back(concat0.narrow(0, b, b)))
+    }
+}
+
+/// [2B, ...] -> the second half first
+pub fn swap_halves<const D: usize>(t: Tensor<D>) -> Tensor<D> {
+    let b = t.dims()[0] / 2;
+    Tensor::cat(vec![t.clone().narrow(0, b, b), t.narrow(0, 0, b)], 0)
+}
+
+/// What split-window attention at one feature size needs that depends only on the size: the window layout, the sine
+/// position embedding of a window tiled over the map, and the attention mask of the shifted windows
+pub struct Windows {
+    pub h: usize,
+    pub w: usize,
+    pub splits: usize,
+    /// [1, C, H, W]
+    pub position: Tensor<4>,
+    /// [K*K, L, L], 0 or -100, L = (H/K)*(W/K)
+    pub shift_mask: Tensor<3>,
+}
+
+impl Windows {
+    pub fn new(h: usize, w: usize, splits: usize, device: &Device) -> Self {
+        assert!(h % splits == 0 && w % splits == 0, "{h}x{w} does not split into {splits}x{splits} windows");
+        let (wh, ww) = (h / splits, w / splits);
+        // PositionEmbeddingSine(num_pos_feats = 64, temperature 10000, normalize, scale 2 pi) of one window, in float32 as
+        // unimatch computes it; every window gets the same (feature_add_position adds it per split)
+        let half = FEATURE_CHANNELS / 2;
+        let scale = 2.0f32 * std::f32::consts::PI;
+        let eps = 1e-6f32;
+        let dim_t: Vec<f32> = (0..half).map(|i| 10000f32.powf((2 * (i / 2)) as f32 / half as f32)).collect();
+        let mut pos = vec![0f32; FEATURE_CHANNELS * h * w];
+        for y in 0..h {
+            for x in 0..w {
+                let ye = ((y % wh) + 1) as f32 / (wh as f32 + eps) * scale;
+                let xe = ((x % ww) + 1) as f32 / (ww as f32 + eps) * scale;
+                for i in 0..half {
+                    let (py, px) = (ye / dim_t[i], xe / dim_t[i]);
+                    // Channels: pos_y (sin of the even, cos of the odd, interleaved), then pos_x
+                    let (vy, vx) = if i % 2 == 0 { (py.sin(), px.sin()) } else { (py.cos(), px.cos()) };
+                    pos[i * h * w + y * w + x] = vy;
+                    pos[(half + i) * h * w + y * w + x] = vx;
+                }
+            }
+        }
+        let position = Tensor::<4>::from_data(TensorData::new(pos, [1, FEATURE_CHANNELS, h, w]), device);
+
+        // generate_shift_window_attn_mask: regions of the map (3 x 3, split at the shifted window borders), windows of the
+        // map, -100 between two positions of a window that are from different regions
+        let (sh, sw) = (wh / 2, ww / 2);
+        let region = |v: usize, n: usize, win: usize, shift: usize| if v < n - win { 0 } else if v < n - shift { 1 } else { 2 };
+        let l = wh * ww;
+        let mut mask = vec![0f32; splits * splits * l * l];
+        for wy in 0..splits {
+            for wx in 0..splits {
+                let labels: Vec<usize> = (0..l).map(|p| {
+                    let (y, x) = (wy * wh + p / ww, wx * ww + p % ww);
+                    region(y, h, wh, sh) * 3 + region(x, w, ww, sw)
+                }).collect();
+                let base = (wy * splits + wx) * l * l;
+                for i in 0..l {
+                    for j in 0..l {
+                        if labels[i] != labels[j] { mask[base + i * l + j] = -100.0; }
+                    }
+                }
+            }
+        }
+        let shift_mask = Tensor::<3>::from_data(TensorData::new(mask, [splits * splits, l, l]), device);
+        Self { h, w, splits, position, shift_mask }
+    }
+}
+
+/// [B, H, W, C] -> [B*K*K, (H/K)*(W/K), C], windows in row-major order (unimatch split_feature, channel last)
+fn to_windows(x: Tensor<4>, k: usize) -> Tensor<3> {
+    let [b, h, w, c] = x.dims();
+    x.reshape([b * k, h / k, k, w / k * c])
+        .swap_dims(1, 2) // [b*k, k, h/k, (w/k)*c]: window row, window column, ...
+        .reshape([b * k * k, (h / k) * (w / k), c])
+}
+
+/// The inverse of `to_windows`
+fn from_windows(x: Tensor<3>, b: usize, h: usize, w: usize, k: usize) -> Tensor<4> {
+    let c = x.dims()[2];
+    x.reshape([b * k, k, h / k, w / k * c]).swap_dims(1, 2).reshape([b, h, w, c])
+}
+
+/// unimatch single_head_split_window_attention: q, k, v [B, H*W, C] -> [B, H*W, C]
+fn split_window_attention(q: Tensor<3>, k: Tensor<3>, v: Tensor<3>, win: &Windows, with_shift: bool) -> Tensor<3> {
+    let [b, _, c] = q.dims();
+    let (h, w, splits) = (win.h, win.w, win.splits);
+    let (sh, sw) = (h / splits / 2, w / splits / 2);
+    let grid = |t: Tensor<3>| {
+        let t = t.reshape([b, h, w, c]);
+        let t = if with_shift { t.roll_dim(-(sh as i64), 1).roll_dim(-(sw as i64), 2) } else { t };
+        to_windows(t, splits)
+    };
+    let (q, k, v) = (grid(q), grid(k), grid(v));
+    let mut scores = q.matmul(k.swap_dims(1, 2)).div_scalar((c as f32).sqrt());
+    if with_shift {
+        let n = splits * splits;
+        let l = scores.dims()[1];
+        scores = (scores.reshape([b, n, l, l]) + win.shift_mask.clone().unsqueeze_dim::<4>(0)).reshape([b * n, l, l]);
+    }
+    let out = softmax(scores, 2).matmul(v);
+    let out = from_windows(out, b, h, w, splits);
+    let out = if with_shift { out.roll_dim(sh as i64, 1).roll_dim(sw as i64, 2) } else { out };
+    out.reshape([b, h * w, c])
+}
+
+// ---------------------------------------------------------------- Matching and propagation (matching.py, attention.py)
+
+/// [1, 2, H, W]: x then y of each position
+fn coords(h: usize, w: usize, device: &Device) -> Tensor<4> {
+    let mut v = vec![0f32; 2 * h * w];
+    for y in 0..h {
+        for x in 0..w {
+            v[y * w + x] = x as f32;
+            v[h * w + y * w + x] = y as f32;
+        }
+    }
+    Tensor::from_data(TensorData::new(v, [1, 2, h, w]), device)
+}
+
+/// The window offsets of radius r in the order of unimatch (generate_window_grid, reshaped): k = (dy + r) * (2r + 1) + (dx + r)
+fn offsets(r: usize) -> Vec<(i32, i32)> {
+    let n = 2 * r as i32 + 1;
+    (0..n * n).map(|k| (k % n - r as i32, k / n - r as i32)).collect()
+}
+
+/// global_correlation_softmax: [B, C, H, W] x 2 -> flow [B, 2, H, W]
+fn global_correlation_softmax(f0: Tensor<4>, f1: Tensor<4>) -> Tensor<4> {
+    let [b, c, h, w] = f0.dims();
+    let device = f0.device();
+    let f0 = f0.reshape([b, c, h * w]).swap_dims(1, 2); // [B, HW, C]
+    let f1 = f1.reshape([b, c, h * w]); // [B, C, HW]
+    let corr = f0.matmul(f1).div_scalar((c as f32).sqrt());
+    let grid = coords(h, w, &device); // [1, 2, H, W]
+    let grid_t = grid.clone().reshape([1, 2, h * w]).swap_dims(1, 2).repeat_dim(0, b); // [B, HW, 2]
+    let correspondence = softmax(corr, 2).matmul(grid_t).swap_dims(1, 2).reshape([b, 2, h, w]);
+    correspondence - grid
+}
+
+/// The (2r+1)^2 copies of x moved by the window offsets (the value at p + offset), zero outside: one [B, C, H, W] each
+fn shifted(x: Tensor<4>, r: usize) -> Vec<Tensor<4>> {
+    let [_, _, h, w] = x.dims();
+    let padded = x.pad([(r, r), (r, r)], PadMode::Constant(0.0));
+    offsets(r).into_iter().map(|(dx, dy)| {
+        let (y0, x0) = ((r as i32 + dy) as usize, (r as i32 + dx) as usize);
+        padded.clone().narrow(2, y0, h).narrow(3, x0, w)
+    }).collect()
+}
+
+/// local_correlation_softmax (integer offsets, radius r): flow [B, 2, H, W]. Out-of-image offsets get -1e9 before the
+/// softmax, as in unimatch
+fn local_correlation_softmax(f0: Tensor<4>, f1: Tensor<4>, r: usize) -> Tensor<4> {
+    let [_, c, h, w] = f0.dims();
+    let device = f0.device();
+    let scale = 1.0 / (c as f32).sqrt();
+    let corr: Vec<Tensor<4>> = shifted(f1, r).into_iter().map(|s| (f0.clone() * s).sum_dim(1).mul_scalar(scale)).collect();
+    let corr = Tensor::cat(corr, 1); // [B, (2r+1)^2, H, W]
+    let n = (2 * r + 1) * (2 * r + 1);
+    let mut invalid = vec![0f32; n * h * w];
+    let mut sx_all = vec![0f32; n * h * w];
+    let mut sy_all = vec![0f32; n * h * w];
+    for (k, (dx, dy)) in offsets(r).into_iter().enumerate() {
+        for y in 0..h {
+            for x in 0..w {
+                let (sx, sy) = (x as i32 + dx, y as i32 + dy);
+                let i = k * h * w + y * w + x;
+                if sx < 0 || sy < 0 || sx >= w as i32 || sy >= h as i32 { invalid[i] = -1e9; }
+                sx_all[i] = sx as f32;
+                sy_all[i] = sy as f32;
+            }
+        }
+    }
+    let t = |v: Vec<f32>| Tensor::<4>::from_data(TensorData::new(v, [1, n, h, w]), &device);
+    let prob = softmax(corr + t(invalid), 1);
+    // The sample coordinates weighted by the probabilities, then the position subtracted (as unimatch: not the offsets)
+    let cx = (prob.clone() * t(sx_all)).sum_dim(1);
+    let cy = (prob * t(sy_all)).sum_dim(1);
+    Tensor::cat(vec![cx, cy], 1) - coords(h, w, &device)
+}
+
+/// Bilinear samples of x at pixel positions [B, 2, H, W] (x then y), zeros outside, as F.grid_sample with align_corners
+/// of the coordinates normalised the way unimatch does: (p - c) / c, c = (size - 1) / 2
+fn sample(x: Tensor<4>, positions: Tensor<4>) -> Tensor<4> {
+    let [_, _, h, w] = x.dims();
+    let cx = ((w - 1) as f32) / 2.0;
+    let cy = ((h - 1) as f32) / 2.0;
+    let nx = positions.clone().narrow(1, 0, 1).sub_scalar(cx).div_scalar(cx);
+    let ny = positions.narrow(1, 1, 1).sub_scalar(cy).div_scalar(cy);
+    let grid = Tensor::cat(vec![nx, ny], 1).permute([0, 2, 3, 1]);
+    x.grid_sample_2d(grid, GridSampleOptions::new(InterpolateMode::Bilinear).with_padding_mode(GridSamplePaddingMode::Zeros).with_align_corners(true))
+}
+
+/// flow_warp: feature [B, C, H, W] sampled at each position + flow. bilinear_sample normalises with 2 x / (w - 1) - 1,
+/// the same as `sample`
+fn flow_warp(feature: Tensor<4>, flow: Tensor<4>) -> Tensor<4> {
+    let [_, _, h, w] = feature.dims();
+    let positions = coords(h, w, &feature.device()) + flow;
+    sample(feature, positions)
+}
+
+/// local_correlation_with_flow, radius r: [B, (2r+1)^2, H, W]
+fn local_correlation_with_flow(f0: Tensor<4>, f1: Tensor<4>, flow: Tensor<4>, r: usize) -> Tensor<4> {
+    let [_, c, h, w] = f0.dims();
+    let device = f0.device();
+    let scale = 1.0 / (c as f32).sqrt();
+    let base = coords(h, w, &device) + flow;
+    let corr: Vec<Tensor<4>> = offsets(r).into_iter().map(|(dx, dy)| {
+        let offset = Tensor::<4>::from_data(TensorData::new(vec![dx as f32, dy as f32], [1, 2, 1, 1]), &device);
+        let s = sample(f1.clone(), base.clone() + offset);
+        (f0.clone() * s).sum_dim(1).mul_scalar(scale)
+    }).collect();
+    Tensor::cat(corr, 1)
+}
+
+#[derive(Module, Debug)]
+pub struct SelfAttnPropagation {
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+}
+
+impl SelfAttnPropagation {
+    fn new(device: &Device) -> Self {
+        let c = FEATURE_CHANNELS;
+        Self { q_proj: LinearConfig::new(c, c).init(device), k_proj: LinearConfig::new(c, c).init(device) }
+    }
+
+    /// Global: feature0 [B, C, H, W], flow [B, 2, H, W] -> flow. The key is k_proj of the projected query, as unimatch
+    /// computes it (its own note: an accident of the training code, kept)
+    fn global(&self, feature0: Tensor<4>, flow: Tensor<4>) -> Tensor<4> {
+        let [b, c, h, w] = feature0.dims();
+        let q = self.q_proj.forward(feature0.reshape([b, c, h * w]).swap_dims(1, 2));
+        let k = self.k_proj.forward(q.clone());
+        let v = flow.reshape([b, 2, h * w]).swap_dims(1, 2);
+        let prob = softmax(q.matmul(k.swap_dims(1, 2)).div_scalar((c as f32).sqrt()), 2);
+        prob.matmul(v).swap_dims(1, 2).reshape([b, 2, h, w])
+    }
+
+    /// Local window of radius r. The window comes from F.unfold with zero padding: a neighbour outside the map has a key of
+    /// zeros (score 0, still in the softmax) and a flow of zeros
+    fn local(&self, feature0: Tensor<4>, flow: Tensor<4>, r: usize) -> Tensor<4> {
+        let [b, c, h, w] = feature0.dims();
+        let tokens = feature0.reshape([b, c, h * w]).swap_dims(1, 2);
+        let as_map = |t: Tensor<3>| t.swap_dims(1, 2).reshape([b, c, h, w]);
+        let q = as_map(self.q_proj.forward(tokens.clone()));
+        let k = as_map(self.k_proj.forward(tokens));
+        let scale = 1.0 / (c as f32).sqrt();
+        let scores: Vec<Tensor<4>> = shifted(k, r).into_iter().map(|s| (q.clone() * s).sum_dim(1).mul_scalar(scale)).collect();
+        let prob = softmax(Tensor::cat(scores, 1), 1); // [B, (2r+1)^2, H, W]
+        let mut out: Option<Tensor<4>> = None;
+        for (i, f) in shifted(flow, r).into_iter().enumerate() {
+            let term = prob.clone().narrow(1, i, 1) * f;
+            out = Some(match out { Some(o) => o + term, None => term });
+        }
+        out.expect("a window of at least one position")
+    }
+}
+
+// ---------------------------------------------------------------- Refinement (reg_refine.py)
+
+#[derive(Module, Debug)]
+pub struct BasicMotionEncoder {
+    pub convc1: Conv2d,
+    pub convc2: Conv2d,
+    pub convf1: Conv2d,
+    pub convf2: Conv2d,
+    pub conv: Conv2d,
+}
+
+#[derive(Module, Debug)]
+pub struct SepConvGru {
+    pub convz1: Conv2d,
+    pub convr1: Conv2d,
+    pub convq1: Conv2d,
+    pub convz2: Conv2d,
+    pub convr2: Conv2d,
+    pub convq2: Conv2d,
+}
+
+#[derive(Module, Debug)]
+pub struct FlowHead {
+    pub conv1: Conv2d,
+    pub conv2: Conv2d,
+}
+
+#[derive(Module, Debug)]
+pub struct MaskHead {
+    /// `mask.0` in unimatch
+    pub conv1: Conv2d,
+    /// `mask.2`
+    pub conv2: Conv2d,
+}
+
+#[derive(Module, Debug)]
+pub struct BasicUpdateBlock {
+    pub encoder: BasicMotionEncoder,
+    pub gru: SepConvGru,
+    pub flow_head: FlowHead,
+    pub mask: MaskHead,
+}
+
+impl BasicUpdateBlock {
+    fn new(device: &Device) -> Self {
+        let corr = (2 * LOCAL_RADIUS + 1) * (2 * LOCAL_RADIUS + 1);
+        let gru_in = 128 + 256;
+        Self {
+            encoder: BasicMotionEncoder {
+                convc1: conv([corr, 256], [1, 1], 1, true, device),
+                convc2: conv([256, 192], [3, 3], 1, true, device),
+                convf1: conv([2, 128], [7, 7], 1, true, device),
+                convf2: conv([128, 64], [3, 3], 1, true, device),
+                conv: conv([64 + 192, 128 - 2], [3, 3], 1, true, device),
+            },
+            gru: SepConvGru {
+                convz1: conv([gru_in, 128], [1, 5], 1, true, device),
+                convr1: conv([gru_in, 128], [1, 5], 1, true, device),
+                convq1: conv([gru_in, 128], [1, 5], 1, true, device),
+                convz2: conv([gru_in, 128], [5, 1], 1, true, device),
+                convr2: conv([gru_in, 128], [5, 1], 1, true, device),
+                convq2: conv([gru_in, 128], [5, 1], 1, true, device),
+            },
+            flow_head: FlowHead { conv1: conv([128, 256], [3, 3], 1, true, device), conv2: conv([256, 2], [3, 3], 1, true, device) },
+            mask: MaskHead { conv1: conv([128, 256], [3, 3], 1, true, device), conv2: conv([256, UPSAMPLE * UPSAMPLE * 9], [1, 1], 1, true, device) },
+        }
+    }
+
+    fn motion(&self, flow: Tensor<4>, corr: Tensor<4>) -> Tensor<4> {
+        let e = &self.encoder;
+        let cor = relu(e.convc2.forward(relu(e.convc1.forward(corr))));
+        let flo = relu(e.convf2.forward(relu(e.convf1.forward(flow.clone()))));
+        let out = relu(e.conv.forward(Tensor::cat(vec![cor, flo], 1)));
+        Tensor::cat(vec![out, flow], 1)
+    }
+
+    fn gru(&self, h: Tensor<4>, x: Tensor<4>) -> Tensor<4> {
+        let g = &self.gru;
+        let half = |h: Tensor<4>, cz: &Conv2d, cr: &Conv2d, cq: &Conv2d| {
+            let hx = Tensor::cat(vec![h.clone(), x.clone()], 1);
+            let z = sigmoid(cz.forward(hx.clone()));
+            let r = sigmoid(cr.forward(hx));
+            let q = tanh(cq.forward(Tensor::cat(vec![r * h.clone(), x.clone()], 1)));
+            // (1 - z) * h + z * q, in the same order of operations as unimatch
+            (z.clone().neg().add_scalar(1.0)) * h + z * q
+        };
+        let h = half(h, &g.convz1, &g.convr1, &g.convq1);
+        half(h, &g.convz2, &g.convr2, &g.convq2)
+    }
+
+    /// One refinement step: the new hidden state and the flow update
+    fn forward(&self, net: Tensor<4>, inp: Tensor<4>, corr: Tensor<4>, flow: Tensor<4>) -> (Tensor<4>, Tensor<4>) {
+        let motion = self.motion(flow, corr);
+        let net = self.gru(net, Tensor::cat(vec![inp, motion], 1));
+        let delta = self.flow_head.conv2.forward(relu(self.flow_head.conv1.forward(net.clone())));
+        (net, delta)
+    }
+
+    fn up_mask(&self, net: Tensor<4>) -> Tensor<4> {
+        self.mask.conv2.forward(relu(self.mask.conv1.forward(net)))
+    }
+}
+
+/// upsample_flow_with_mask (convex upsampling, factor 4): flow [B, 2, H, W], mask [B, 9*16, H, W] -> [B, 2, 4H, 4W]
+fn convex_upsample(flow: Tensor<4>, mask: Tensor<4>) -> Tensor<4> {
+    let [b, _, h, w] = flow.dims();
+    let k = UPSAMPLE;
+    // mask.view(b, 1, 9, k, k, h, w), softmax over the 9
+    let mask = softmax(mask.reshape([b, 9, k * k, h * w]), 1);
+    // F.unfold(k * flow, 3x3, padding 1): per channel, the 3x3 window row-major, zeros outside
+    let mut up: Option<Tensor<4>> = None; // [B, 2, k*k, h*w]
+    for (i, nb) in shifted(flow.mul_scalar(k as f32), 1).into_iter().enumerate() {
+        let term = mask.clone().narrow(1, i, 1) * nb.reshape([b, 2, 1, h * w]);
+        up = Some(match up { Some(u) => u + term, None => term });
+    }
+    // [B, 2, ky, kx, h, w] -> [B, 2, h, ky, w, kx]
+    up.expect("nine neighbours")
+        .reshape([b * 2, k, k, h, w])
+        .permute([0, 3, 1, 4, 2])
+        .reshape([b, 2, h * k, w * k])
+}
+
+// ---------------------------------------------------------------- The model
+
+#[derive(Module, Debug)]
+pub struct Gmflow {
+    pub backbone: CnnEncoder,
+    pub transformer: FeatureTransformer,
+    pub feature_flow_attn: SelfAttnPropagation,
+    pub refine_proj: Conv2d,
+    pub refine: BasicUpdateBlock,
+}
+
+/// The size-dependent constants of one input size
+pub struct Statics {
+    pub h: usize,
+    pub w: usize,
+    pub eighth: Windows,
+    pub quarter: Windows,
+    /// ImageNet mean and std, [1, 3, 1, 1]
+    pub mean: Tensor<4>,
+    pub std: Tensor<4>,
+}
+
+impl Statics {
+    pub fn new(h: usize, w: usize, device: &Device) -> Self {
+        assert!(h % 32 == 0 && w % 32 == 0, "gmflow needs a size divisible by 32 (the 8 window splits at 1/4), got {w}x{h}");
+        let c3 = |v: [f32; 3]| Tensor::<4>::from_data(TensorData::new(v.to_vec(), [1, 3, 1, 1]), device);
+        Self {
+            h,
+            w,
+            eighth: Windows::new(h / 8, w / 8, 2, device),
+            quarter: Windows::new(h / 4, w / 4, 8, device),
+            mean: c3([0.485, 0.456, 0.406]),
+            std: c3([0.229, 0.224, 0.225]),
+        }
+    }
+}
+
+/// Intermediates of one pass, named as ci-gpu/refs_native.py names those of unimatch, for checking the port stage by stage
+#[derive(Default)]
+pub struct Trace {
+    pub tensors: Vec<(String, Tensor<4>)>,
+}
+
+fn put(trace: &mut Option<&mut Trace>, name: &str, t: &Tensor<4>) {
+    if let Some(tr) = trace.as_deref_mut() { tr.tensors.push((name.to_owned(), t.clone())); }
+}
+
+impl Gmflow {
+    pub fn new(device: &Device) -> Self {
+        Self {
+            backbone: CnnEncoder::new(device),
+            transformer: FeatureTransformer::new(device),
+            feature_flow_attn: SelfAttnPropagation::new(device),
+            refine_proj: Conv2dConfig::new([128, 256], [1, 1]).with_bias(true).init(device),
+            refine: BasicUpdateBlock::new(device),
+        }
+    }
+
+    /// Raw 0-255 images [B, 3, H, W] (B pairs) -> flow img0 -> img1 [B, 2, H, W], the forward of unimatch for the flow task
+    pub fn forward(&self, img0: Tensor<4>, img1: Tensor<4>, st: &Statics) -> Tensor<4> {
+        self.forward_traced(img0, img1, st, None)
+    }
+
+    pub fn forward_traced(&self, img0: Tensor<4>, img1: Tensor<4>, st: &Statics, mut trace: Option<&mut Trace>) -> Tensor<4> {
+        let b = img0.dims()[0];
+        let norm = |x: Tensor<4>| (x.div_scalar(255.0) - st.mean.clone()) / st.std.clone();
+        let (quarter, eighth) = self.backbone.forward(Tensor::cat(vec![norm(img0), norm(img1)], 0));
+        put(&mut trace, "backbone0", &quarter);
+        put(&mut trace, "backbone1", &eighth);
+
+        // 1/8: global matching, global propagation
+        let (f0, f1) = (eighth.clone().narrow(0, 0, b), eighth.narrow(0, b, b));
+        let pos = st.eighth.position.clone();
+        let (f0, f1) = self.transformer.forward(f0 + pos.clone(), f1 + pos, &st.eighth);
+        put(&mut trace, "transformer_f0_0", &f0);
+        put(&mut trace, "transformer_f1_0", &f1);
+        let flow = global_correlation_softmax(f0.clone(), f1);
+        put(&mut trace, "global_corr_flow0", &flow);
+        let flow = self.feature_flow_attn.global(f0, flow);
+        put(&mut trace, "propagated0", &flow);
+
+        // 1/4: the flow doubled in size, feature 1 warped by it, local matching of what remains, local propagation
+        let (f0_ori, f1_ori) = (quarter.clone().narrow(0, 0, b), quarter.narrow(0, b, b));
+        let flow = interpolate(flow, InterpolateOptions::new(InterpolateMode::Bilinear).with_align_corners(true).with_scale_factor([2.0, 2.0])).mul_scalar(2.0);
+        let f1w = flow_warp(f1_ori.clone(), flow.clone());
+        put(&mut trace, "warped_feature1_0", &f1w);
+        let pos = st.quarter.position.clone();
+        let (f0, f1) = self.transformer.forward(f0_ori.clone() + pos.clone(), f1w + pos, &st.quarter);
+        put(&mut trace, "transformer_f0_1", &f0);
+        put(&mut trace, "transformer_f1_1", &f1);
+        let flow_pred = local_correlation_softmax(f0.clone(), f1, LOCAL_RADIUS);
+        put(&mut trace, "local_corr_flow0", &flow_pred);
+        let flow = flow + flow_pred;
+        let mut flow = self.feature_flow_attn.local(f0.clone(), flow, 1);
+        put(&mut trace, "propagated1", &flow);
+
+        // Refinement: the context comes from feature 0 of the transformer and is the same in every iteration (unimatch
+        // computes it again each time), the correlation from the CNN features
+        let proj = self.refine_proj.forward(f0);
+        put(&mut trace, "refine_proj0", &proj);
+        let net0 = tanh(proj.clone().narrow(1, 0, 128));
+        let inp = relu(proj.narrow(1, 128, 128));
+        let mut net = net0.clone();
+        for i in 0..REFINE_ITERATIONS {
+            let corr = local_correlation_with_flow(f0_ori.clone(), f1_ori.clone(), flow.clone(), LOCAL_RADIUS);
+            put(&mut trace, &format!("corr_with_flow{i}"), &corr);
+            let (n, delta) = self.refine.forward(net0.clone(), inp.clone(), corr, flow.clone());
+            put(&mut trace, &format!("refine_net{i}"), &n);
+            put(&mut trace, &format!("refine_delta{i}"), &delta);
+            net = n;
+            flow = flow + delta;
+        }
+        let up = convex_upsample(flow, self.refine.up_mask(net));
+        put(&mut trace, "upsampled0", &up);
+        up
+    }
+}

@@ -1,11 +1,12 @@
-# Work branch only (never part of #1143): the hand-written burn gmflow. Step 0: PyTorch references (forward, bidirectional,
-# intermediates) and the profile of the current (ONNX-generated) model on Metal, as the baseline.
+# Work branch only (never part of #1143): the hand-written burn gmflow (ci-gpu/gmflow-dev builds
+# src/core/synchronization/optical_flow/gmflow/model.rs on its own) against PyTorch, on lavapipe (Vulkan, SPIR-V kernels)
+# and on the paravirtual Apple GPU of the macOS runner (WGSL kernels on Metal).
 name: gmflow native
 
 on:
   push:
     branches: ['wip/gmflow-native']
-    paths: ['ci-gpu/**', '.github/workflows/gmflow-native.yml', 'src/core/**', 'Cargo.toml', 'Cargo.lock']
+    paths: ['ci-gpu/**', '.github/workflows/gmflow-native.yml', 'src/core/synchronization/optical_flow/gmflow/**']
   workflow_dispatch:
     inputs:
       memo:
@@ -54,45 +55,57 @@ jobs:
           retention-days: 7
           path: ci-gpu/out
 
-  # The model of the PR as it is (burn-onnx codegen), on the paravirtualised Apple GPU of the hosted macOS runner: warm
-  # time per pair, then the same passes with cubecl's per-kernel profile. A virtual machine's speed, not a Mac's.
-  baseline-metal:
+  native:
     needs: refs
-    runs-on: macos-14
-    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: lavapipe, os: ubuntu-24.04, warm: '0' }
+          - { name: metal-wgsl, os: macos-14, warm: '10' }
+    name: native-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    defaults:
+      run:
+        working-directory: ci-gpu/gmflow-dev
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: gmflow-refs
           path: ci-gpu/out
+      - name: Software Vulkan (lavapipe)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mesa-vulkan-drivers libvulkan1 vulkan-tools > /dev/null
+          vulkaninfo --summary | sed -n '/Devices:/,$p'
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable && rustc --version
       - name: Build the tests
-        working-directory: src/core
-        run: time cargo test --locked --release --features use-burn --lib --no-run
-      - name: Metal against PyTorch, 10 warm passes
-        working-directory: src/core
+        run: time cargo test --release --test native --no-run
+      - name: The checkpoint into the model, written as .bpk
         env:
-          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
-          GMFLOW_WARM_RUNS: '10'
-        run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_matches_pytorch timing.log
-      - name: The same with cubecl's per-kernel profile (3 warm passes)
-        working-directory: src/core
-        env:
-          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
-          GMFLOW_WARM_RUNS: '3'
-          CUBECL_DEBUG_LOG: stdout
-          CUBECL_DEBUG_OPTION: profile
+          GMFLOW_BPK: ${{ runner.temp }}/gmflow.bpk
         run: |
-          cargo test --locked --release --features use-burn --lib -- --ignored --nocapture --exact synchronization::optical_flow::gmflow::tests::gmflow_matches_pytorch > profile.log 2>&1 || { tail -n 50 profile.log; exit 1; }
-          ls -la profile.log
-          python3 ../../ci-gpu/profile_summary.py profile.log "pair 2 on" "test result:" 3 | tee profile_summary.txt
+          curl -fsSL --retry 3 --max-time 600 -o "$RUNNER_TEMP/gmflow.pth" "$PTH_URL"
+          GMFLOW_PTH="$RUNNER_TEMP/gmflow.pth" cargo test --release --test native -- --ignored --nocapture --exact convert_weights 2>&1 | tee convert.log
+          grep -q "test result: ok. 1 passed" convert.log
+          ls -la "$GMFLOW_BPK"; shasum -a 256 "$GMFLOW_BPK"
+      - name: Against PyTorch, stage by stage and every pair
+        env:
+          GMFLOW_BPK: ${{ runner.temp }}/gmflow.bpk
+          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
+          GMFLOW_WARM_RUNS: ${{ matrix.warm }}
+        run: |
+          cargo test --release --test native -- --ignored --nocapture --exact matches_pytorch 2>&1 | tee pytorch.log
+          grep -q "test result: ok. 1 passed" pytorch.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: baseline-metal-profile
+          name: native-${{ matrix.name }}
           retention-days: 7
           path: |
-            src/core/timing.log
-            src/core/profile_summary.txt
+            ci-gpu/gmflow-dev/*.log
+            ci-gpu/gmflow-dev/Cargo.lock

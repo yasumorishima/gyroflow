@@ -1,0 +1,20 @@
+# Work branch only (never part of #1143): builds the hand-written gmflow (src/core/.../gmflow/model.rs) on its own, without
+# the rest of gyroflow-core, to check it against PyTorch and time it on the CI GPUs quickly
+[package]
+name = "gmflow-dev"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+burn-store = { version = "=0.22.1", default-features = false, features = ["std", "pytorch"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+burn = { version = "=0.22.1", default-features = false, features = ["std", "autotune", "fusion", "cubecl", "wgpu"] }
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+burn = { version = "=0.22.1", default-features = false, features = ["std", "autotune", "fusion", "cubecl", "vulkan"] }
+
+[profile.release]
+debug = false
