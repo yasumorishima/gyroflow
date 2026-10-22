@@ -185,8 +185,9 @@ impl Tracker {
     }
 
     /// Where each point went, by gmflow's dense flow (Xu et al. 2022, see `optical_flow::GmflowDenseFlow`) from this
-    /// frame to the next and back, like `dense`: None where the two don't agree at the point (`GMFLOW_FB_MAX`). Two
-    /// passes of the model per frame, on the GPU, with `stop` asked before each. An error when it can't run at all (no
+    /// frame to the next and back, like `dense`: None where the two don't agree at the point (`GMFLOW_FB_MAX`). One
+    /// bidirectional pass of the model per frame (the CNN features of the previous frame are reused), on the GPU, with
+    /// `stop` asked before it. An error when it can't run at all (no
     /// usable GPU, no model), which stops the analysis: every frame after it would fail the same way
     #[cfg(feature = "use-burn")]
     fn gmflow(prev: &Mat, cur: &Mat, points: &[Point2f], stop: &dyn Fn() -> bool) -> Result<Vec<Option<Point2f>>, opencv::Error> {
@@ -200,9 +201,7 @@ impl Tracker {
         let (a, b) = (to_image(prev)?, to_image(cur)?);
         let failed = || opencv::Error::new(core::StsError, "gmflow could not compute the flow, see the log");
         if stop() { return Ok(vec![None; points.len()]); }
-        let forward = GmflowDenseFlow::compute(&a, &b).ok_or_else(failed)?;
-        if stop() { return Ok(vec![None; points.len()]); }
-        let backward = GmflowDenseFlow::compute(&b, &a).ok_or_else(failed)?;
+        let (forward, backward) = GmflowDenseFlow::compute_both(&a, &b).ok_or_else(failed)?;
         let (w, h) = (prev.cols() as f32, prev.rows() as f32);
         let inside = |p: Point2f| p.x >= 0.0 && p.y >= 0.0 && p.x <= w - 1.0 && p.y <= h - 1.0;
         Ok(points.iter().map(|&a| {

@@ -9,25 +9,23 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use parking_lot::RwLock;
 
-// AI-based optical flow backend built on gmflow (Unimatch).
-// The generated `model` module is produced by `burn-onnx` from a simplified
-// gmflow-scale2-regrefine6 ONNX at build time. See `build.rs`.
+// gmflow (unimatch), written by hand in burn: model.rs, with the CubeCL kernels of kernels.rs
 #[cfg(feature = "use-burn")]
-#[allow(clippy::all, dead_code, unused_imports, unused_variables)]
-mod model {
-    include!(concat!(env!("OUT_DIR"), "/model/gmflow-scale2-regrefine6-320x576-opset16-sim.rs"));
-}
+mod model;
+#[cfg(feature = "use-burn")]
+mod kernels;
 
 #[cfg(feature = "use-burn")]
 mod inference {
-    use super::model::Model;
+    use super::kernels;
+    use super::model::{ Features, Gmflow, Ops, Statics };
     use std::io::Read;
     use std::path::PathBuf;
-    use std::sync::{ Arc, OnceLock };
+    use std::sync::OnceLock;
     use std::time::{ Duration, Instant };
     use image::GrayImage;
     use parking_lot::Mutex;
-    use burn::tensor::{ Bytes, Device, DeviceKind, Tensor, TensorData };
+    use burn::tensor::{ Bytes, Device, DeviceKind, Int, Tensor, TensorData };
     use burn::tensor::wgpu::WgpuBackend;
     use burn_store::{ BurnpackStore, ModuleSnapshot };
     use sha2::{ Digest, Sha256 };
@@ -35,30 +33,25 @@ mod inference {
     pub const MODEL_W: usize = 576;
     pub const MODEL_H: usize = 320;
 
-    // Model weights are hosted separately rather than embedded to avoid a ~145 MB library bloat
-    // for users who do not enable the ai-optical-flow feature. The .bpk is the weights file that burn-onnx 0.22 writes
-    // next to the generated code, from the ONNX that build.rs pins (gmflow-scale2-regrefine6, MIT, derived from
-    // autonomousvision/unimatch): its tensors are named after that graph, so the two go together. Each build writes
-    // fresh random parameter ids into it and nothing else differs; loading matches tensors by name, so the hosted file
-    // is one such build. The SHA-256 pin defends against tampering on the download path. GYROFLOW_GMFLOW_WEIGHTS=<path>
-    // takes the file from there instead of downloading it (offline installs, packaging, tests); it must still match
-    // the pin.
-    const MODEL_URL: &str = "https://github.com/yasumorishima/gyroflow-models/releases/download/v1.1.0/gmflow-scale2-regrefine6-320x576-opset16-sim.bpk";
-    const MODEL_SHA256: &str = "4f89e462a8457023fdadb9383c9b04d8fd56420329e56aa7c36d5e7387f269d5";
-    const MODEL_FILENAME: &str = "gmflow-scale2-regrefine6-320x576-opset16-sim.bpk";
+    // The weights of gmflow-scale2-regrefine6 (mixdata, trained at 320x576; MIT, autonomousvision/unimatch), converted from
+    // the official checkpoint into the parameters of model.rs (ci-gpu/gmflow-dev: convert_weights), hosted separately rather
+    // than embedded. The SHA-256 pin defends against tampering on the download path. GYROFLOW_GMFLOW_WEIGHTS=<path> takes
+    // the file from there instead of downloading it (offline installs, packaging, tests); it must still match the pin.
+    const MODEL_URL: &str = "https://github.com/yasumorishima/gyroflow-models/releases/download/v1.2.0/gmflow-scale2-regrefine6.bpk";
+    const MODEL_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const MODEL_FILENAME: &str = "gmflow-scale2-regrefine6.bpk";
 
     // gmflow runs on the GPU only: Vulkan on Windows, Linux and Android, Metal on macOS and iOS (the graphics API is
-    // pinned, there is no fallback to another one). Without a usable GPU it doesn't run, and says why.
+    // pinned, there is no fallback to another one). On Metal, burn compiles its kernels to native MSL where the device and
+    // the Metal compiler allow it (cooperative matrices for the matmuls and convolutions), and to WGSL elsewhere.
     #[cfg(target_vendor = "apple")]
     const GRAPHICS_API: WgpuBackend = WgpuBackend::Metal;
     #[cfg(not(target_vendor = "apple"))]
     const GRAPHICS_API: WgpuBackend = WgpuBackend::Vulkan;
 
-    // The largest single tensor of the model, which the GPU must be able to hold as one storage buffer: the transformer's
-    // feed-forward layer, [2, 11520, 1024] f32 (both frames at 1/4 of 576x320, 4 x 256 channels). Measured on the exported
-    // graph (every output, static shapes). The local correlations, 456 MiB as unimatch writes them, are exported 9 window
-    // offsets at a time so that they stay below this; 128 MiB is all that Vulkan guarantees, and what many Android GPUs have.
-    const LARGEST_BUFFER: u64 = 2 * 11520 * 1024 * 4;
+    // The largest buffer the model makes: the im2col columns of a convolution, at most 120 MiB by construction
+    // (model.rs, IM2COL_MAX_BYTES), under the 128 MiB that Vulkan guarantees for one storage buffer
+    const LARGEST_BUFFER: u64 = 120 << 20;
 
     // The device, picked once per process: a hardware GPU (discrete, then integrated, then virtual) that can hold the
     // model's largest buffer. GYROFLOW_GMFLOW_DEVICE=any takes the graphics API's default adapter even when it's a software
@@ -67,7 +60,13 @@ mod inference {
     // Set when the GPU failed while running the model (a lost device, a shader the driver rejects): gmflow stays off for
     // the rest of the process, with the reason logged once
     static GPU_FAILED: Mutex<Option<String>> = Mutex::new(None);
-    static MODEL: Mutex<Option<Arc<Model>>> = Mutex::new(None);
+    static RUNNER: Mutex<Option<std::sync::Arc<Runner>>> = Mutex::new(None);
+
+    /// The model on the device with the constants of the input size
+    pub struct Runner {
+        model: Gmflow,
+        statics: Statics,
+    }
 
     fn gpu() -> Result<&'static (Device, String), String> {
         if let Some(why) = &*GPU_FAILED.lock() { return Err(why.clone()); }
@@ -81,7 +80,7 @@ mod inference {
         }).as_ref().map_err(|e| e.clone())
     }
 
-    // What gmflow runs on, for tests: "wgpu: <adapter> (<type>, <api>)", or why it can't run
+    // What gmflow runs on, for tests: "wgpu: <adapter> (<type>, <api>, <kernels>)", or why it can't run
     #[cfg(test)]
     pub fn device_name() -> String {
         match gpu() { Ok((_, name)) => name.clone(), Err(why) => format!("no GPU: {}", why) }
@@ -103,17 +102,33 @@ mod inference {
         Err(format!("no usable {:?} GPU ({})", GRAPHICS_API, errors.join("; ")))
     }
 
-    // A missing adapter comes back as an error; a panic inside the wgpu stack (a broken driver) is caught too
+    // A missing adapter comes back as an error; a panic inside the wgpu stack (a broken driver) is caught too. On Apple
+    // systems Metal is asked for with native MSL first; where the device or the Metal compiler can't run it (iOS, macOS
+    // before 15, GPUs before Apple7), the automatic choice, which is Metal with WGSL kernels.
     fn init(kind: DeviceKind) -> Result<(Device, String), String> {
         let label = format!("{:?}", kind);
-        let started = std::panic::catch_unwind(|| Device::wgpu_options().graphics_api(GRAPHICS_API).device_kind(kind).init_with_setup());
+        let attempt = |pin: bool| std::panic::catch_unwind(|| {
+            let options = Device::wgpu_options().device_kind(kind);
+            if pin { options.graphics_api(GRAPHICS_API).init_with_setup() } else { options.init_with_setup() }
+        });
+        let (started, kernels) = match attempt(true) {
+            Ok(Ok(found)) => (Ok(Ok(found)), if cfg!(target_vendor = "apple") { "MSL" } else { "SPIR-V" }),
+            first if cfg!(target_vendor = "apple") => {
+                if let Ok(Err(e)) = &first { log::info!("gmflow: {}: no native MSL ({}), WGSL kernels", label, e); }
+                (attempt(false), "WGSL")
+            }
+            first => (first, "SPIR-V"),
+        };
         let (device, setup) = match started {
             Ok(Ok(found)) => found,
             Ok(Err(e)) => return Err(format!("{}: {}", label, e)),
             Err(_) => return Err(format!("{}: the wgpu runtime panicked while starting", label)),
         };
         let info = setup.adapter.get_info();
-        let name = format!("wgpu: {} ({:?}, {:?})", info.name, info.device_type, info.backend);
+        if info.backend != wgpu_backend() {
+            return Err(format!("{}: {} is a {:?} adapter", label, info.name, info.backend));
+        }
+        let name = format!("wgpu: {} ({:?}, {:?}, {} kernels)", info.name, info.device_type, info.backend, kernels);
         // What the adapter can do, not the device: cubecl raises the device's binding size to u64::MAX where Vulkan has
         // 64-bit indexing, so only the adapter's limit says what a buffer can be
         let limits = setup.adapter.limits();
@@ -124,6 +139,10 @@ mod inference {
         Ok((device, name))
     }
 
+    #[cfg(target_vendor = "apple")]
+    fn wgpu_backend() -> burn::tensor::wgpu::wgpu::Backend { burn::tensor::wgpu::wgpu::Backend::Metal }
+    #[cfg(not(target_vendor = "apple"))]
+    fn wgpu_backend() -> burn::tensor::wgpu::wgpu::Backend { burn::tensor::wgpu::wgpu::Backend::Vulkan }
     // cubecl keeps the kernels it compiled and the results of tuning them (seconds to tens of seconds on first use) in a
     // cache: in Gyroflow's data directory, not in the working directory or a Cargo `target/` above it (its default)
     #[cfg(not(target_os = "ios"))]
@@ -180,7 +199,7 @@ mod inference {
             std::fs::create_dir_all(parent).map_err(|e| format!("create {:?}: {}", parent, e))?;
         }
         log::info!("gmflow: downloading model from {}", MODEL_URL);
-        // 600 s global budget (covers the ~145 MB download on a >= 2.4 Mbps link)
+        // 600 s global budget (covers the ~30 MB download on a slow link)
         // plus a 30 s connect timeout so a DNS / TLS stall cannot hang a rayon worker
         // indefinitely. Without these, ureq falls back to unbounded waits.
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -217,7 +236,7 @@ mod inference {
     // Loads the weights onto `device`, downloading them first if they're not cached. Errors are logged when they
     // happen, not when a recent one is handed out again. A file that doesn't load is the answer for good: it passed the
     // SHA-256 pin, so it would fail the same way every time.
-    fn load_model(device: &Device) -> Result<Arc<Model>, String> {
+    fn load_model(device: &Device) -> Result<Gmflow, String> {
         static WEIGHTS_FAILED: Mutex<Option<(Instant, String)>> = Mutex::new(None);
         static LOAD_FAILED: OnceLock<String> = OnceLock::new();
         if let Some(why) = LOAD_FAILED.get() { return Err(why.clone()); }
@@ -231,10 +250,8 @@ mod inference {
             why
         })?;
         *WEIGHTS_FAILED.lock() = None;
-        // Load through the store rather than the generated `from_bytes`, which panics on a
-        // bad file; this runs on a rayon worker, so report and disable gmflow instead.
         let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(raw)));
-        let mut m = Model::new(device);
+        let mut m = Gmflow::new(device);
         let applied = m.load_from(&mut store).map_err(|e| {
             let why = format!("failed to load model weights: {}", e);
             log::error!("gmflow: {}", why);
@@ -247,16 +264,45 @@ mod inference {
             log::error!("gmflow: {}", why);
             return Err(LOAD_FAILED.get_or_init(|| why).clone());
         }
-        Ok(Arc::new(m))
+        Ok(m)
     }
 
     // The model on the GPU, loaded if it isn't yet. One load at a time: the others wait for it.
-    fn model_on(device: &Device) -> Result<Arc<Model>, String> {
-        let mut slot = MODEL.lock();
-        if let Some(m) = &*slot { return Ok(m.clone()); }
-        let m = load_model(device)?;
-        *slot = Some(m.clone());
-        Ok(m)
+    fn runner_on(device: &Device) -> Result<std::sync::Arc<Runner>, String> {
+        let mut slot = RUNNER.lock();
+        if let Some(r) = &*slot { return Ok(r.clone()); }
+        let model = load_model(device)?;
+        let mut statics = Statics::new(MODEL_H, MODEL_W, device);
+        statics.ops = Ops { conv_im2col: im2col_is_faster(device), ..OPS };
+        log::info!("gmflow: convolutions {}", if statics.ops.conv_im2col { "as im2col + matmul" } else { "by burn" });
+        let r = std::sync::Arc::new(Runner { model, statics });
+        *slot = Some(r.clone());
+        Ok(r)
+    }
+
+    // Which implementations run: see model.rs, Ops. The convolutions are chosen per GPU (im2col_is_faster)
+    const OPS: Ops = Ops { kernels: true, conv_im2col: false, gru_factored: true, fused_qkv: true };
+
+    // Where the GPU has no cooperative matrices (WGSL on Metal, many Vulkan GPUs), burn can only run a 3x3 convolution
+    // as a direct convolution, which is much slower than its matmul; where it has them (native MSL, recent Vulkan GPUs),
+    // its implicit-GEMM convolutions are faster than im2col + matmul. Measured once, on the shape of the refinement (most
+    // of the convolution work), each way warmed up first: the faster one is used for the convolutions of the model
+    fn im2col_is_faster(device: &Device) -> bool {
+        use burn::tensor::Distribution;
+        use burn::tensor::module::conv2d;
+        use burn::tensor::ops::ConvOptions;
+        let x = Tensor::<4>::random([1, 256, MODEL_H / 4, MODEL_W / 4], Distribution::Default, device);
+        let w = Tensor::<4>::random([192, 256, 3, 3], Distribution::Default, device);
+        let time = |f: &dyn Fn() -> Tensor<4>| {
+            for _ in 0..2 { let _ = f().sum().into_data(); }
+            let started = Instant::now();
+            for _ in 0..3 { let _ = f().sum().into_data(); }
+            started.elapsed()
+        };
+        let by_burn = time(&|| conv2d(x.clone(), w.clone(), None, ConvOptions::new([1, 1], [1, 1], [1, 1], 1)));
+        let by_im2col = time(&|| kernels::conv2d_im2col(x.clone(), w.clone(), None, 1, [1, 1], 120 << 20));
+        log::debug!("gmflow: a 3x3 convolution of the refinement, 3 runs: burn {:?}, im2col + matmul {:?}", by_burn, by_im2col);
+        by_im2col < by_burn
     }
 
     // Turns gmflow off for the rest of the process after the GPU failed while running it
@@ -276,17 +322,15 @@ mod inference {
     pub fn prepare() -> Result<String, String> {
         let (device, name) = gpu()?;
         // Loading the weights allocates GPU memory: a panic there is the GPU's
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model_on(device))) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner_on(device))) {
             Ok(Ok(_)) => Ok(name.clone()),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(gpu_failed(name, "panic in the wgpu runtime while loading the weights".to_owned())),
         }
     }
 
-    // Aspect-preserving letterbox mapping parameters. `scale` is model-pixels per
-    // original-pixel; `pad_x` / `pad_y` are the left/top zero-padding offsets in
-    // model space. Kept separate from the tensor so `compute_flow` can move the
-    // tensor into `forward` without cloning.
+    // Aspect-preserving letterbox mapping parameters. `scale` is model-pixels per original-pixel; `pad_x` / `pad_y` are
+    // the left/top zero-padding offsets in model space; the frame is resized to new_w x new_h.
     pub struct LetterboxParams {
         pub scale: f32,
         // The exact ratios of each axis: `scale` but for the rounding of the resized size
@@ -294,49 +338,42 @@ mod inference {
         pub sy: f32,
         pub pad_x: usize,
         pub pad_y: usize,
+        pub new_w: usize,
+        pub new_h: usize,
     }
 
-    // The model's input for one frame: [1, 3, MODEL_H, MODEL_W], letterboxed, raw 0-255 grey in all 3 channels
-    pub fn preprocess(img: &GrayImage) -> (Vec<f32>, LetterboxParams) {
-        let (iw, ih) = (img.width() as f32, img.height() as f32);
+    pub fn letterbox(width: u32, height: u32) -> LetterboxParams {
+        let (iw, ih) = (width as f32, height as f32);
         let scale = (MODEL_W as f32 / iw).min(MODEL_H as f32 / ih);
         let new_w = ((iw * scale).round() as usize).min(MODEL_W).max(1);
         let new_h = ((ih * scale).round() as usize).min(MODEL_H).max(1);
-        let pad_x = (MODEL_W - new_w) / 2;
-        let pad_y = (MODEL_H - new_h) / 2;
-
-        let resized = image::imageops::resize(
-            img,
-            new_w as u32,
-            new_h as u32,
-            image::imageops::FilterType::Triangle,
-        );
-
-        // Zero-padded letterbox into [1, 3, MODEL_H, MODEL_W]. gmflow expects raw
-        // 0-255 f32 (normalises internally). Write the resized luminance into the
-        // first channel slot in place, then memcpy it into channels 2 and 3 so we
-        // do not allocate an auxiliary per-channel buffer.
-        let mut data = vec![0.0f32; 3 * MODEL_H * MODEL_W];
-        {
-            let src_pixels = resized.as_raw();
-            let (first, rest) = data.split_at_mut(MODEL_H * MODEL_W);
-            for y in 0..new_h {
-                let sr = y * new_w;
-                let dr = (y + pad_y) * MODEL_W + pad_x;
-                for x in 0..new_w {
-                    first[dr + x] = src_pixels[sr + x] as f32;
-                }
-            }
-            let (second, third) = rest.split_at_mut(MODEL_H * MODEL_W);
-            second.copy_from_slice(first);
-            third.copy_from_slice(first);
-        }
-        (data, LetterboxParams { scale, sx: new_w as f32 / iw, sy: new_h as f32 / ih, pad_x, pad_y })
+        LetterboxParams { scale, sx: new_w as f32 / iw, sy: new_h as f32 / ih, pad_x: (MODEL_W - new_w) / 2, pad_y: (MODEL_H - new_h) / 2, new_w, new_h }
     }
 
-    // One pass of the model on the GPU, inputs as `preprocess` makes them; the flow, [1, 2, MODEL_H, MODEL_W]. An error or
-    // a panic inside the wgpu runtime (a shader that doesn't compile, a lost device, out of memory) turns gmflow off.
-    pub fn forward(in0: Vec<f32>, in1: Vec<f32>) -> Result<Vec<f32>, String> {
+    /// A frame on its way to the GPU: its 8-bit grey as it is uploaded (3 pixels to a word, kernels::pack_frame) and
+    /// where it goes in the letterbox. The resize to the model size (the Triangle filter of the image crate, which the CPU
+    /// ran before) and the 3 channels happen on the GPU, from these bytes.
+    pub struct Frame {
+        words: Vec<i32>,
+        shape: [usize; 2],
+        width: usize,
+        pub lb: LetterboxParams,
+    }
+
+    pub fn frame(img: &GrayImage) -> Frame {
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let (words, shape) = kernels::pack_frame(w, h, w, img.as_raw());
+        Frame { words, shape, width: w, lb: letterbox(img.width(), img.height()) }
+    }
+
+    fn model_input(f: &Frame, device: &Device) -> Tensor<4> {
+        let packed = Tensor::<2, Int>::from_data(TensorData::new(f.words.clone(), f.shape), device);
+        kernels::preprocess(packed, f.width, f.lb.new_w, f.lb.new_h, f.lb.pad_x, f.lb.pad_y, MODEL_H, MODEL_W)
+    }
+
+    // One pass of the model on the GPU; the flow, [1, 2, MODEL_H, MODEL_W]. An error or a panic inside the wgpu runtime
+    // (a shader that doesn't compile, a lost device, out of memory) turns gmflow off.
+    fn run<F: FnOnce(&Runner, &Device) -> Tensor<4>>(make: F) -> Result<Vec<f32>, String> {
         let (device, name) = gpu()?;
         // One pass at a time: the sync asks for many pairs in parallel, and several passes side by side would only
         // share the GPU while each holding its own activations (out of memory on small GPUs)
@@ -346,11 +383,8 @@ mod inference {
         if let Some(why) = &*GPU_FAILED.lock() { return Err(why.clone()); }
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Result<Vec<f32>, String>, String> {
             // No weights is not the GPU's fault: Err on the outside
-            let model = model_on(device)?;
-            let shape = [1usize, 3, MODEL_H, MODEL_W];
-            let t0 = Tensor::<4>::from_data(TensorData::new(in0, shape), device);
-            let t1 = Tensor::<4>::from_data(TensorData::new(in1, shape), device);
-            let flow = model.forward(t0, t1);
+            let runner = runner_on(device)?;
+            let flow = make(&runner, device);
             Ok(flow.try_into_data().map_err(|e| short_error(&e.to_string()))
                 .and_then(|d| d.try_into_vec::<f32>().map_err(|e| format!("output is not f32: {:?}", e))))
         }));
@@ -362,12 +396,62 @@ mod inference {
         }
     }
 
+    // The CNN features of the last frames, found by their bytes: each frame the tracker sees is in two pairs (with the
+    // previous and with the next frame), and the sync asks for neighbouring pairs close together. 7.4 MB each on the GPU.
+    const CACHED_FRAMES: usize = 4;
+    static FEATURES: Mutex<Vec<(Vec<i32>, usize, Features)>> = Mutex::new(Vec::new());
+
+    fn features(r: &Runner, f: &Frame, device: &Device) -> Features {
+        let mut cache = FEATURES.lock();
+        if let Some(i) = cache.iter().position(|(words, width, _)| *width == f.width && *words == f.words) {
+            let hit = cache.remove(i);
+            let features = hit.2.clone();
+            cache.push(hit);
+            return features;
+        }
+        let features = r.model.features(model_input(f, device), &r.statics);
+        if cache.len() >= CACHED_FRAMES { cache.remove(0); }
+        cache.push((f.words.clone(), f.width, features.clone()));
+        features
+    }
+
+    pub fn forward_frames(f0: &Frame, f1: &Frame) -> Result<Vec<f32>, String> {
+        run(|r, device| {
+            let (a, b) = (features(r, f0, device), features(r, f1, device));
+            r.model.flow(&a, &b, false, &r.statics, None)
+        })
+    }
+
+    // The flows both ways in one pass: [2, 2, MODEL_H, MODEL_W], f0 -> f1 then f1 -> f0
+    pub fn forward_both(f0: &Frame, f1: &Frame) -> Result<Vec<f32>, String> {
+        run(|r, device| {
+            let (a, b) = (features(r, f0, device), features(r, f1, device));
+            r.model.flow(&a, &b, true, &r.statics, None)
+        })
+    }
+
+    // One pass on inputs as the references are ([1, 3, MODEL_H, MODEL_W] raw 0-255 grey in all 3 channels)
+    #[cfg(test)]
+    pub fn forward(in0: Vec<f32>, in1: Vec<f32>) -> Result<Vec<f32>, String> {
+        let shape = [1usize, 3, MODEL_H, MODEL_W];
+        run(|r, device| r.model.forward(Tensor::from_data(TensorData::new(in0, shape), device), Tensor::from_data(TensorData::new(in1, shape), device), &r.statics))
+    }
+
+    // The letterbox of the GPU for a test: [1, 3, MODEL_H, MODEL_W]
+    #[cfg(test)]
+    pub fn model_input_of(img: &GrayImage) -> Result<Vec<f32>, String> {
+        let f = frame(img);
+        run(|_, device| model_input(&f, device))
+    }
+
     // One pass on a device of the caller's (tests: a GPU set up with smaller limits), weights loaded for it
     #[cfg(test)]
     pub fn forward_on(device: &Device, in0: Vec<f32>, in1: Vec<f32>) -> Result<Vec<f32>, String> {
         let model = load_model(device)?;
+        let mut statics = Statics::new(MODEL_H, MODEL_W, device);
+        statics.ops = OPS;
         let shape = [1usize, 3, MODEL_H, MODEL_W];
-        let flow = model.forward(Tensor::<4>::from_data(TensorData::new(in0, shape), device), Tensor::<4>::from_data(TensorData::new(in1, shape), device));
+        let flow = model.forward(Tensor::from_data(TensorData::new(in0, shape), device), Tensor::from_data(TensorData::new(in1, shape), device), &statics);
         flow.try_into_data().map_err(|e| short_error(&e.to_string()))?.try_into_vec::<f32>().map_err(|e| format!("output is not f32: {:?}", e))
     }
 
@@ -383,11 +467,25 @@ mod inference {
 
     // Returns the flow and the first frame's letterbox parameters, so callers can invert the
     // mapping back into original-frame coordinates, or `None` (logged) if gmflow cannot run.
+    // Both ways in one pass: the flows f0 -> f1 and f1 -> f0, and the letterbox (the same for both, the frames have one size)
+    pub fn compute_both(img0: &GrayImage, img1: &GrayImage) -> Option<(Vec<f32>, Vec<f32>, LetterboxParams)> {
+        let (f0, f1) = (frame(img0), frame(img1));
+        match forward_both(&f0, &f1) {
+            Ok(mut flow) => {
+                let backward = flow.split_off(flow.len() / 2);
+                Some((flow, backward, f0.lb))
+            }
+            Err(e) => {
+                log::debug!("gmflow: no flow: {}", e);
+                None
+            }
+        }
+    }
+
     pub fn compute_flow(img0: &GrayImage, img1: &GrayImage) -> Option<(Vec<f32>, LetterboxParams)> {
-        let (in0, lb0) = preprocess(img0);
-        let (in1, _) = preprocess(img1);
-        match forward(in0, in1) {
-            Ok(flow) => Some((flow, lb0)),
+        let (f0, f1) = (frame(img0), frame(img1));
+        match forward_frames(&f0, &f1) {
+            Ok(flow) => Some((flow, f0.lb)),
             Err(e) => {
                 log::debug!("gmflow: no flow: {}", e);
                 None
@@ -417,6 +515,17 @@ impl GmflowDenseFlow {
     /// The flow from `a` to `b` (same size), on the GPU, see `inference`. None, logged, when gmflow can't run
     pub fn compute(a: &image::GrayImage, b: &image::GrayImage) -> Option<Self> {
         let (flow, lb) = inference::compute_flow(a, b)?;
+        Self::from_flow(flow, &lb)
+    }
+
+    /// The flows from `a` to `b` and from `b` to `a` (same size), from one pass of the model (bidirectional, as unimatch
+    /// computes them): what the forward-backward check needs, at about the cost of one way
+    pub fn compute_both(a: &image::GrayImage, b: &image::GrayImage) -> Option<(Self, Self)> {
+        let (forward, backward, lb) = inference::compute_both(a, b)?;
+        Some((Self::from_flow(forward, &lb)?, Self::from_flow(backward, &lb)?))
+    }
+
+    fn from_flow(flow: Vec<f32>, lb: &inference::LetterboxParams) -> Option<Self> {
         if flow.len() < 2 * inference::MODEL_H * inference::MODEL_W { return None; }
         Some(Self { flow, sx: lb.sx.max(1e-6), sy: lb.sy.max(1e-6), pad_x: lb.pad_x as f32, pad_y: lb.pad_y as f32 })
     }

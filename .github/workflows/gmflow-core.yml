@@ -1,0 +1,174 @@
+# Work branch only (never part of #1143): gyroflow-core with the hand-written gmflow (feature use-burn), its tests on the
+# GPUs of the hosted runners, and that it compiles for Windows, Android and iOS. The weights are converted from the official
+# checkpoint here (ci-gpu/gmflow-dev); the pin in gmflow.rs is set to that file for the tests of this run.
+name: gmflow core
+
+on:
+  push:
+    branches: ['wip/gmflow-native']
+    paths: ['.github/gmflow-core.trigger']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gmflow-core-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PTH_URL: https://s3.eu-central-1.amazonaws.com/avg-projects/unimatch/pretrained/gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth
+  UNIMATCH_SHA: da140fa
+  VIDEO_URL: https://github.com/intel-iot-devkit/sample-videos/raw/master/person-bicycle-car-detection.mp4
+  CARGO_TERM_COLOR: never
+
+jobs:
+  refs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: ci-gpu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Python packages
+        run: |
+          pip install --quiet torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet numpy==1.26.4 opencv-python-headless==4.10.0.84
+      - name: References from the unchanged PyTorch model
+        run: |
+          git clone -q https://github.com/AdrianEddy/unimatch.git unimatch
+          git -C unimatch checkout -q "$UNIMATCH_SHA"
+          curl -fsSL --retry 3 --max-time 600 -o gmflow.pth "$PTH_URL"
+          curl -fsSL --retry 3 --max-time 600 -o video.mp4 "$VIDEO_URL"
+          python refs_native.py gmflow.pth unimatch video.mp4 out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-refs
+          retention-days: 7
+          path: ci-gpu/out
+
+  weights:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: ci-gpu/gmflow-dev
+    steps:
+      - uses: actions/checkout@v4
+      - name: Software Vulkan (lavapipe)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mesa-vulkan-drivers libvulkan1 > /dev/null
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: The checkpoint into the model, written as .bpk
+        env:
+          GMFLOW_BPK: ${{ github.workspace }}/gmflow-scale2-regrefine6.bpk
+        run: |
+          curl -fsSL --retry 3 --max-time 600 -o "$RUNNER_TEMP/gmflow.pth" "$PTH_URL"
+          GMFLOW_PTH="$RUNNER_TEMP/gmflow.pth" cargo test --release --test native -- --ignored --nocapture --exact convert_weights 2>&1 | tee convert.log
+          grep -q "test result: ok. 1 passed" convert.log
+          ls -la "$GMFLOW_BPK"; sha256sum "$GMFLOW_BPK"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-weights
+          retention-days: 14
+          path: gmflow-scale2-regrefine6.bpk
+
+  test:
+    needs: [refs, weights]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: lavapipe, os: ubuntu-24.04 }
+          - { name: metal-wgsl, os: macos-14 }
+          - { name: metal-msl, os: macos-15 }
+    name: test-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: core-refs
+          path: ci-gpu/out
+      - uses: actions/download-artifact@v4
+        with:
+          name: core-weights
+          path: ${{ runner.temp }}/w
+      - name: Software Vulkan (lavapipe)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mesa-vulkan-drivers libvulkan1 > /dev/null
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustc --version
+      - name: Pin the weights of this run
+        shell: bash
+        run: |
+          f="$RUNNER_TEMP/w/gmflow-scale2-regrefine6.bpk"
+          sha=$(shasum -a 256 "$f" | cut -d' ' -f1)
+          sed -i.bak "s/const MODEL_SHA256: \&str = \"[0-9a-f]*\";/const MODEL_SHA256: \&str = \"$sha\";/" src/core/synchronization/optical_flow/gmflow.rs
+          grep -n "MODEL_SHA256: &str" src/core/synchronization/optical_flow/gmflow.rs
+          echo "GYROFLOW_GMFLOW_WEIGHTS=$f" >> "$GITHUB_ENV"
+      - name: Build the tests
+        working-directory: src/core
+        run: time cargo test --locked --release --features use-burn --lib --no-run
+      - name: Automatic choice skips the software renderer and says so
+        if: runner.os == 'Linux'
+        working-directory: src/core
+        env:
+          GMFLOW_EXPECT_ERROR: llvmpipe
+        run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_refuses_without_a_gpu
+      - name: Against PyTorch
+        working-directory: src/core
+        env:
+          GYROFLOW_GMFLOW_DEVICE: ${{ runner.os == 'Linux' && 'any' || '' }}
+          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
+          GMFLOW_WARM_RUNS: ${{ runner.os == 'Linux' && '1' || '10' }}
+        run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_matches_pytorch
+      - name: Known shift, through the GPU preprocessing, three frame sizes
+        working-directory: src/core
+        env:
+          GYROFLOW_GMFLOW_DEVICE: ${{ runner.os == 'Linux' && 'any' || '' }}
+        run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_detects_known_shift
+      - name: With buffers of at most 128 MiB, against PyTorch
+        working-directory: src/core
+        env:
+          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
+        run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_runs_within_128_mib_buffers
+
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows, os: windows-2022 }
+          - { name: android, os: ubuntu-24.04 }
+          - { name: ios, os: macos-15 }
+    name: check-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Windows compiles (Vulkan)
+        if: matrix.name == 'windows'
+        working-directory: src/core
+        run: cargo check --locked --features use-burn
+      - name: Android aarch64 compiles (Vulkan)
+        if: matrix.name == 'android'
+        working-directory: src/core
+        run: |
+          rustup toolchain install stable --profile minimal && rustup default stable
+          rustup target add aarch64-linux-android
+          bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$bin/aarch64-linux-android26-clang"
+          export CXX_aarch64_linux_android="$bin/aarch64-linux-android26-clang++"
+          export AR_aarch64_linux_android="$bin/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$bin/aarch64-linux-android26-clang"
+          cargo check --locked --features use-burn --target aarch64-linux-android
+      - name: iOS compiles (Metal, WGSL kernels)
+        if: matrix.name == 'ios'
+        working-directory: src/core
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustup target add aarch64-apple-ios && cargo check --locked --features use-burn --target aarch64-apple-ios
