@@ -62,8 +62,8 @@ jobs:
       matrix:
         include:
           - { name: lavapipe, os: ubuntu-24.04, warm: '0', features: '', im2col: '1', best: '' }
-          - { name: metal-wgsl, os: macos-14, warm: '10', features: '', im2col: '1', best: kernels+im2col+gru+qkv }
-          - { name: metal-msl, os: macos-15, warm: '10', features: msl, im2col: '0', best: kernels+gru+qkv }
+          - { name: metal-wgsl, os: macos-14, warm: '10', features: '', im2col: '1', best: kernels+im2col+gru }
+          - { name: metal-msl, os: macos-15, warm: '10', features: msl, im2col: '0', best: kernels+gru }
     name: native-${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
@@ -111,6 +111,15 @@ jobs:
         run: |
           cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matches_pytorch 2>&1 | tee pytorch.log
           grep -q "test result: ok. 1 passed" pytorch.log
+      - name: Time of each stage of the fastest configuration
+        if: matrix.best != ''
+        env:
+          GMFLOW_BPK: ${{ runner.temp }}/gmflow.bpk
+          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
+          GMFLOW_PROFILE_OPS: ${{ matrix.best }}
+        run: |
+          cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact stage_times 2>&1 | tee stages.log
+          grep -q "test result: ok. 1 passed" stages.log
       - name: Per-kernel profile of the fastest configuration
         if: matrix.best != ''
         env:

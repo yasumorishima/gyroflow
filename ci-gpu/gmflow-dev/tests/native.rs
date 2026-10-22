@@ -16,15 +16,13 @@ const W: usize = 576;
 
 /// The configurations measured: (label, ops)
 fn configs() -> Vec<(&'static str, model::Ops)> {
-    let o = |kernels, conv_im2col, gru_factored, fused_qkv| model::Ops { kernels, conv_im2col, gru_factored, fused_qkv };
+    let o = |kernels, conv_im2col, gru_factored| model::Ops { kernels, conv_im2col, gru_factored };
     vec![
-        ("plain", o(false, false, false, false)),
-        ("kernels", o(true, false, false, false)),
-        ("kernels+gru", o(true, false, true, false)),
-        ("kernels+gru+qkv", o(true, false, true, true)),
-        ("kernels+im2col", o(true, true, false, false)),
-        ("kernels+im2col+gru", o(true, true, true, false)),
-        ("kernels+im2col+gru+qkv", o(true, true, true, true)),
+        ("plain", o(false, false, false)),
+        ("kernels", o(true, false, false)),
+        ("kernels+gru", o(true, false, true)),
+        ("kernels+im2col", o(true, true, false)),
+        ("kernels+im2col+gru", o(true, true, true)),
     ]
 }
 
@@ -112,7 +110,7 @@ fn matches_pytorch() {
 
     // Bidirectional, each frame through the CNN on its own (as the tracker will): the flow both ways against unimatch with
     // pred_bidir_flow, the same gate
-    st.ops = model::Ops { kernels: true, conv_im2col: std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true), gru_factored: true, fused_qkv: true };
+    st.ops = model::Ops { kernels: true, conv_im2col: std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true), gru_factored: true };
     for k in 0..3 {
         let fa = model.features(inp(k, 0), &st);
         let fb = model.features(inp(k, 1), &st);
@@ -273,4 +271,66 @@ fn profile_passes() {
     for _ in 0..3 { let _ = to_vec(model.forward(inp(0), inp(1), &st)); }
     std::thread::sleep(std::time::Duration::from_secs(3));
     println!("PROFILE-END");
+}
+
+/// Where the time of a pass goes, stage by stage (the GPU is waited for at each trace point, so the stages do not overlap
+/// and fusion stops at their borders): one pass on a pair, and the bidirectional pass of the tracker on CNN features
+#[test]
+#[ignore]
+fn stage_times() {
+    let (device, name) = device();
+    println!("device: {name}");
+    let dir = env_path("GMFLOW_REF_DIR");
+    let model = load(&device);
+    let mut st = Statics::new(H, W, &device);
+    let want = std::env::var("GMFLOW_PROFILE_OPS").expect("GMFLOW_PROFILE_OPS");
+    st.ops = configs().into_iter().find(|(l, _)| *l == want).unwrap_or_else(|| panic!("no configuration {want}")).1;
+    let inp = |i: usize| tensor4(&dir.join(format!("pair1_in{i}.f32")), [1, 3, H, W], &device);
+    // Stage label: the trace name, without the iteration number for the refinement, so that its 6 steps add up
+    let label = |n: &str| {
+        let base = n.trim_end_matches(|c: char| c.is_ascii_digit());
+        if ["corr_with_flow", "refine_net", "refine_delta"].contains(&base) { base.to_owned() } else { n.to_owned() }
+    };
+    let report = |what: &str, runs: Vec<(Instant, Vec<(String, Instant)>)>| {
+        let mut order: Vec<String> = Vec::new();
+        let mut sums: std::collections::HashMap<String, f64> = Default::default();
+        let mut total = 0.0;
+        for (start, marks) in &runs {
+            let mut prev = *start;
+            for (n, t) in marks {
+                let l = label(n);
+                if !order.contains(&l) { order.push(l.clone()); }
+                *sums.entry(l).or_default() += (*t - prev).as_secs_f64();
+                prev = *t;
+            }
+            total += (prev - *start).as_secs_f64();
+        }
+        let k = runs.len() as f64;
+        println!("{what} ({want}): {:.3} s per pass with a wait at each stage (mean of {})", total / k, runs.len());
+        for l in order {
+            let v = sums[&l] / k;
+            println!("  {l:22} {:8.1} ms  {:5.1} %", v * 1e3, 100.0 * v * k / total);
+        }
+    };
+    let timed = || Trace { timed: true, ..Default::default() };
+    let mut runs = Vec::new();
+    for i in 0..5 {
+        let (a, b) = (inp(0), inp(1));
+        let _ = to_vec(a.clone() + b.clone());
+        let mut tr = timed();
+        let start = Instant::now();
+        let _ = to_vec(model.forward_traced(a, b, &st, Some(&mut tr)));
+        if i >= 2 { runs.push((start, tr.marks)); }
+    }
+    report("one pass", runs);
+    let fa = model.features(inp(0), &st);
+    let fb = model.features(inp(1), &st);
+    let mut runs = Vec::new();
+    for i in 0..5 {
+        let mut tr = timed();
+        let start = Instant::now();
+        let _ = to_vec(model.flow(&fa, &fb, true, &st, Some(&mut tr)));
+        if i >= 2 { runs.push((start, tr.marks)); }
+    }
+    report("bidirectional flow, CNN features given", runs);
 }

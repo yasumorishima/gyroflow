@@ -31,7 +31,7 @@ use burn::module::{ Module, Param };
 use burn::nn::conv::{ Conv2d, Conv2dConfig };
 use burn::nn::{ InstanceNorm, InstanceNormConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig2d };
 use burn::tensor::activation::{ gelu, relu, sigmoid, softmax, tanh };
-use burn::tensor::module::{ conv2d, interpolate, linear };
+use burn::tensor::module::{ conv2d, interpolate };
 use burn::tensor::ops::{ ConvOptions, GridSampleOptions, GridSamplePaddingMode, InterpolateMode, InterpolateOptions, PadMode };
 use burn::tensor::{ Device, Tensor, TensorData };
 
@@ -52,8 +52,6 @@ pub struct Ops {
     pub conv_im2col: bool,
     /// The GRU of the refinement with its convolutions split by input (GruFactored); needs the im2col kernel
     pub gru_factored: bool,
-    /// The projections of each transformer block that read the same tokens as one matmul (self q, k, v and cross k, v)
-    pub fused_qkv: bool,
 }
 
 /// A convolution of this model: 1x1 ones and the plain path through burn, the others as im2col + matmul if asked
@@ -206,16 +204,10 @@ impl TransformerLayer {
     }
 
     /// source, target: [B, H*W, C]
-    fn forward(&self, source: Tensor<3>, target: Tensor<3>, win: &Windows, with_shift: bool, ops: Ops) -> Tensor<3> {
+    fn forward(&self, source: Tensor<3>, target: Tensor<3>, win: &Windows, with_shift: bool) -> Tensor<3> {
         let q = self.q_proj.forward(source.clone());
         let k = self.k_proj.forward(target.clone());
         let v = self.v_proj.forward(target);
-        self.attend(source, q, k, v, win, with_shift, ops)
-    }
-
-    /// The layer from its projected query, key and value
-    #[allow(clippy::too_many_arguments)]
-    fn attend(&self, source: Tensor<3>, q: Tensor<3>, k: Tensor<3>, v: Tensor<3>, win: &Windows, with_shift: bool, ops: Ops) -> Tensor<3> {
         let message = split_window_attention(q, k, v, win, with_shift);
         let message = self.norm1.forward(self.merge.forward(message));
         let message = match (&self.mlp, &self.norm2) {
@@ -256,7 +248,7 @@ impl FeatureTransformer {
     }
 
     /// feature0, feature1: [B, C, H, W] (position added) -> the same, after self- and cross-attention
-    pub fn forward(&self, feature0: Tensor<4>, feature1: Tensor<4>, win: &Windows, ops: Ops) -> (Tensor<4>, Tensor<4>) {
+    pub fn forward(&self, feature0: Tensor<4>, feature1: Tensor<4>, win: &Windows) -> (Tensor<4>, Tensor<4>) {
         let [b, c, h, w] = feature0.dims();
         let tokens = |f: Tensor<4>| f.reshape([b, c, h * w]).swap_dims(1, 2);
         let (f0, f1) = (tokens(feature0), tokens(feature1));
@@ -264,21 +256,9 @@ impl FeatureTransformer {
         let mut concat0 = Tensor::cat(vec![f0, f1], 0);
         for (i, layer) in self.layers.iter().enumerate() {
             let with_shift = i % 2 == 1;
-            if ops.fused_qkv {
-                // The key and value of the cross attention read concat1, the halves of concat0 swapped: projected from
-                // concat0 with the rest, then swapped
-                let (sa, ca) = (&layer.self_attn, &layer.cross_attn_ffn);
-                let w = Tensor::cat(vec![sa.q_proj.weight.val(), sa.k_proj.weight.val(), sa.v_proj.weight.val(), ca.k_proj.weight.val(), ca.v_proj.weight.val()], 1);
-                let p = linear(concat0.clone(), w, None);
-                let part = |i: usize| p.clone().narrow(2, i * c, c);
-                let s = sa.attend(concat0, part(0), part(1), part(2), win, with_shift, ops);
-                let q = ca.q_proj.forward(s.clone());
-                concat0 = ca.attend(s, q, swap_halves(part(3)), swap_halves(part(4)), win, with_shift, ops);
-            } else {
-                let concat1 = swap_halves(concat0.clone());
-                let s = layer.self_attn.forward(concat0.clone(), concat0, win, with_shift, ops);
-                concat0 = layer.cross_attn_ffn.forward(s, concat1, win, with_shift, ops);
-            }
+            let concat1 = swap_halves(concat0.clone());
+            let s = layer.self_attn.forward(concat0.clone(), concat0, win, with_shift);
+            concat0 = layer.cross_attn_ffn.forward(s, concat1, win, with_shift);
         }
         let back = |t: Tensor<3>| t.swap_dims(1, 2).reshape([b, c, h, w]);
         (back(concat0.clone().narrow(0, 0, b)), back(concat0.narrow(0, b, b)))
@@ -821,19 +801,28 @@ impl Statics {
             quarter: Windows::new(h / 4, w / 4, 8, device),
             mean: c3([0.485, 0.456, 0.406]),
             std: c3([0.229, 0.224, 0.225]),
-            ops: Ops { kernels: true, conv_im2col: false, gru_factored: false, fused_qkv: false },
+            ops: Ops { kernels: true, conv_im2col: false, gru_factored: false },
         }
     }
 }
 
 /// Intermediates of one pass, named as ci-gpu/refs_native.py names those of unimatch, for checking the port stage by stage
+/// or, with `timed`, when each stage was done (the GPU waited for at each point; nothing is kept)
 #[derive(Default)]
 pub struct Trace {
     pub tensors: Vec<(String, Tensor<4>)>,
+    pub timed: bool,
+    pub marks: Vec<(String, std::time::Instant)>,
 }
 
 fn put(trace: &mut Option<&mut Trace>, name: &str, t: &Tensor<4>) {
-    if let Some(tr) = trace.as_deref_mut() { tr.tensors.push((name.to_owned(), t.clone())); }
+    let Some(tr) = trace.as_deref_mut() else { return };
+    if tr.timed {
+        let _ = t.clone().slice([0..1, 0..1, 0..1, 0..1]).into_data();
+        tr.marks.push((name.to_owned(), std::time::Instant::now()));
+    } else {
+        tr.tensors.push((name.to_owned(), t.clone()));
+    }
 }
 
 /// The CNN features of images, [N, 128, H/4, W/4] and [N, 128, H/8, W/8]: all a pass needs of a frame on its own (the CNN
@@ -896,7 +885,7 @@ impl Gmflow {
         let (f0, f1) = (a.eighth.clone() + pos.clone(), b.eighth.clone() + pos);
         put(&mut trace, "pos_f0_0", &f0);
         put(&mut trace, "pos_f1_0", &f1);
-        let (f0, f1) = self.transformer.forward(f0, f1, &st.eighth, ops);
+        let (f0, f1) = self.transformer.forward(f0, f1, &st.eighth);
         put(&mut trace, "transformer_f0_0", &f0);
         put(&mut trace, "transformer_f1_0", &f1);
         let flow = global_correlation_softmax(f0.clone(), f1.clone(), bidirectional);
@@ -919,7 +908,7 @@ impl Gmflow {
         let (f0, f1) = (f0_ori.clone() + pos.clone(), f1w + pos);
         put(&mut trace, "pos_f0_1", &f0);
         put(&mut trace, "pos_f1_1", &f1);
-        let (f0, f1) = self.transformer.forward(f0, f1, &st.quarter, ops);
+        let (f0, f1) = self.transformer.forward(f0, f1, &st.quarter);
         put(&mut trace, "transformer_f0_1", &f0);
         put(&mut trace, "transformer_f1_1", &f1);
         let flow_pred = if ops.kernels { kernels::local_corr_softmax(f0.clone(), f1) } else { local_correlation_softmax(f0.clone(), f1, LOCAL_RADIUS) };

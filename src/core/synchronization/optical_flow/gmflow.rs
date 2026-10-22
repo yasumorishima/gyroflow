@@ -281,7 +281,7 @@ mod inference {
     }
 
     // Which implementations run: see model.rs, Ops. The convolutions are chosen per GPU (im2col_is_faster)
-    const OPS: Ops = Ops { kernels: true, conv_im2col: false, gru_factored: true, fused_qkv: true };
+    const OPS: Ops = Ops { kernels: true, conv_im2col: false, gru_factored: true };
 
     // Where the GPU has no cooperative matrices (WGSL on Metal, many Vulkan GPUs), burn can only run a 3x3 convolution
     // as a direct convolution, which is much slower than its matmul; where it has them (native MSL, recent Vulkan GPUs),
