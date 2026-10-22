@@ -223,7 +223,17 @@ impl TransformerLayer {
         let message = match (&self.mlp, &self.norm2) {
             (Some(mlp), Some(norm2)) => {
                 let x = Tensor::cat(vec![source.clone(), message], 2);
-                norm2.forward(mlp.fc2.forward(gelu(mlp.fc1.forward(x))))
+                // The hidden layer [B, L, 1024] of a bidirectional pass at 1/4 is 189 MB: a few images at a time, so that
+                // no buffer is over IM2COL_MAX_BYTES (each token is on its own here)
+                let [nb, l, _] = x.dims();
+                let per_image = l * mlp.fc1.weight.dims()[1] * 4;
+                let chunk = (IM2COL_MAX_BYTES / per_image).max(1);
+                let ffn = |x: Tensor<3>| norm2.forward(mlp.fc2.forward(gelu(mlp.fc1.forward(x))));
+                if nb <= chunk {
+                    ffn(x)
+                } else {
+                    Tensor::cat((0..nb).step_by(chunk).map(|s| ffn(x.clone().narrow(0, s, chunk.min(nb - s)))).collect(), 0)
+                }
             }
             _ => message,
         };
@@ -413,13 +423,15 @@ fn offsets(r: usize) -> Vec<(i32, i32)> {
     (0..n * n).map(|k| (k % n - r as i32, k / n - r as i32)).collect()
 }
 
-/// global_correlation_softmax: [B, C, H, W] x 2 -> flow [B, 2, H, W]
-pub fn global_correlation_softmax(f0: Tensor<4>, f1: Tensor<4>) -> Tensor<4> {
+/// global_correlation_softmax: [B, C, H, W] x 2 -> flow [B, 2, H, W]; bidirectional: [2B, 2, H, W], the flow 1 -> 0 from
+/// the transposed correlation
+pub fn global_correlation_softmax(f0: Tensor<4>, f1: Tensor<4>, bidirectional: bool) -> Tensor<4> {
     let [b, c, h, w] = f0.dims();
     let device = f0.device();
     let f0 = f0.reshape([b, c, h * w]).swap_dims(1, 2); // [B, HW, C]
     let f1 = f1.reshape([b, c, h * w]); // [B, C, HW]
     let corr = f0.matmul(f1).div_scalar((c as f32).sqrt());
+    let (corr, b) = if bidirectional { (Tensor::cat(vec![corr.clone(), corr.swap_dims(1, 2)], 0), 2 * b) } else { (corr, b) };
     let grid = coords(h, w, &device); // [1, 2, H, W]
     let grid_t = grid.clone().reshape([1, 2, h * w]).swap_dims(1, 2).repeat_dim(0, b); // [B, HW, 2]
     let correspondence = softmax(corr, 2).matmul(grid_t).swap_dims(1, 2).reshape([b, 2, h, w]);
@@ -836,6 +848,22 @@ fn put(trace: &mut Option<&mut Trace>, name: &str, t: &Tensor<4>) {
     if let Some(tr) = trace.as_deref_mut() { tr.tensors.push((name.to_owned(), t.clone())); }
 }
 
+/// The CNN features of images, [N, 128, H/4, W/4] and [N, 128, H/8, W/8]: all a pass needs of a frame on its own (the CNN
+/// normalises each image by itself), so a frame in two pairs (the tracker: with the previous and with the next frame) goes
+/// through the CNN once
+#[derive(Clone)]
+pub struct Features {
+    pub quarter: Tensor<4>,
+    pub eighth: Tensor<4>,
+}
+
+impl Features {
+    fn split(self, b: usize) -> (Features, Features) {
+        let (q, e) = (self.quarter, self.eighth);
+        (Features { quarter: q.clone().narrow(0, 0, b), eighth: e.clone().narrow(0, 0, b) }, Features { quarter: q.narrow(0, b, b), eighth: e.narrow(0, b, b) })
+    }
+}
+
 impl Gmflow {
     pub fn new(device: &Device) -> Self {
         Self {
@@ -847,6 +875,13 @@ impl Gmflow {
         }
     }
 
+    /// The CNN features of raw 0-255 images [N, 3, H, W]
+    pub fn features(&self, img: Tensor<4>, st: &Statics) -> Features {
+        let x = (img.div_scalar(255.0) - st.mean.clone()) / st.std.clone();
+        let (quarter, eighth) = self.backbone.forward(x, st.ops);
+        Features { quarter, eighth }
+    }
+
     /// Raw 0-255 images [B, 3, H, W] (B pairs) -> flow img0 -> img1 [B, 2, H, W], the forward of unimatch for the flow task
     pub fn forward(&self, img0: Tensor<4>, img1: Tensor<4>, st: &Statics) -> Tensor<4> {
         self.forward_traced(img0, img1, st, None)
@@ -854,28 +889,38 @@ impl Gmflow {
 
     pub fn forward_traced(&self, img0: Tensor<4>, img1: Tensor<4>, st: &Statics, mut trace: Option<&mut Trace>) -> Tensor<4> {
         let b = img0.dims()[0];
-        let norm = |x: Tensor<4>| (x.div_scalar(255.0) - st.mean.clone()) / st.std.clone();
-        let ops = st.ops;
-        let (quarter, eighth) = self.backbone.forward(Tensor::cat(vec![norm(img0), norm(img1)], 0), ops);
-        put(&mut trace, "backbone0", &quarter);
-        put(&mut trace, "backbone1", &eighth);
+        let both = self.features(Tensor::cat(vec![img0, img1], 0), st);
+        put(&mut trace, "backbone0", &both.quarter);
+        put(&mut trace, "backbone1", &both.eighth);
+        let (a, bb) = both.split(b);
+        self.flow(&a, &bb, false, st, trace)
+    }
 
+    /// The flow from the frames of `a` to those of `b` [B, 2, H, W]; with `bidirectional`, the flows both ways in one pass
+    /// [2B, 2, H, W] (a -> b, then b -> a), as unimatch computes them with pred_bidir_flow: the transformer at 1/8 and its
+    /// correlation are shared (the correlation the other way is its transpose), the rest runs on both directions batched
+    pub fn flow(&self, a: &Features, b: &Features, bidirectional: bool, st: &Statics, mut trace: Option<&mut Trace>) -> Tensor<4> {
+        let ops = st.ops;
         // 1/8: global matching, global propagation
-        let (f0, f1) = (eighth.clone().narrow(0, 0, b), eighth.narrow(0, b, b));
         let pos = st.eighth.position.clone();
-        let (f0, f1) = (f0 + pos.clone(), f1 + pos);
+        let (f0, f1) = (a.eighth.clone() + pos.clone(), b.eighth.clone() + pos);
         put(&mut trace, "pos_f0_0", &f0);
         put(&mut trace, "pos_f1_0", &f1);
         let (f0, f1) = self.transformer.forward(f0, f1, &st.eighth, ops);
         put(&mut trace, "transformer_f0_0", &f0);
         put(&mut trace, "transformer_f1_0", &f1);
-        let flow = global_correlation_softmax(f0.clone(), f1);
+        let flow = global_correlation_softmax(f0.clone(), f1.clone(), bidirectional);
         put(&mut trace, "global_corr_flow0", &flow);
-        let flow = self.feature_flow_attn.global(f0, flow);
+        let feature0 = if bidirectional { Tensor::cat(vec![f0, f1], 0) } else { f0 };
+        let flow = self.feature_flow_attn.global(feature0, flow);
         put(&mut trace, "propagated0", &flow);
 
         // 1/4: the flow doubled in size, feature 1 warped by it, local matching of what remains, local propagation
-        let (f0_ori, f1_ori) = (quarter.clone().narrow(0, 0, b), quarter.narrow(0, b, b));
+        let (f0_ori, f1_ori) = if bidirectional {
+            (Tensor::cat(vec![a.quarter.clone(), b.quarter.clone()], 0), Tensor::cat(vec![b.quarter.clone(), a.quarter.clone()], 0))
+        } else {
+            (a.quarter.clone(), b.quarter.clone())
+        };
         let flow = interpolate(flow, InterpolateOptions::new(InterpolateMode::Bilinear).with_align_corners(true).with_scale_factor([2.0, 2.0])).mul_scalar(2.0);
         put(&mut trace, "warp_flow0", &flow);
         let f1w = flow_warp(f1_ori.clone(), flow.clone());
@@ -887,10 +932,10 @@ impl Gmflow {
         let (f0, f1) = self.transformer.forward(f0, f1, &st.quarter, ops);
         put(&mut trace, "transformer_f0_1", &f0);
         put(&mut trace, "transformer_f1_1", &f1);
-        let flow_pred = if st.ops.kernels { kernels::local_corr_softmax(f0.clone(), f1) } else { local_correlation_softmax(f0.clone(), f1, LOCAL_RADIUS) };
+        let flow_pred = if ops.kernels { kernels::local_corr_softmax(f0.clone(), f1) } else { local_correlation_softmax(f0.clone(), f1, LOCAL_RADIUS) };
         put(&mut trace, "local_corr_flow0", &flow_pred);
         let flow = flow + flow_pred;
-        let mut flow = self.feature_flow_attn.local(f0.clone(), flow, 1, st.ops.kernels);
+        let mut flow = self.feature_flow_attn.local(f0.clone(), flow, 1, ops.kernels);
         put(&mut trace, "propagated1", &flow);
 
         // Refinement: the context comes from feature 0 of the transformer and is the same in every iteration (unimatch
@@ -906,7 +951,7 @@ impl Gmflow {
             (g, c)
         });
         for i in 0..REFINE_ITERATIONS {
-            let corr = if st.ops.kernels {
+            let corr = if ops.kernels {
                 kernels::corr_with_flow(f0_ori.clone(), f1_ori.clone(), flow.clone())
             } else {
                 local_correlation_with_flow(f0_ori.clone(), f1_ori.clone(), flow.clone(), LOCAL_RADIUS)
@@ -919,7 +964,7 @@ impl Gmflow {
             flow = flow + delta;
         }
         let mask = self.refine.up_mask(net, ops);
-        let up = if st.ops.kernels { kernels::convex_upsample(flow, mask) } else { convex_upsample(flow, mask) };
+        let up = if ops.kernels { kernels::convex_upsample(flow, mask) } else { convex_upsample(flow, mask) };
         put(&mut trace, "upsampled0", &up);
         up
     }

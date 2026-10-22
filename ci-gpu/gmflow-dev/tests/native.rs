@@ -101,6 +101,24 @@ fn matches_pytorch() {
         assert!(checked >= 3, "found {checked} reference pairs");
     }
 
+    // Bidirectional, each frame through the CNN on its own (as the tracker will): the flow both ways against unimatch with
+    // pred_bidir_flow, the same gate
+    st.ops = model::Ops { kernels: true, conv_im2col: true, gru_factored: true, fused_attention: true, fused_qkv: true };
+    for k in 0..3 {
+        let fa = model.features(inp(k, 0), &st);
+        let fb = model.features(inp(k, 1), &st);
+        let started = Instant::now();
+        let both = model.flow(&fa, &fb, true, &st, None);
+        let fwd = to_vec(both.clone().narrow(0, 0, 1));
+        let bwd = to_vec(both.narrow(0, 1, 1));
+        let secs = started.elapsed().as_secs_f64();
+        for (dir, got, file) in [("a -> b", fwd, format!("pair{k}_torch.f32")), ("b -> a", bwd, format!("pair{k}_bwd_torch.f32"))] {
+            let (max, mean, _) = diff(&got, &read_f32(&env_path("GMFLOW_REF_DIR").join(&file)));
+            println!("bidirectional pair {k} {dir}: max |burn - torch| {max:.2e} px, mean {mean:.2e} px ({secs:.3} s for both, without the CNN)");
+            assert!(max <= 1e-2 && mean <= 1e-4, "bidirectional pair {k} {dir}: max {max:e}, mean {mean:e}");
+        }
+    }
+
     // Warm: the same pair again until the time settles (spread of the last 5 under 5 %) or 30 passes
     let runs: usize = std::env::var("GMFLOW_WARM_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
     if runs == 0 { return; }
