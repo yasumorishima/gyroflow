@@ -344,3 +344,65 @@ fn stage_times() {
     }
     report("bidirectional flow, CNN features given", runs);
 }
+
+/// How fast burn's matmuls are on this GPU at the shapes of the model, against the arithmetic peak (independent
+/// multiply-add chains): whether the passes are bound by the matmul kernels or by the FLOPs themselves. Each case: 3 calls
+/// to warm up (autotune runs on the first), then 10 calls timed between two device syncs
+#[test]
+#[ignore]
+fn matmul_ceiling() {
+    let (device, name) = device();
+    println!("device: {name}");
+    // What gmflow.rs decides the convolutions from (im2col_is_faster)
+    if let burn::backend::DispatchDevice::Cube(d) = device.as_dispatch() {
+        let client = d.client();
+        let m = &client.properties().features.matmul;
+        for c in m.cmma.iter() { println!("CEIL cmma {:?} x {:?} -> {:?} ({}x{}x{})", c.a_type, c.b_type, c.cd_type, c.m, c.n, c.k); }
+        for c in m.mma.iter() { println!("CEIL mma {:?} x {:?} -> {:?} ({}x{}x{})", c.a_type, c.b_type, c.cd_type, c.m, c.n, c.k); }
+        println!("CEIL matrix units: {} cmma and {} mma configurations", m.cmma.len(), m.mma.len());
+    }
+    let rnd2 = |s: [usize; 2]| Tensor::<2>::random(s, Distribution::Normal(0.0, 1.0), &device);
+    let rnd3 = |s: [usize; 3]| Tensor::<3>::random(s, Distribution::Normal(0.0, 1.0), &device);
+    let rnd4 = |s: [usize; 4]| Tensor::<4>::random(s, Distribution::Normal(0.0, 1.0), &device);
+    // The last result is held (one value of it, which keeps its buffer) until the end of the timed calls
+    let time = |label: &str, flops: f64, f: &dyn Fn() -> Tensor<1>| {
+        let mut keep = None;
+        for _ in 0..3 { keep = Some(f()); }
+        device.sync().expect("sync");
+        let reps = 10;
+        let start = Instant::now();
+        for _ in 0..reps { keep = Some(f()); }
+        device.sync().expect("sync");
+        drop(keep);
+        let secs = start.elapsed().as_secs_f64() / reps as f64;
+        println!("CEIL {label:58} {:9.2} ms {:8.0} GFLOPS", secs * 1e3, flops / secs / 1e9);
+    };
+    let first = |t: Tensor<3>| t.slice([0..1, 0..1, 0..1]).reshape([1]);
+    let first2 = |t: Tensor<2>| t.slice([0..1, 0..1]).reshape([1]);
+    let first4 = |t: Tensor<4>| t.slice([0..1, 0..1, 0..1, 0..1]).reshape([1]);
+    // One image: the columns of two (212 MB) would be over the 128 MiB of one buffer
+    let (n, cout, k, l) = (1usize, 192usize, 256 * 9, (H / 4) * (W / 4));
+    let conv_flops = 2.0 * (n * cout * k * l) as f64;
+    let w = rnd3([1, cout, k]);
+    let cols = rnd3([n, k, l]);
+    time("conv 256->192 3x3 @1/4: [1,Co,K]@[1,K,L] (as the model)", conv_flops, &|| first(w.clone().matmul(cols.clone())));
+    let cols_t = rnd2([n * l, k]);
+    let w_t = rnd2([k, cout]);
+    time("same, transposed: [L,K]@[K,Co]", conv_flops, &|| first2(cols_t.clone().matmul(w_t.clone())));
+    let x = rnd4([n, 256, H / 4, W / 4]);
+    let wt = rnd4([cout, 256, 3, 3]);
+    time("same conv, im2col kernel + matmul (conv2d_im2col)", conv_flops, &|| first4(kernels::conv2d_im2col(x.clone(), wt.clone(), None, 1, [1, 1], 120 << 20)));
+    time("same conv, burn conv2d", conv_flops, &|| first4(burn::tensor::module::conv2d(x.clone(), wt.clone(), None, burn::tensor::ops::ConvOptions::new([1, 1], [1, 1], [1, 1], 1))));
+    let tokens = 2 * l;
+    let a = rnd2([tokens, 256]);
+    let fc1 = rnd2([256, 1024]);
+    time("FFN fc1 @1/4 x2: [2L,256]@[256,1024]", 2.0 * (tokens * 256 * 1024) as f64, &|| first2(a.clone().matmul(fc1.clone())));
+    let q = rnd3([2 * 64, 180, 128]);
+    let kt = rnd3([2 * 64, 128, 180]);
+    time("window attention @1/4 x2: [128,180,128]@[128,128,180]", 2.0 * (128 * 180 * 180 * 128) as f64, &|| first(q.clone().matmul(kt.clone())));
+    let s = rnd2([2048, 2048]);
+    time("square 2048^3", 2.0 * 2048f64.powi(3), &|| first2(s.clone().matmul(s.clone())));
+    let like = Tensor::<1>::zeros([1 << 20], &device);
+    let peak_flops = (16 * gmflow_dev::bench::FMA_ITERS * (1 << 20)) as f64;
+    time("arithmetic peak (independent multiply-add chains)", peak_flops, &|| gmflow_dev::bench::fma_peak(like.clone()).slice([0..1]));
+}

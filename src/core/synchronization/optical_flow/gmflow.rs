@@ -283,26 +283,34 @@ mod inference {
     // Which implementations run: see model.rs, Ops. The convolutions are chosen per GPU (im2col_is_faster)
     const OPS: Ops = Ops { kernels: true, conv_im2col: false, gru_factored: true };
 
-    // Where the GPU has no cooperative matrices (WGSL on Metal, many Vulkan GPUs), burn can only run a 3x3 convolution
-    // as a direct convolution, which is much slower than its matmul; where it has them (native MSL, recent Vulkan GPUs),
-    // its implicit-GEMM convolutions are faster than im2col + matmul. Measured once, on the shape of the refinement (most
-    // of the convolution work), each way warmed up first: the faster one is used for the convolutions of the model
+    // burn convolves with implicit GEMM on matrix units only where the device has them for exactly the types of the
+    // tensors (f32 inputs, or tf32 that burn stages f32 to, with an f32 accumulator); otherwise its 3x3 convolutions are
+    // direct convolutions, much slower than im2col + matmul (WGSL on the macOS CI GPU: 3.8 s a pass against 6.0 s).
+    // With them (native MSL) burn's own are faster (1.22 s against 1.38 s). Decided from the device's features rather
+    // than by timing a convolution at load, which picked the slower way at times (autotune and compilation inside the
+    // timed runs). Vulkan drivers that list matrix units for f16 only get im2col, as their f32 convolutions are direct
     fn im2col_is_faster(device: &Device) -> bool {
-        use burn::tensor::Distribution;
-        use burn::tensor::module::conv2d;
-        use burn::tensor::ops::ConvOptions;
-        let x = Tensor::<4>::random([1, 256, MODEL_H / 4, MODEL_W / 4], Distribution::Default, device);
-        let w = Tensor::<4>::random([192, 256, 3, 3], Distribution::Default, device);
-        let time = |f: &dyn Fn() -> Tensor<4>| {
-            for _ in 0..2 { let _ = f().sum().into_data(); }
-            let started = Instant::now();
-            for _ in 0..3 { let _ = f().sum().into_data(); }
-            started.elapsed()
-        };
-        let by_burn = time(&|| conv2d(x.clone(), w.clone(), None, ConvOptions::new([1, 1], [1, 1], [1, 1], 1)));
-        let by_im2col = time(&|| kernels::conv2d_im2col(x.clone(), w.clone(), None, 1, [1, 1], 120 << 20));
-        log::debug!("gmflow: a 3x3 convolution of the refinement, 3 runs: burn {:?}, im2col + matmul {:?}", by_burn, by_im2col);
-        by_im2col < by_burn
+        use cubecl::ir::{ ElemType, FloatKind };
+        match device.as_dispatch() {
+            burn::backend::DispatchDevice::Cube(d) => {
+                let client = d.client();
+                let m = &client.properties().features.matmul;
+                let input = |t: ElemType| t == ElemType::Float(FloatKind::F32) || t == ElemType::Float(FloatKind::TF32);
+                !m.cmma.iter().chain(m.mma.iter()).any(|c| input(c.a_type) && input(c.b_type) && c.cd_type == ElemType::Float(FloatKind::F32))
+            }
+            #[allow(unreachable_patterns)]
+            _ => true,
+        }
+    }
+
+    // How the convolutions run on the loaded model, for the tests
+    #[cfg(test)]
+    pub fn convolutions() -> &'static str {
+        match &*RUNNER.lock() {
+            Some(r) if r.statics.ops.conv_im2col => "im2col + matmul",
+            Some(_) => "by burn",
+            None => "model not loaded",
+        }
     }
 
     // Turns gmflow off for the rest of the process after the GPU failed while running it
@@ -783,7 +791,7 @@ mod tests {
         let runs: usize = std::env::var("GMFLOW_WARM_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
         let started = std::time::Instant::now();
         for _ in 0..runs { inference::forward(in0.clone(), in1.clone()).expect("gmflow did not run"); }
-        println!("warm: {:.3} s per pass on {} (mean of {runs})", started.elapsed().as_secs_f64() / runs as f64, inference::device_name());
+        println!("warm: {:.3} s per pass on {}, convolutions {} (mean of {runs})", started.elapsed().as_secs_f64() / runs as f64, inference::device_name(), inference::convolutions());
     }
 
     // The whole model with no buffer over 128 MiB, which is all that Vulkan guarantees and what many Android GPUs have,

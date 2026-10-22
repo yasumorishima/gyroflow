@@ -36,32 +36,50 @@ fn corr_taps_kernel<F: Float>(
     #[comptime] radius: usize,
     #[define(F)] _dtype: ElemType,
 ) {
+    // One thread per position and row of the window: the 2r+2 products of the row share each value of f0 and read
+    // neighbouring values of f1, as independent sums
     let idx = ABSOLUTE_POS as usize;
-    let (b_n, k_n, h, w) = (taps.shape(0), taps.shape(1), taps.shape(2), taps.shape(3));
-    if idx >= b_n * k_n * h * w {
+    let (b_n, h, w) = (taps.shape(0), taps.shape(2), taps.shape(3));
+    let m = comptime!(2 * radius + 2);
+    if idx >= b_n * m * h * w {
         terminate!();
     }
     let hw = h * w;
-    let x = idx % w;
-    let y = (idx / w) % h;
-    let k = (idx / hw) % k_n;
-    let b = idx / (hw * k_n);
-    let n = comptime!(2 * radius + 2);
+    let p = idx % hw;
+    let ey = (idx / hw) % m;
+    let b = idx / (hw * m);
+    let x = p % w;
+    let y = p / w;
     let r = comptime!(radius as i32);
-    let p = y * w + x;
-    let sx = x as i32 + i32::cast_from(flow[b * 2 * hw + p].floor()) - r + (k % n) as i32;
-    let sy = y as i32 + i32::cast_from(flow[b * 2 * hw + hw + p].floor()) - r + (k / n) as i32;
-    let mut acc = F::new(0.0_f32);
-    if sx >= 0 && sx < w as i32 && sy >= 0 && sy < h as i32 {
-        let q = sy as usize * w + sx as usize;
-        let c_n = f0.shape(1);
+    let wi = w as i32;
+    let x0 = x as i32 + i32::cast_from(flow[b * 2 * hw + p].floor()) - r;
+    let sy = y as i32 + i32::cast_from(flow[b * 2 * hw + hw + p].floor()) - r + ey as i32;
+    let c_n = f0.shape(1);
+    let mut acc = Array::<F>::new(m);
+    #[unroll]
+    for e in 0..m {
+        acc[e] = F::new(0.0_f32);
+    }
+    if sy >= 0 && sy < h as i32 {
+        let row = sy as usize * w;
         for c in 0..c_n {
             let base = (b * c_n + c) * hw;
-            acc += f0[base + p] * f1[base + q];
+            let a = f0[base + p];
+            #[unroll]
+            for e in 0..m {
+                // Clamped address: a point outside of the map is set to 0 below
+                let sx = clamp(x0 + e as i32, 0, wi - 1) as usize;
+                acc[e] += a * f1[base + row + sx];
+            }
         }
-        acc = acc / F::sqrt(F::cast_from(c_n as u32));
     }
-    taps[idx] = acc;
+    let scale = F::sqrt(F::cast_from(c_n as u32));
+    #[unroll]
+    for e in 0..m {
+        let sx = x0 + e as i32;
+        let v = if sx >= 0 && sx < wi { acc[e] / scale } else { F::new(0.0_f32) };
+        taps[(b * m * m + ey * m + e) * hw + p] = v;
+    }
 }
 
 #[cube(launch)]
@@ -303,9 +321,9 @@ fn launch_corr_with_flow(f0: CubeTensor, f1: CubeTensor, flow: CubeTensor) -> Cu
     let s = f0.meta.shape().clone();
     let m = 2 * CORR_RADIUS + 2;
     let taps_shape = Shape::new([s[0], m * m, s[2], s[3]]);
-    let n_taps = taps_shape.num_elements();
+    let rows = s[0] * m * s[2] * s[3];
     let dtype = f0.dtype;
-    let (taps, count, dim) = output_for(&f0, taps_shape, n_taps);
+    let (taps, count, dim) = output_for(&f0, taps_shape, rows);
     corr_taps_kernel::launch(&taps.client, count, dim, f0.into_tensor_arg(), f1.into_tensor_arg(), flow.clone().into_tensor_arg(), taps.clone().into_tensor_arg(), CORR_RADIUS, dtype_to_storage_type(dtype));
     let shape = corr_shape(&s);
     let n = shape.num_elements();

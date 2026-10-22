@@ -111,6 +111,11 @@ jobs:
         run: |
           cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matches_pytorch 2>&1 | tee pytorch.log
           grep -q "test result: ok. 1 passed" pytorch.log
+      - name: Matmuls at the shapes of the model against the arithmetic peak
+        if: matrix.best != ''
+        run: |
+          cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matmul_ceiling 2>&1 | tee ceiling.log
+          grep -q "test result: ok. 1 passed" ceiling.log
       - name: Time of each stage of the fastest configuration
         if: matrix.best != ''
         env:
