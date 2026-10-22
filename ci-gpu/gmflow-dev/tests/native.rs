@@ -176,12 +176,17 @@ fn kernels_match_plain() {
     let f1 = rnd([b, c, h, w], 1.0);
     // Flows of a few pixels, so that the taps cross the borders of the map
     let flow = rnd([b, 2, h, w], 3.0);
-    let mut worst = 0f32;
+    // Each check against its limit. local_correlation_softmax returns sample coordinates (up to 143 at 1/4) minus the
+    // position, as unimatch computes the flow: float32 rounding of numbers that size alone is about 1e-4 (measured 1.07e-4
+    // at batch 2, over the 1e-4 set for every check before measuring), so its limit is 1e-3, still far under the 1 px a
+    // wrong offset would give
+    let mut failed = Vec::new();
     let mut check = |label: &str, got: Tensor<4>, want: Tensor<4>| {
         assert_eq!(got.dims(), want.dims(), "{label}: shape");
         let (max, mean, scale) = diff(&to_vec(got), &to_vec(want));
-        println!("{label:28}: max |kernel - plain| {max:.2e}, mean {mean:.2e} (values up to {scale:.2e})");
-        worst = worst.max(max);
+        let limit = if label == "local_correlation_softmax" { 1e-3 } else { 1e-4 };
+        println!("{label:28}: max |kernel - plain| {max:.2e}, mean {mean:.2e} (values up to {scale:.2e}, limit {limit:e})");
+        if !(max <= limit) { failed.push(format!("{label}: {max:e}")); }
     };
     check("local_correlation_with_flow", kernels::corr_with_flow(f0.clone(), f1.clone(), flow.clone()), model::local_correlation_with_flow(f0.clone(), f1.clone(), flow.clone(), kernels::CORR_RADIUS));
     check("local_correlation_softmax", kernels::local_corr_softmax(f0.clone(), f1.clone()), model::local_correlation_softmax(f0.clone(), f1.clone(), kernels::CORR_RADIUS));
@@ -197,7 +202,7 @@ fn kernels_match_plain() {
         let got = kernels::conv2d_im2col(x, wt, Some(bias), stride, [ph, pw], 120 << 20);
         check(&format!("conv {cin}->{cout} {kh}x{kw}/{stride} im2col"), got, want);
     }
-    assert!(worst <= 1e-4, "a kernel differs from the plain operations by {worst:e}");
+    assert!(failed.is_empty(), "kernels that differ from the plain operations: {failed:?}");
 }
 
 /// The letterbox the CPU made before (image crate resize, Triangle), as gmflow.rs computes it

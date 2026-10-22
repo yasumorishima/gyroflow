@@ -9,14 +9,14 @@ publish = false
 [workspace]
 
 [dependencies]
-burn-store = { version = "=0.22.1", default-features = false, features = ["std", "pytorch"] }
-burn-cubecl = { version = "=0.22.1" }
-cubecl = { version = "=0.11.1" }
+burn-store = { version = "=0.22.0", default-features = false, features = ["std", "pytorch"] }
+burn-cubecl = { version = "=0.22.0" }
+cubecl = { version = "=0.11.0" }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
-burn = { version = "=0.22.1", default-features = false, features = ["std", "autotune", "fusion", "cubecl", "extension", "wgpu"] }
+burn = { version = "=0.22.0", default-features = false, features = ["std", "autotune", "fusion", "cubecl", "extension", "wgpu"] }
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
-burn = { version = "=0.22.1", default-features = false, features = ["std", "autotune", "fusion", "cubecl", "extension", "vulkan"] }
+burn = { version = "=0.22.0", default-features = false, features = ["std", "autotune", "fusion", "cubecl", "extension", "vulkan"] }
 
 [dev-dependencies]
 # The CPU preprocessing of Gyroflow (gmflow.rs), which the GPU one must match
