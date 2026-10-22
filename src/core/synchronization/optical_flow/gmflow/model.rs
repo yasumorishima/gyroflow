@@ -260,8 +260,8 @@ impl FeatureTransformer {
         let [b, c, h, w] = feature0.dims();
         let tokens = |f: Tensor<4>| f.reshape([b, c, h * w]).swap_dims(1, 2);
         let (f0, f1) = (tokens(feature0), tokens(feature1));
-        let mut concat0 = Tensor::cat(vec![f0.clone(), f1.clone()], 0);
-        let mut concat1 = Tensor::cat(vec![f1, f0], 0);
+        // concat1 of unimatch, the halves of concat0 swapped, is made where it is read
+        let mut concat0 = Tensor::cat(vec![f0, f1], 0);
         for (i, layer) in self.layers.iter().enumerate() {
             let with_shift = i % 2 == 1;
             if ops.fused_qkv {
@@ -275,10 +275,10 @@ impl FeatureTransformer {
                 let q = ca.q_proj.forward(s.clone());
                 concat0 = ca.attend(s, q, swap_halves(part(3)), swap_halves(part(4)), win, with_shift, ops);
             } else {
+                let concat1 = swap_halves(concat0.clone());
                 let s = layer.self_attn.forward(concat0.clone(), concat0, win, with_shift, ops);
                 concat0 = layer.cross_attn_ffn.forward(s, concat1, win, with_shift, ops);
             }
-            if !ops.fused_qkv { concat1 = swap_halves(concat0.clone()); }
         }
         let back = |t: Tensor<3>| t.swap_dims(1, 2).reshape([b, c, h, w]);
         (back(concat0.clone().narrow(0, 0, b)), back(concat0.narrow(0, b, b)))

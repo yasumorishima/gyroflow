@@ -63,8 +63,8 @@ fn corr_with_flow_kernel<F: Float>(
     let in_x1 = x0 + 1 >= 0 && x0 + 1 < wi;
     let in_y0 = y0 >= 0 && y0 < hi;
     let in_y1 = y0 + 1 >= 0 && y0 + 1 < hi;
-    let one = F::new(1.0);
-    let zero = F::new(0.0);
+    let one = F::new(1.0_f32);
+    let zero = F::new(0.0_f32);
     let w00 = if in_x0 && in_y0 { (one - ax) * (one - ay) } else { zero };
     let w01 = if in_x1 && in_y0 { ax * (one - ay) } else { zero };
     let w10 = if in_x0 && in_y1 { (one - ax) * ay } else { zero };
@@ -109,18 +109,18 @@ fn local_corr_softmax_kernel<F: Float>(
     let n = comptime!(2 * radius + 1);
     let r = comptime!(radius as i32);
     let scale = F::sqrt(F::cast_from(c_n as u32));
-    let mut m = F::new(-1e30);
-    let mut s = F::new(0.0);
-    let mut ax = F::new(0.0);
-    let mut ay = F::new(0.0);
+    let mut m = F::new(-1e30_f32);
+    let mut s = F::new(0.0_f32);
+    let mut ax = F::new(0.0_f32);
+    let mut ay = F::new(0.0_f32);
     for k in 0..n * n {
         let sx = x as i32 + (k % n) as i32 - r;
         let sy = y as i32 + (k / n) as i32 - r;
         let valid = sx >= 0 && sx < w as i32 && sy >= 0 && sy < h as i32;
-        let mut score = F::new(-1e9);
+        let mut score = F::new(-1e9_f32);
         if valid {
             let q = sy as usize * w + sx as usize;
-            let mut acc = F::new(0.0);
+            let mut acc = F::new(0.0_f32);
             for c in 0..c_n {
                 let base = (b * c_n + c) * hw;
                 acc += f0[base + p] * f1[base + q];
@@ -131,7 +131,7 @@ fn local_corr_softmax_kernel<F: Float>(
         let fsy = F::cast_from(sy);
         if score > m {
             let carry = F::exp(m - score);
-            s = s * carry + F::new(1.0);
+            s = s * carry + F::new(1.0_f32);
             ax = ax * carry + fsx;
             ay = ay * carry + fsy;
             m = score;
@@ -170,20 +170,20 @@ fn local_propagation_kernel<F: Float>(
     let n = comptime!(2 * radius + 1);
     let r = comptime!(radius as i32);
     let scale = F::sqrt(F::cast_from(c_n as u32));
-    let mut m = F::new(-1e30);
-    let mut s = F::new(0.0);
-    let mut ax = F::new(0.0);
-    let mut ay = F::new(0.0);
+    let mut m = F::new(-1e30_f32);
+    let mut s = F::new(0.0_f32);
+    let mut ax = F::new(0.0_f32);
+    let mut ay = F::new(0.0_f32);
     for j in 0..n * n {
         let sx = x as i32 + (j % n) as i32 - r;
         let sy = y as i32 + (j / n) as i32 - r;
         let valid = sx >= 0 && sx < w as i32 && sy >= 0 && sy < h as i32;
-        let mut score = F::new(0.0);
-        let mut vx = F::new(0.0);
-        let mut vy = F::new(0.0);
+        let mut score = F::new(0.0_f32);
+        let mut vx = F::new(0.0_f32);
+        let mut vy = F::new(0.0_f32);
         if valid {
             let o = sy as usize * w + sx as usize;
-            let mut acc = F::new(0.0);
+            let mut acc = F::new(0.0_f32);
             for c in 0..c_n {
                 let base = (b * c_n + c) * hw;
                 acc += q[base + p] * k[base + o];
@@ -194,7 +194,7 @@ fn local_propagation_kernel<F: Float>(
         }
         if score > m {
             let carry = F::exp(m - score);
-            s = s * carry + F::new(1.0);
+            s = s * carry + F::new(1.0_f32);
             ax = ax * carry + vx;
             ay = ay * carry + vy;
             m = score;
@@ -238,14 +238,14 @@ fn convex_upsample_kernel<F: Float>(
     let p = y * w + x;
     let ff = comptime!(factor * factor);
     let mbase = b * 9 * ff * hw + sub * hw + p;
-    let mut m = F::new(-1e30);
+    let mut m = F::new(-1e30_f32);
     for j in 0..9usize {
         m = F::max(m, mask[mbase + j * ff * hw]);
     }
     let mult = F::cast_from(factor as u32);
-    let mut s = F::new(0.0);
-    let mut ax = F::new(0.0);
-    let mut ay = F::new(0.0);
+    let mut s = F::new(0.0_f32);
+    let mut ax = F::new(0.0_f32);
+    let mut ay = F::new(0.0_f32);
     for j in 0..9usize {
         let e = F::exp(mask[mbase + j * ff * hw] - m);
         s += e;
@@ -357,7 +357,7 @@ fn im2col_kernel<F: Float>(
     let c = k / (kw * kh);
     let iy = ((l / ow) * stride + ky) as i32 - ph as i32;
     let ix = ((l % ow) * stride + kx) as i32 - pw as i32;
-    let mut v = F::new(0.0);
+    let mut v = F::new(0.0_f32);
     if iy >= 0 && iy < h as i32 && ix >= 0 && ix < w as i32 {
         v = x[((n * c_n + c) * h + iy as usize) * w + ix as usize];
     }
@@ -423,9 +423,9 @@ fn preprocess_kernel<I: Int, F: Float>(
     let oy = idx / ow;
     let h0 = frame.shape(0);
     let words = frame.shape(1);
-    let zero = F::new(0.0);
-    let one = F::new(1.0);
-    let half = F::new(0.5);
+    let zero = F::new(0.0_f32);
+    let one = F::new(1.0_f32);
+    let half = F::new(0.5_f32);
     let mut value = zero;
     if ox >= pad_x && ox < pad_x + new_w && oy >= pad_y && oy < pad_y + new_h {
         let x = ox - pad_x;
@@ -475,7 +475,7 @@ fn preprocess_kernel<I: Int, F: Float>(
         }
         // f32::round of the image crate rounds half away from zero; WGSL round() rounds half to even: t >= 0, so
         // floor(t + 0.5) is what the CPU does
-        value = (clamp(t, zero, F::new(255.0)) + half).floor();
+        value = (clamp(t, zero, F::new(255.0_f32)) + half).floor();
     }
     let plane = oh * ow;
     let v = value;
