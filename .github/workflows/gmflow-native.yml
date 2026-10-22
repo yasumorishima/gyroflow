@@ -94,6 +94,10 @@ jobs:
           GMFLOW_PTH="$RUNNER_TEMP/gmflow.pth" cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact convert_weights 2>&1 | tee convert.log
           grep -q "test result: ok. 1 passed" convert.log
           ls -la "$GMFLOW_BPK"; shasum -a 256 "$GMFLOW_BPK"
+      - name: The GPU preprocessing against the CPU one
+        run: |
+          cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact preprocess_matches_cpu 2>&1 | tee preprocess.log
+          grep -q "test result: ok. 1 passed" preprocess.log
       - name: Each kernel against the plain operations it replaces
         run: |
           cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact kernels_match_plain 2>&1 | tee kernels.log

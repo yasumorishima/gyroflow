@@ -50,6 +50,8 @@ const IM2COL_MAX_BYTES: usize = 120 << 20;
 pub struct Ops {
     pub kernels: bool,
     pub conv_im2col: bool,
+    /// The GRU of the refinement with its convolutions split by input (GruFactored); needs the im2col kernel
+    pub gru_factored: bool,
 }
 
 /// A convolution of this model: 1x1 ones and the plain path through burn, the others as im2col + matmul if asked
@@ -616,15 +618,121 @@ impl BasicUpdateBlock {
     }
 
     /// One refinement step: the new hidden state and the flow update
-    fn forward(&self, net: Tensor<4>, inp: Tensor<4>, corr: Tensor<4>, flow: Tensor<4>, ops: Ops) -> (Tensor<4>, Tensor<4>) {
+    fn forward(&self, net: Tensor<4>, inp: Tensor<4>, corr: Tensor<4>, flow: Tensor<4>, ops: Ops, factored: Option<(&GruFactored, &GruConstants)>) -> (Tensor<4>, Tensor<4>) {
         let motion = self.motion(flow, corr, ops);
-        let net = self.gru(net, Tensor::cat(vec![inp, motion], 1), ops);
+        let net = match factored {
+            Some((g, c)) => g.step(c, net, motion),
+            None => self.gru(net, Tensor::cat(vec![inp, motion], 1), ops),
+        };
         let delta = conv_fwd(&self.flow_head.conv2, relu(conv_fwd(&self.flow_head.conv1, net.clone(), ops)), ops);
         (net, delta)
     }
 
     fn up_mask(&self, net: Tensor<4>, ops: Ops) -> Tensor<4> {
         conv_fwd(&self.mask.conv2, relu(conv_fwd(&self.mask.conv1, net, ops)), ops)
+    }
+}
+
+/// The convolutions of the GRU split by input channels, for `BasicUpdateBlock::forward_factored`. A GRU convolution reads
+/// [h, inp, motion] (128 channels each; q reads [r * h, inp, motion]): a convolution is linear in its input, so it is the
+/// sum of the convolutions of the three parts. Matrices [Cout, 128 * KH * KW] in im2col order, several outputs stacked
+/// where they read the same columns.
+pub struct GruFactored {
+    zr1_h: Tensor<3>, // [1, 256, 640]: z1 and r1 from h (1x5)
+    zr1_i: Tensor<3>, // z1 and r1 from inp
+    zr1_b: Tensor<3>, // [1, 256, 1]
+    q1_h: Tensor<3>,  // [1, 128, 640]
+    q1_i: Tensor<3>,
+    q1_b: Tensor<3>,
+    zrq1_m: Tensor<3>, // [1, 384, 640]: z1, r1 and q1 from motion
+    zr2_h: Tensor<3>,  // [1, 256, 640]: z2 and r2 from h (5x1)
+    q2_h: Tensor<3>,
+    zrq2_i: Tensor<3>, // [1, 384, 640]
+    zrq2_b: Tensor<3>,
+    zrq2_m: Tensor<3>,
+}
+
+/// The weight of a GRU convolution [128, 384, KH, KW] as [1, 128, 128 * KH * KW] for one of its three inputs (0 h, 1 inp,
+/// 2 motion), and its bias as [1, 128, 1]
+fn gru_part(conv: &Conv2d, part: usize) -> Tensor<3> {
+    let [cout, cin, kh, kw] = conv.weight.dims();
+    let k = kh * kw;
+    conv.weight.val().reshape([1, cout, cin * k]).narrow(2, part * 128 * k, 128 * k)
+}
+fn gru_bias(conv: &Conv2d) -> Tensor<3> {
+    let b = conv.bias.as_ref().expect("GRU convolutions have a bias").val();
+    let n = b.dims()[0];
+    b.reshape([1, n, 1])
+}
+
+impl BasicUpdateBlock {
+    pub fn factor_gru(&self) -> GruFactored {
+        let g = &self.gru;
+        let cat = |v: Vec<Tensor<3>>| Tensor::cat(v, 1);
+        GruFactored {
+            zr1_h: cat(vec![gru_part(&g.convz1, 0), gru_part(&g.convr1, 0)]),
+            zr1_i: cat(vec![gru_part(&g.convz1, 1), gru_part(&g.convr1, 1)]),
+            zr1_b: cat(vec![gru_bias(&g.convz1), gru_bias(&g.convr1)]),
+            q1_h: gru_part(&g.convq1, 0),
+            q1_i: gru_part(&g.convq1, 1),
+            q1_b: gru_bias(&g.convq1),
+            zrq1_m: cat(vec![gru_part(&g.convz1, 2), gru_part(&g.convr1, 2), gru_part(&g.convq1, 2)]),
+            zr2_h: cat(vec![gru_part(&g.convz2, 0), gru_part(&g.convr2, 0)]),
+            q2_h: gru_part(&g.convq2, 0),
+            zrq2_i: cat(vec![gru_part(&g.convz2, 1), gru_part(&g.convr2, 1), gru_part(&g.convq2, 1)]),
+            zrq2_b: cat(vec![gru_bias(&g.convz2), gru_bias(&g.convr2), gru_bias(&g.convq2)]),
+            zrq2_m: cat(vec![gru_part(&g.convz2, 2), gru_part(&g.convr2, 2), gru_part(&g.convq2, 2)]),
+        }
+    }
+}
+
+/// Columns of x [N, C, H, W] for a 1x5 (horizontal) or 5x1 (vertical) convolution with "same" padding: [N, C*5, H*W]
+fn gru_cols(x: Tensor<4>, horizontal: bool) -> Tensor<3> {
+    let (kh, kw, ph, pw) = if horizontal { (1, 5, 0, 2) } else { (5, 1, 2, 0) };
+    kernels::im2col(x, kh, kw, 1, ph, pw)
+}
+
+/// What the GRU of every refinement step shares: h0 and inp are the same in all six (unimatch computes them again each
+/// time), so their parts of the convolutions are computed once. [N, C, H*W]
+pub struct GruConstants {
+    zr1: Tensor<3>,  // z1, r1 from h0 and inp, with the biases
+    q1: Tensor<3>,   // q1 from inp, with its bias
+    zrq2: Tensor<3>, // z2, r2, q2 from inp, with the biases
+}
+
+impl GruFactored {
+    pub fn constants(&self, h0: Tensor<4>, inp: Tensor<4>) -> GruConstants {
+        let ci1 = gru_cols(inp.clone(), true);
+        let ci2 = gru_cols(inp, false);
+        let ch1 = gru_cols(h0, true);
+        GruConstants {
+            zr1: self.zr1_h.clone().matmul(ch1) + self.zr1_i.clone().matmul(ci1.clone()) + self.zr1_b.clone(),
+            q1: self.q1_i.clone().matmul(ci1) + self.q1_b.clone(),
+            zrq2: self.zrq2_i.clone().matmul(ci2) + self.zrq2_b.clone(),
+        }
+    }
+
+    /// SepConvGRU(h0, [inp, motion]), the same as `BasicUpdateBlock::gru` up to the order of the sums
+    pub fn step(&self, c: &GruConstants, h0: Tensor<4>, motion: Tensor<4>) -> Tensor<4> {
+        let [n, ch, hh, ww] = h0.dims();
+        let flat = |t: Tensor<4>| t.reshape([n, ch, hh * ww]);
+        let map = |t: Tensor<3>| t.reshape([n, ch, hh, ww]);
+        let one_minus = |z: Tensor<3>| z.neg().add_scalar(1.0);
+        // Horizontal
+        let m1 = self.zrq1_m.clone().matmul(gru_cols(motion.clone(), true)); // [N, 384, L]
+        let zr = c.zr1.clone() + m1.clone().narrow(1, 0, 256);
+        let z = sigmoid(zr.clone().narrow(1, 0, 128));
+        let r = sigmoid(zr.narrow(1, 128, 128));
+        let h0f = flat(h0.clone());
+        let q = tanh(self.q1_h.clone().matmul(gru_cols(map(r * h0f.clone()), true)) + c.q1.clone() + m1.narrow(1, 256, 128));
+        let h1 = one_minus(z.clone()) * h0f + z * q;
+        // Vertical
+        let m2 = self.zrq2_m.clone().matmul(gru_cols(motion, false));
+        let zr = self.zr2_h.clone().matmul(gru_cols(map(h1.clone()), false)) + c.zrq2.clone().narrow(1, 0, 256) + m2.clone().narrow(1, 0, 256);
+        let z = sigmoid(zr.clone().narrow(1, 0, 128));
+        let r = sigmoid(zr.narrow(1, 128, 128));
+        let q = tanh(self.q2_h.clone().matmul(gru_cols(map(r * h1.clone()), false)) + c.zrq2.clone().narrow(1, 256, 128) + m2.narrow(1, 256, 128));
+        map(one_minus(z.clone()) * h1 + z * q)
     }
 }
 
@@ -681,7 +789,7 @@ impl Statics {
             quarter: Windows::new(h / 4, w / 4, 8, device),
             mean: c3([0.485, 0.456, 0.406]),
             std: c3([0.229, 0.224, 0.225]),
-            ops: Ops { kernels: true, conv_im2col: false },
+            ops: Ops { kernels: true, conv_im2col: false, gru_factored: false },
         }
     }
 }
@@ -760,6 +868,11 @@ impl Gmflow {
         let net0 = tanh(proj.clone().narrow(1, 0, 128));
         let inp = relu(proj.narrow(1, 128, 128));
         let mut net = net0.clone();
+        let factored = ops.gru_factored.then(|| {
+            let g = self.refine.factor_gru();
+            let c = g.constants(net0.clone(), inp.clone());
+            (g, c)
+        });
         for i in 0..REFINE_ITERATIONS {
             let corr = if st.ops.kernels {
                 kernels::corr_with_flow(f0_ori.clone(), f1_ori.clone(), flow.clone())
@@ -767,7 +880,7 @@ impl Gmflow {
                 local_correlation_with_flow(f0_ori.clone(), f1_ori.clone(), flow.clone(), LOCAL_RADIUS)
             };
             put(&mut trace, &format!("corr_with_flow{i}"), &corr);
-            let (n, delta) = self.refine.forward(net0.clone(), inp.clone(), corr, flow.clone(), ops);
+            let (n, delta) = self.refine.forward(net0.clone(), inp.clone(), corr, flow.clone(), ops, factored.as_ref().map(|(g, c)| (g, c)));
             put(&mut trace, &format!("refine_net{i}"), &n);
             put(&mut trace, &format!("refine_delta{i}"), &delta);
             net = n;

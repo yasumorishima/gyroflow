@@ -7,8 +7,11 @@
 // tensor operations (kept there as the reference the tests compare these to).
 
 use burn::backend::cubecl::dtype_to_storage_type;
-use burn::backend::{ Dispatch, backend_extension, tensor::FloatTensor };
-use burn::tensor::{ Shape, Tensor };
+use burn::backend::fusion::custom::TensorSpec;
+use burn::backend::{ Dispatch, backend_extension, tensor::{ FloatTensor, IntTensor } };
+// burn::tensor::Int is the kind of integer tensors; Int in kernels is the CubeCL trait
+// Tensor in the kernels is the CubeCL one: the burn tensors of the functions model.rs calls are BurnTensor
+use burn::tensor::{ DType, Int as IntKind, Shape, Tensor as BurnTensor };
 use burn_cubecl::{ CubeBackend, kernel::into_contiguous, tensor::CubeTensor };
 use cubecl::{ calculate_cube_count_elemwise, cube, prelude::*, CubeDim };
 
@@ -377,6 +380,133 @@ fn launch_im2col(x: CubeTensor, kh: usize, kw: usize, stride: usize, ph: usize, 
     out
 }
 
+// ---------------------------------------------------------------- preprocessing on the GPU
+
+/// A frame of 8-bit grey (luma), packed 3 bytes to an i32 word (always positive, so that no conversion can change it), as
+/// it is uploaded: [H, words per row]
+pub fn pack_frame(width: usize, height: usize, stride: usize, pixels: &[u8]) -> (Vec<i32>, [usize; 2]) {
+    let words = width.div_ceil(3);
+    let mut out = vec![0i32; height * words];
+    for y in 0..height {
+        let row = &pixels[y * stride..y * stride + width];
+        for (j, chunk) in row.chunks(3).enumerate() {
+            let mut v = 0i32;
+            for (b, &p) in chunk.iter().enumerate() { v |= (p as i32) << (8 * b); }
+            out[y * words + j] = v;
+        }
+    }
+    (out, [height, words])
+}
+
+/// What `resize` of the image crate (0.25) does with FilterType::Triangle, then the letterbox: the frame scaled to
+/// new_w x new_h, vertical pass then horizontal pass with the weights of the triangle filter widened by the ratio and
+/// normalised, rounded to an integer grey level once at the end, placed at (pad_x, pad_y) on a canvas of zeros; the same
+/// grey in the 3 channels: [1, 3, out_h, out_w], raw 0-255 as the model takes it. One thread per canvas position.
+#[cube(launch)]
+fn preprocess_kernel<I: Int, F: Float>(
+    frame: &Tensor<I>,   // [H0, ceil(W0 / 3)], 3 bytes per word
+    out: &mut Tensor<F>, // [1, 3, out_h, out_w]
+    #[comptime] w0: usize,
+    #[comptime] new_w: usize,
+    #[comptime] new_h: usize,
+    #[comptime] pad_x: usize,
+    #[comptime] pad_y: usize,
+    #[define(I)] _itype: ElemType,
+    #[define(F)] _ftype: ElemType,
+) {
+    let idx = ABSOLUTE_POS as usize;
+    let (oh, ow) = (out.shape(2), out.shape(3));
+    if idx >= oh * ow {
+        terminate!();
+    }
+    let ox = idx % ow;
+    let oy = idx / ow;
+    let h0 = frame.shape(0);
+    let words = frame.shape(1);
+    let zero = F::new(0.0);
+    let one = F::new(1.0);
+    let half = F::new(0.5);
+    let mut value = zero;
+    if ox >= pad_x && ox < pad_x + new_w && oy >= pad_y && oy < pad_y + new_h {
+        let x = ox - pad_x;
+        let y = oy - pad_y;
+        // Vertical window and weights (vertical_sample)
+        let ry = F::cast_from(h0 as u32) / F::cast_from(new_h as u32);
+        let sy = F::max(ry, one);
+        let iny = (F::cast_from(y as u32) + half) * ry;
+        let top = clamp(i32::cast_from((iny - sy).floor()), 0, h0 as i32 - 1);
+        let bottom = clamp(i32::cast_from((iny + sy).ceil()), top + 1, h0 as i32);
+        let iny = iny - half;
+        let mut sumy = zero;
+        for i in top..bottom {
+            let d = ((F::cast_from(i) - iny) / sy).abs();
+            if d < one { sumy += one - d; }
+        }
+        // Horizontal window and weights (horizontal_sample)
+        let rx = F::cast_from(w0 as u32) / F::cast_from(new_w as u32);
+        let sx = F::max(rx, one);
+        let inx = (F::cast_from(x as u32) + half) * rx;
+        let left = clamp(i32::cast_from((inx - sx).floor()), 0, w0 as i32 - 1);
+        let right = clamp(i32::cast_from((inx + sx).ceil()), left + 1, w0 as i32);
+        let inx = inx - half;
+        let mut sumx = zero;
+        for j in left..right {
+            let d = ((F::cast_from(j) - inx) / sx).abs();
+            if d < one { sumx += one - d; }
+        }
+        let mut t = zero;
+        for j in left..right {
+            let dx = ((F::cast_from(j) - inx) / sx).abs();
+            let mut wx = zero;
+            if dx < one { wx = one - dx; }
+            wx = wx / sumx;
+            // The vertical pass at column j
+            let mut v = zero;
+            for i in top..bottom {
+                let dy = ((F::cast_from(i) - iny) / sy).abs();
+                let mut wy = zero;
+                if dy < one { wy = one - dy; }
+                wy = wy / sumy;
+                let word = u32::cast_from(frame[i as usize * words + j as usize / 3]);
+                let byte = (word >> (8 * (j as u32 % 3))) & 255;
+                v += F::cast_from(byte) * wy;
+            }
+            t += v * wx;
+        }
+        value = clamp(t, zero, F::new(255.0)).round();
+    }
+    let plane = oh * ow;
+    let v = value;
+    out[idx] = v;
+    out[plane + idx] = v;
+    out[2 * plane + idx] = v;
+}
+
+fn preprocess_meta(_frame: &TensorSpec, _w0: &usize, _new_w: &usize, _new_h: &usize, _pad_x: &usize, _pad_y: &usize, out_h: &usize, out_w: &usize) -> TensorSpec {
+    TensorSpec::new(Shape::new([1, 3, *out_h, *out_w]), DType::F32)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_preprocess(frame: CubeTensor, w0: usize, new_w: usize, new_h: usize, pad_x: usize, pad_y: usize, out_h: usize, out_w: usize) -> CubeTensor {
+    let frame = into_contiguous(frame);
+    let shape = Shape::new([1, 3, out_h, out_w]);
+    let threads = out_h * out_w;
+    let dtype = DType::F32;
+    let buffer = frame.client.empty(shape.num_elements() * dtype.size());
+    let out = CubeTensor::new_contiguous(frame.client.clone(), frame.device.clone(), shape, buffer, dtype);
+    let cube_dim = CubeDim::new(&frame.client, threads);
+    let count = calculate_cube_count_elemwise(&frame.client, threads, cube_dim);
+    let itype = dtype_to_storage_type(frame.dtype);
+    preprocess_kernel::launch(&out.client, count, cube_dim, frame.into_tensor_arg(), out.clone().into_tensor_arg(), w0, new_w, new_h, pad_x, pad_y, itype, dtype_to_storage_type(dtype));
+    out
+}
+
+/// The letterbox of a frame packed by `pack_frame` (width w0), computed on the GPU: [1, 3, out_h, out_w] raw 0-255
+#[allow(clippy::too_many_arguments)]
+pub fn preprocess(frame: BurnTensor<2, IntKind>, w0: usize, new_w: usize, new_h: usize, pad_x: usize, pad_y: usize, out_h: usize, out_w: usize) -> BurnTensor<4> {
+    BurnTensor::from_dispatch(Dispatch::preprocess(frame.into_dispatch(), w0, new_w, new_h, pad_x, pad_y, out_h, out_w))
+}
+
 // ---------------------------------------------------------------- the backend extension
 
 /// The kernels as backend operations: on the CubeCL backends (Vulkan, Metal), and lazily under burn fusion
@@ -392,6 +522,9 @@ pub trait GmflowKernels: burn::backend::Backend {
     fn convex_upsample(flow: FloatTensor<Self>, mask: FloatTensor<Self>) -> FloatTensor<Self>;
     #[fusion(dtype = x, shape = im2col_shape(x, *kh, *kw, *stride, *ph, *pw))]
     fn im2col(x: FloatTensor<Self>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> FloatTensor<Self>;
+    #[fusion(meta = preprocess_meta)]
+    #[allow(clippy::too_many_arguments)]
+    fn preprocess(frame: IntTensor<Self>, w0: usize, new_w: usize, new_h: usize, pad_x: usize, pad_y: usize, out_h: usize, out_w: usize) -> FloatTensor<Self>;
 }
 
 impl GmflowKernels for CubeBackend {
@@ -410,34 +543,42 @@ impl GmflowKernels for CubeBackend {
     fn im2col(x: FloatTensor<Self>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> FloatTensor<Self> {
         launch_im2col(x, kh, kw, stride, ph, pw)
     }
+    fn preprocess(frame: IntTensor<Self>, w0: usize, new_w: usize, new_h: usize, pad_x: usize, pad_y: usize, out_h: usize, out_w: usize) -> FloatTensor<Self> {
+        launch_preprocess(frame, w0, new_w, new_h, pad_x, pad_y, out_h, out_w)
+    }
 }
 
 // ---------------------------------------------------------------- what model.rs calls
 
 /// f0, f1 [B, C, H, W], flow [B, 2, H, W] -> [B, 81, H, W]
-pub fn corr_with_flow(f0: Tensor<4>, f1: Tensor<4>, flow: Tensor<4>) -> Tensor<4> {
-    Tensor::from_dispatch(Dispatch::corr_with_flow(f0.into_dispatch(), f1.into_dispatch(), flow.into_dispatch()))
+pub fn corr_with_flow(f0: BurnTensor<4>, f1: BurnTensor<4>, flow: BurnTensor<4>) -> BurnTensor<4> {
+    BurnTensor::from_dispatch(Dispatch::corr_with_flow(f0.into_dispatch(), f1.into_dispatch(), flow.into_dispatch()))
 }
 
 /// f0, f1 [B, C, H, W] -> flow [B, 2, H, W]
-pub fn local_corr_softmax(f0: Tensor<4>, f1: Tensor<4>) -> Tensor<4> {
-    Tensor::from_dispatch(Dispatch::local_corr_softmax(f0.into_dispatch(), f1.into_dispatch()))
+pub fn local_corr_softmax(f0: BurnTensor<4>, f1: BurnTensor<4>) -> BurnTensor<4> {
+    BurnTensor::from_dispatch(Dispatch::local_corr_softmax(f0.into_dispatch(), f1.into_dispatch()))
 }
 
 /// q, k [B, C, H, W] (projected), flow [B, 2, H, W] -> flow
-pub fn local_propagation(q: Tensor<4>, k: Tensor<4>, flow: Tensor<4>) -> Tensor<4> {
-    Tensor::from_dispatch(Dispatch::local_propagation(q.into_dispatch(), k.into_dispatch(), flow.into_dispatch()))
+pub fn local_propagation(q: BurnTensor<4>, k: BurnTensor<4>, flow: BurnTensor<4>) -> BurnTensor<4> {
+    BurnTensor::from_dispatch(Dispatch::local_propagation(q.into_dispatch(), k.into_dispatch(), flow.into_dispatch()))
 }
 
 /// flow [B, 2, H, W], mask [B, 144, H, W] -> [B, 2, 4H, 4W]
-pub fn convex_upsample(flow: Tensor<4>, mask: Tensor<4>) -> Tensor<4> {
-    Tensor::from_dispatch(Dispatch::convex_upsample(flow.into_dispatch(), mask.into_dispatch()))
+pub fn convex_upsample(flow: BurnTensor<4>, mask: BurnTensor<4>) -> BurnTensor<4> {
+    BurnTensor::from_dispatch(Dispatch::convex_upsample(flow.into_dispatch(), mask.into_dispatch()))
+}
+
+/// The columns of x [N, C, H, W] for a KH x KW convolution (F.unfold): [N, C*KH*KW, OH*OW]
+pub fn im2col(x: BurnTensor<4>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> BurnTensor<3> {
+    BurnTensor::from_dispatch(Dispatch::im2col(x.into_dispatch(), kh, kw, stride, ph, pw))
 }
 
 /// A 2D convolution (symmetric zero padding, no dilation or groups) as im2col + one batched matmul, the columns made in
 /// chunks of images so that none is over `max_bytes` (Vulkan guarantees 128 MiB for one buffer). x [N, C, H, W],
 /// weight [Cout, C, KH, KW] -> [N, Cout, OH, OW]
-pub fn conv2d_im2col(x: Tensor<4>, weight: Tensor<4>, bias: Option<Tensor<1>>, stride: usize, padding: [usize; 2], max_bytes: usize) -> Tensor<4> {
+pub fn conv2d_im2col(x: BurnTensor<4>, weight: BurnTensor<4>, bias: Option<BurnTensor<1>>, stride: usize, padding: [usize; 2], max_bytes: usize) -> BurnTensor<4> {
     let [n, c, h, w] = x.dims();
     let [cout, cin, kh, kw] = weight.dims();
     assert_eq!(c, cin, "conv2d_im2col: channels");
@@ -454,11 +595,11 @@ pub fn conv2d_im2col(x: Tensor<4>, weight: Tensor<4>, bias: Option<Tensor<1>>, s
     while start < n {
         let len = chunk.min(n - start);
         let part = if len == n { x.clone() } else { x.clone().narrow(0, start, len) };
-        let cols: Tensor<3> = Tensor::from_dispatch(Dispatch::im2col(part.into_dispatch(), kh, kw, stride, ph, pw));
+        let cols: BurnTensor<3> = BurnTensor::from_dispatch(Dispatch::im2col(part.into_dispatch(), kh, kw, stride, ph, pw));
         outs.push(wmat.clone().matmul(cols)); // [len, Cout, OH*OW]
         start += len;
     }
-    let out = if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(outs, 0) };
+    let out = if outs.len() == 1 { outs.pop().unwrap() } else { BurnTensor::cat(outs, 0) };
     let out = out.reshape([n, cout, oh, ow]);
     match bias {
         Some(b) => out + b.reshape([1, cout, 1, 1]),

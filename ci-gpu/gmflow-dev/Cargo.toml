@@ -18,6 +18,10 @@ burn = { version = "=0.22.1", default-features = false, features = ["std", "auto
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
 burn = { version = "=0.22.1", default-features = false, features = ["std", "autotune", "fusion", "cubecl", "extension", "vulkan"] }
 
+[dev-dependencies]
+# The CPU preprocessing of Gyroflow (gmflow.rs), which the GPU one must match
+image = { version = "=0.25.10", default-features = false }
+
 [features]
 # Native MSL kernels on Metal (cooperative matrices), falling back to WGSL where the device or the compiler lacks it
 msl = ["burn/metal"]
