@@ -3,6 +3,7 @@ pub mod model;
 #[path = "../../../src/core/synchronization/optical_flow/gmflow/kernels.rs"]
 pub mod kernels;
 pub mod bench;
+pub mod interp_diag;
 
 use burn::tensor::wgpu::WgpuBackend;
 use burn::tensor::{ Device, DeviceKind, Tensor, TensorData };

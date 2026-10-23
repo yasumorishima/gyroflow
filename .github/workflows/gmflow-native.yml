@@ -102,6 +102,13 @@ jobs:
         run: |
           cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact kernels_match_plain 2>&1 | tee kernels.log
           grep -q "test result: ok. 1 passed" kernels.log
+      - name: burn's bilinear interpolation with each cubek strategy, batches 1 to 3 (the occasional bidirectional failure)
+        run: |
+          # Autotune's cache off here, so that matches_pytorch after it tunes this key on its own as before
+          { echo '[autotune]'; echo 'disable_cache = true'; } > cubecl.toml
+          cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact interpolate_strategies 2>&1 | tee interp.log || true
+          rm -f cubecl.toml
+          grep -q "test result: ok. 1 passed" interp.log
       - name: Against PyTorch, stage by stage and every pair
         env:
           GMFLOW_BPK: ${{ runner.temp }}/gmflow.bpk

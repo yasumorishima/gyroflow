@@ -273,6 +273,67 @@ fn kernels_match_plain() {
     assert!(failed.is_empty(), "kernels that differ from the plain operations: {failed:?}");
 }
 
+/// burn's bilinear interpolation (the flow doubled at 1/8, aligned corners, as model.rs makes it) with each of cubek's two
+/// strategies and with autotune's choice, at batches 1, 2 and 3, against the CPU. Fails only if maximize_throughput is
+/// wrong; minimize_latency and autotune's choice are reported (see interp_diag.rs)
+#[test]
+#[ignore]
+fn interpolate_strategies() {
+    let (device, name) = device();
+    println!("device: {name}");
+    let (c, h, w) = (2usize, 40usize, 72usize);
+    let (oh, ow) = (2 * h, 2 * w);
+    let per_item = c * oh * ow;
+    let mut bad = Vec::new();
+    for b in [1usize, 2, 3] {
+        let x = Tensor::<4>::random([b, c, h, w], Distribution::Normal(0.0, 3.0), &device);
+        let xs = to_vec(x.clone());
+        let (sy, sx) = ((h - 1) as f64 / (oh - 1) as f64, (w - 1) as f64 / (ow - 1) as f64);
+        let mut want = vec![0f32; b * per_item];
+        for n in 0..b * c {
+            let at = |y: usize, x: usize| xs[(n * h + y) * w + x] as f64;
+            for oy in 0..oh {
+                let fy = oy as f64 * sy;
+                let y0 = (fy.floor() as usize).min(h - 1);
+                let (y1, ty) = ((y0 + 1).min(h - 1), fy - y0 as f64);
+                for ox in 0..ow {
+                    let fx = ox as f64 * sx;
+                    let x0 = (fx.floor() as usize).min(w - 1);
+                    let (x1, tx) = ((x0 + 1).min(w - 1), fx - x0 as f64);
+                    let v = (1.0 - ty) * ((1.0 - tx) * at(y0, x0) + tx * at(y0, x1)) + ty * ((1.0 - tx) * at(y1, x0) + tx * at(y1, x1));
+                    want[(n * oh + oy) * ow + ox] = v as f32;
+                }
+            }
+        }
+        // Each forced strategy 10 times (a race in its shared-memory stage would not show every time): the worst of them
+        let mut first: Vec<Vec<f32>> = Vec::new();
+        for (label, latency) in [("maximize_throughput", false), ("minimize_latency", true)] {
+            let (mut worst, mut worst_mean, mut worst_items) = (0f32, 0f64, Vec::new());
+            for rep in 0..10 {
+                let got = to_vec(interp_diag::interp2x(x.clone(), latency));
+                let (max, mean, _) = diff(&got, &want);
+                if rep == 0 || max > worst {
+                    worst = max;
+                    worst_mean = mean;
+                    worst_items = (0..b).map(|i| format!("{:.1e}", diff(&got[i * per_item..(i + 1) * per_item], &want[i * per_item..(i + 1) * per_item]).0)).collect::<Vec<_>>();
+                }
+                if rep == 0 { first.push(got); }
+            }
+            println!("INTERP {label:20} batch {b}: worst of 10, max |gpu - cpu| {worst:.2e}, mean {worst_mean:.2e}, max per item {worst_items:?}");
+            if !(worst <= 1e-4) { bad.push(format!("{label} batch {b}: {worst:e}")); }
+        }
+        // burn's own call, as the model makes it; which strategy autotune chose shows as an exact match with that one's output
+        let got = to_vec(burn::tensor::module::interpolate(x.clone(), burn::tensor::ops::InterpolateOptions::new(burn::tensor::ops::InterpolateMode::Bilinear).with_align_corners(true).with_scale_factor([2.0, 2.0])));
+        let (max, mean, _) = diff(&got, &want);
+        let same = |o: &Vec<f32>| got.iter().zip(o).all(|(a, b)| a.to_bits() == b.to_bits());
+        let chose = match (same(&first[0]), same(&first[1])) { (true, true) => "both (identical outputs)", (true, false) => "maximize_throughput", (false, true) => "minimize_latency", _ => "neither" };
+        println!("INTERP {:20} batch {b}: max |gpu - cpu| {max:.2e}, mean {mean:.2e}, output equal to {chose}", "autotune");
+        if !(max <= 1e-4) { bad.push(format!("autotune batch {b}: {max:e}")); }
+    }
+    println!("INTERP over 1e-4: {bad:?}");
+    assert!(!bad.iter().any(|s| s.starts_with("maximize_throughput")), "maximize_throughput: {bad:?}");
+}
+
 /// The letterbox the CPU made before (image crate resize, Triangle), as gmflow.rs computes it
 fn cpu_preprocess(img: &image::GrayImage) -> (Vec<f32>, [usize; 5]) {
     let (iw, ih) = (img.width() as f32, img.height() as f32);

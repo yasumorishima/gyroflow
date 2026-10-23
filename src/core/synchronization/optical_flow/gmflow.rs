@@ -278,7 +278,7 @@ mod inference {
         let own = im2col_is_faster(device);
         let gemm = own && gemm_fits(device);
         statics.ops = Ops { conv_im2col: own, own_gemm: gemm, gemm_linear: gemm, ..OPS };
-        log::info!("gmflow: convolutions {}", match (own, gemm) { (true, true) => "as im2col + kernels::gemm", (true, false) => "as im2col + matmul", _ => "by burn" });
+        log::info!("gmflow: convolutions {}", match (own, gemm) { (true, true) => "as im2col + kernels::gemm, linear layers by kernels::gemm too", (true, false) => "as im2col + matmul", _ => "by burn" });
         let r = std::sync::Arc::new(Runner { model, statics });
         *slot = Some(r.clone());
         Ok(r)

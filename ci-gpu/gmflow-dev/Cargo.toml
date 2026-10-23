@@ -12,6 +12,8 @@ publish = false
 burn-store = { version = "=0.22.1", default-features = false, features = ["std", "pytorch"] }
 burn-cubecl = { version = "=0.22.1" }
 cubecl = { version = "=0.11.1" }
+# burn's interpolation with a given strategy (interp_diag.rs)
+cubek = { version = "=0.3.1", default-features = false, features = ["interpolate"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 burn = { version = "=0.22.1", default-features = false, features = ["std", "autotune", "fusion", "cubecl", "extension", "wgpu"] }
