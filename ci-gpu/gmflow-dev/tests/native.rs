@@ -18,7 +18,7 @@ const W: usize = 576;
 /// kernels_match_plain checks every one of them against burn's matmul
 const GEMM_TILES: [kernels::GemmTile; 5] = [
     kernels::GEMM_DEFAULT,
-    kernels::GemmTile { block: 64, kstep: 8, per: 4 },
+    kernels::GemmTile { block: 64, kstep: 16, per: 4 },
     kernels::GemmTile { block: 32, kstep: 16, per: 2 },
     kernels::GemmTile { block: 32, kstep: 32, per: 2 },
     kernels::GemmTile { block: 128, kstep: 8, per: 8 },
@@ -126,7 +126,7 @@ fn matches_pytorch() {
     let im2col = std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true);
     let mut bad = Vec::new();
     for (what, kernels_on) in [("kernels", true), ("plain ops", false)] {
-        st.ops = model::Ops { kernels: kernels_on, conv_im2col: im2col, gru_factored: true, own_gemm: im2col && kernels_on, gemm_linear: false };
+        st.ops = model::Ops { kernels: kernels_on, conv_im2col: im2col, gru_factored: true, own_gemm: im2col && kernels_on, gemm_linear: im2col && kernels_on };
         for k in 0..3 {
             let fa = model.features(inp(k, 0), &st);
             let fb = model.features(inp(k, 1), &st);
@@ -142,7 +142,7 @@ fn matches_pytorch() {
             }
         }
     }
-    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col, gemm_linear: false };
+    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col, gemm_linear: im2col };
     assert!(bad.is_empty(), "bidirectional: {bad:?}");
 
     // The tracker, per frame: before, two one-way passes (each through the CNN with both frames); now, the CNN of the new
@@ -498,7 +498,7 @@ fn bidirectional_repeat() {
     let model = load(&device);
     let mut st = Statics::new(H, W, &device);
     let im2col = std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true);
-    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col, gemm_linear: false };
+    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col, gemm_linear: im2col };
     let inp = |k: usize, i: usize| tensor4(&dir.join(format!("pair{k}_in{i}.f32")), [1, 3, H, W], &device);
     let mut bad = Vec::new();
     for k in 0..3 {

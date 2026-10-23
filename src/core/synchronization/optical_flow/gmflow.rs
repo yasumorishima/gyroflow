@@ -273,10 +273,11 @@ mod inference {
         if let Some(r) = &*slot { return Ok(r.clone()); }
         let model = load_model(device)?;
         let mut statics = Statics::new(MODEL_H, MODEL_W, device);
-        // Without f32 matrix units: convolutions as im2col, their matmuls (and the GRU's) by kernels::gemm
+        // Without f32 matrix units: convolutions as im2col, their matmuls (and the GRU's and the transformer's linear
+        // layers) by kernels::gemm (WGSL on the macOS CI GPU: the linear layers too, 3.08 s a pass against 3.29 s)
         let own = im2col_is_faster(device);
         let gemm = own && gemm_fits(device);
-        statics.ops = Ops { conv_im2col: own, own_gemm: gemm, ..OPS };
+        statics.ops = Ops { conv_im2col: own, own_gemm: gemm, gemm_linear: gemm, ..OPS };
         log::info!("gmflow: convolutions {}", match (own, gemm) { (true, true) => "as im2col + kernels::gemm", (true, false) => "as im2col + matmul", _ => "by burn" });
         let r = std::sync::Arc::new(Runner { model, statics });
         *slot = Some(r.clone());

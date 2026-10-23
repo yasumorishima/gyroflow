@@ -62,7 +62,7 @@ jobs:
       matrix:
         include:
           - { name: lavapipe, os: ubuntu-24.04, warm: '0', features: '', im2col: '1', best: '' }
-          - { name: metal-wgsl, os: macos-14, warm: '10', features: '', im2col: '1', best: kernels+im2col+gru+gemm }
+          - { name: metal-wgsl, os: macos-14, warm: '10', features: '', im2col: '1', best: kernels+im2col+gru+gemm+linear }
           - { name: metal-msl, os: macos-15, warm: '10', features: msl, im2col: '0', best: kernels+gru }
     name: native-${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -109,7 +109,15 @@ jobs:
           GMFLOW_WARM_RUNS: ${{ matrix.warm }}
           GMFLOW_IM2COL: ${{ matrix.im2col }}
         run: |
-          cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matches_pytorch 2>&1 | tee pytorch.log
+          # Autotune as usual (its cache on), only its choices logged: the bidirectional check failed now and then (0.54 px
+          # at pair 0, then every pair and the plain ops too, in the same process), as a cached bad choice would
+          {
+            echo '[autotune.logger]'
+            echo 'level = "full"'
+            echo 'file = "autotune_pytorch.log"'
+          } > cubecl.toml
+          cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matches_pytorch 2>&1 | tee pytorch.log || true
+          rm -f cubecl.toml
           grep -q "test result: ok. 1 passed" pytorch.log
       - name: The bidirectional pass 6 times in fresh processes, autotune cache off, its choices logged
         if: matrix.best != ''

@@ -420,7 +420,9 @@ fn launch_im2col(x: CubeTensor, kh: usize, kw: usize, stride: usize, ph: usize, 
 
 /// The tiling of gemm: rows and columns of the block of the output a cube computes, its k step, and outputs per thread
 /// per side (block / per threads per side, outputs strided by that so that neighbouring threads read neighbouring
-/// values). Measured on WGSL (macOS CI GPU): 64 / 16 / 4 at 251 GFLOPS; 128 / 8 / 8 at 146 (64 accumulators a thread)
+/// values). Measured on the macOS CI GPU (conv / GRU / FFN shapes, GFLOPS), WGSL: 64 / 8 / 4 458 / 480 / 524, 64 / 16 / 4
+/// 257 / 273 / 296, 32 / 16 / 2 340 / 405 / 472, 32 / 32 / 2 286 / 298 / 328, 128 / 8 / 8 143 / 188 / 192 (64 accumulators a
+/// thread); MSL in the same order, 64 / 8 / 4 fastest at 578 / 576 / 633
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GemmTile {
     pub block: usize,
@@ -434,7 +436,7 @@ impl GemmTile {
     }
 }
 
-pub const GEMM_DEFAULT: GemmTile = GemmTile { block: 64, kstep: 16, per: 4 };
+pub const GEMM_DEFAULT: GemmTile = GemmTile { block: 64, kstep: 8, per: 4 };
 /// Threads per side of every tiling used (the workgroup is GEMM_THREADS squared)
 pub const GEMM_THREADS: usize = 16;
 
