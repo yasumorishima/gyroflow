@@ -352,6 +352,57 @@ fn launch_local_propagation(q: CubeTensor, k: CubeTensor, flow: CubeTensor) -> C
     out
 }
 
+/// The flow at the next finer level: flow [B, C, H, W] -> 2 * bilinear(flow) [B, C, 2H, 2W], corners aligned (unimatch:
+/// F.interpolate(flow, scale_factor=2, mode='bilinear', align_corners=True) * 2). Not burn's interpolation: its autotune
+/// picks between two cubek strategies, and every CI run that picked minimize_latency for this key (tuned at batch 1, the key
+/// has no batch) came out wrong in the bidirectional pass (batch 2) from this stage on, differing from run to run as a part
+/// of the output left unwritten would; every run that picked maximize_throughput passed. One thread per output value; the
+/// source position o * (n - 1) / (2n - 1) taken as an exact fraction
+#[cube(launch)]
+fn flow_double_kernel<F: Float>(
+    flow: &Tensor<F>,    // [B, C, H, W]
+    out: &mut Tensor<F>, // [B, C, 2H, 2W]
+    #[define(F)] _dtype: ElemType,
+) {
+    let idx = ABSOLUTE_POS as usize;
+    let (bc_n, h, w) = (flow.shape(0) * flow.shape(1), flow.shape(2), flow.shape(3));
+    let oh = h * 2usize;
+    let ow = w * 2usize;
+    if idx >= bc_n * oh * ow {
+        terminate!();
+    }
+    let ox = idx % ow;
+    let oy = (idx / ow) % oh;
+    let bc = idx / (oh * ow);
+    let ny = oy * (h - 1usize);
+    let y0 = ny / (oh - 1usize);
+    let ty = F::cast_from((ny - y0 * (oh - 1usize)) as u32) / F::cast_from((oh - 1usize) as u32);
+    let nx = ox * (w - 1usize);
+    let x0 = nx / (ow - 1usize);
+    let tx = F::cast_from((nx - x0 * (ow - 1usize)) as u32) / F::cast_from((ow - 1usize) as u32);
+    let y1 = if y0 + 1usize < h { y0 + 1usize } else { y0 };
+    let x1 = if x0 + 1usize < w { x0 + 1usize } else { x0 };
+    let base = bc * h * w;
+    let one = F::new(1.0_f32);
+    let top = flow[base + y0 * w + x0] * (one - tx) + flow[base + y0 * w + x1] * tx;
+    let bottom = flow[base + y1 * w + x0] * (one - tx) + flow[base + y1 * w + x1] * tx;
+    out[idx] = (top * (one - ty) + bottom * ty) * F::new(2.0_f32);
+}
+
+fn doubled_shape(flow: &Shape) -> Shape {
+    Shape::new([flow[0], flow[1], flow[2] * 2, flow[3] * 2])
+}
+
+fn launch_flow_double(flow: CubeTensor) -> CubeTensor {
+    let flow = into_contiguous(flow);
+    let shape = doubled_shape(flow.meta.shape());
+    let n = shape.num_elements();
+    let dtype = flow.dtype;
+    let (out, count, dim) = output_for(&flow, shape, n);
+    flow_double_kernel::launch(&out.client, count, dim, flow.into_tensor_arg(), out.clone().into_tensor_arg(), dtype_to_storage_type(dtype));
+    out
+}
+
 fn launch_convex_upsample(flow: CubeTensor, mask: CubeTensor) -> CubeTensor {
     let (flow, mask) = (into_contiguous(flow), into_contiguous(mask));
     let shape = upsampled_shape(flow.meta.shape());
@@ -703,6 +754,8 @@ pub trait GmflowKernels: burn::backend::Backend {
     fn local_propagation(q: FloatTensor<Self>, k: FloatTensor<Self>, flow: FloatTensor<Self>) -> FloatTensor<Self>;
     #[fusion(dtype = flow, shape = upsampled_shape(flow))]
     fn convex_upsample(flow: FloatTensor<Self>, mask: FloatTensor<Self>) -> FloatTensor<Self>;
+    #[fusion(dtype = flow, shape = doubled_shape(flow))]
+    fn flow_double(flow: FloatTensor<Self>) -> FloatTensor<Self>;
     #[fusion(dtype = x, shape = im2col_shape(x, *kh, *kw, *stride, *ph, *pw))]
     fn im2col(x: FloatTensor<Self>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> FloatTensor<Self>;
     #[fusion(dtype = a, shape = gemm_shape(a, b))]
@@ -724,6 +777,9 @@ impl GmflowKernels for CubeBackend {
     }
     fn convex_upsample(flow: FloatTensor<Self>, mask: FloatTensor<Self>) -> FloatTensor<Self> {
         launch_convex_upsample(flow, mask)
+    }
+    fn flow_double(flow: FloatTensor<Self>) -> FloatTensor<Self> {
+        launch_flow_double(flow)
     }
     fn im2col(x: FloatTensor<Self>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> FloatTensor<Self> {
         launch_im2col(x, kh, kw, stride, ph, pw)
@@ -756,6 +812,11 @@ pub fn local_propagation(q: BurnTensor<4>, k: BurnTensor<4>, flow: BurnTensor<4>
 /// flow [B, 2, H, W], mask [B, 144, H, W] -> [B, 2, 4H, 4W]
 pub fn convex_upsample(flow: BurnTensor<4>, mask: BurnTensor<4>) -> BurnTensor<4> {
     BurnTensor::from_dispatch(Dispatch::convex_upsample(flow.into_dispatch(), mask.into_dispatch()))
+}
+
+/// flow [B, C, H, W] -> [B, C, 2H, 2W]: the flow at the next finer level (flow_double_kernel)
+pub fn flow_double(flow: BurnTensor<4>) -> BurnTensor<4> {
+    BurnTensor::from_dispatch(Dispatch::flow_double(flow.into_dispatch()))
 }
 
 /// The columns of x [N, C, H, W] for a KH x KW convolution (F.unfold): [N, C*KH*KW, OH*OW]

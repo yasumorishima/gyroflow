@@ -31,8 +31,8 @@ use burn::module::{ Module, Param };
 use burn::nn::conv::{ Conv2d, Conv2dConfig };
 use burn::nn::{ InstanceNorm, InstanceNormConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig2d };
 use burn::tensor::activation::{ gelu, relu, sigmoid, softmax, tanh };
-use burn::tensor::module::{ conv2d, interpolate };
-use burn::tensor::ops::{ ConvOptions, GridSampleOptions, GridSamplePaddingMode, InterpolateMode, InterpolateOptions, PadMode };
+use burn::tensor::module::conv2d;
+use burn::tensor::ops::{ ConvOptions, GridSampleOptions, GridSamplePaddingMode, InterpolateMode, PadMode };
 use burn::tensor::{ Device, Tensor, TensorData };
 
 use super::kernels;
@@ -773,6 +773,30 @@ impl GruFactored {
     }
 }
 
+/// The flow at the next finer level with plain operations (kernels::flow_double): 2 * bilinear(flow), corners aligned, as
+/// one matmul per axis with the interpolation weights (exact; not burn's interpolation, see flow_double_kernel).
+/// flow [B, C, H, W] -> [B, C, 2H, 2W]
+pub fn flow_double(flow: Tensor<4>) -> Tensor<4> {
+    let [b, c, h, w] = flow.dims();
+    let device = flow.device();
+    // [n, 2n]: input index -> output index weights, source position o * (n - 1) / (2n - 1)
+    let weights = |n: usize, scale: f32| {
+        let on = 2 * n;
+        let mut m = vec![0f32; n * on];
+        for o in 0..on {
+            let num = o * (n - 1);
+            let i0 = num / (on - 1);
+            let t = (num - i0 * (on - 1)) as f32 / (on - 1) as f32;
+            m[i0 * on + o] += scale * (1.0 - t);
+            if t > 0.0 { m[(i0 + 1) * on + o] += scale * t; }
+        }
+        Tensor::<2>::from_data(TensorData::new(m, [n, on]), &device)
+    };
+    let rows = flow.reshape([b * c * h, w]).matmul(weights(w, 2.0)).reshape([b * c, h, 2 * w]);
+    let cols = rows.swap_dims(1, 2).reshape([b * c * 2 * w, h]).matmul(weights(h, 1.0)).reshape([b * c, 2 * w, 2 * h]);
+    cols.swap_dims(1, 2).reshape([b, c, 2 * h, 2 * w])
+}
+
 /// upsample_flow_with_mask (convex upsampling, factor 4): flow [B, 2, H, W], mask [B, 9*16, H, W] -> [B, 2, 4H, 4W]
 pub fn convex_upsample(flow: Tensor<4>, mask: Tensor<4>) -> Tensor<4> {
     let [b, _, h, w] = flow.dims();
@@ -925,7 +949,7 @@ impl Gmflow {
         } else {
             (a.quarter.clone(), b.quarter.clone())
         };
-        let flow = interpolate(flow, InterpolateOptions::new(InterpolateMode::Bilinear).with_align_corners(true).with_scale_factor([2.0, 2.0])).mul_scalar(2.0);
+        let flow = if st.ops.kernels { kernels::flow_double(flow) } else { flow_double(flow) };
         put(&mut trace, "warp_flow0", &flow);
         let f1w = flow_warp(f1_ori.clone(), flow.clone());
         put(&mut trace, "warped_feature1_0", &f1w);

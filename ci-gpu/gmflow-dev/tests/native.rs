@@ -266,7 +266,9 @@ fn kernels_match_plain() {
     check("local_correlation_softmax", kernels::local_corr_softmax(f0.clone(), f1.clone()), model::local_correlation_softmax(f0.clone(), f1.clone(), kernels::CORR_RADIUS));
     check("local propagation", kernels::local_propagation(f0.clone(), f1.clone(), flow.clone()), model::local_propagation(f0.clone(), f1.clone(), flow.clone(), kernels::PROP_RADIUS));
     let mask = rnd([b, 9 * 16, h, w], 2.0);
-    check("convex upsampling", kernels::convex_upsample(flow.clone(), mask.clone()), model::convex_upsample(flow, mask));
+    check("convex upsampling", kernels::convex_upsample(flow.clone(), mask.clone()), model::convex_upsample(flow.clone(), mask));
+    let flow8 = rnd([b, 2, H / 8, W / 8], 3.0);
+    check("flow doubled", kernels::flow_double(flow8.clone()), model::flow_double(flow8));
     // Convolutions of the shapes of the model as im2col + matmul, against burn
     for (cin, cout, kh, kw, stride, ph, pw, hh, ww) in [(3usize, 64usize, 7usize, 7usize, 2usize, 3usize, 3usize, H, W), (64, 64, 3, 3, 1, 1, 1, H / 2, W / 2), (256, 192, 3, 3, 1, 1, 1, h, w), (384, 128, 1, 5, 1, 0, 2, h, w), (384, 128, 5, 1, 1, 2, 0, h, w)] {
         let x = rnd([2, cin, hh, ww], 1.0);
@@ -342,12 +344,19 @@ fn interpolate_strategies() {
                 }
             }
         }
-        // Each forced strategy 10 times (a race in its shared-memory stage would not show every time): the worst of them
+        // Each forced strategy 10 times, each call just after four tensors of the output's size filled with 1e6 were made
+        // and dropped (four, as the call first takes the NHWC copy of its input from the pool, then its output): a value the
+        // kernel leaves unwritten shows as 1e6. minimize_latency first: the first version of this test ran it right after
+        // maximize_throughput, whose correct output was what an unwritten value would have kept
         let mut first: Vec<Vec<f32>> = Vec::new();
-        for (label, latency) in [("maximize_throughput", false), ("minimize_latency", true)] {
-            let (mut worst, mut worst_mean, mut worst_items) = (0f32, 0f64, Vec::new());
+        for (label, latency) in [("minimize_latency", true), ("maximize_throughput", false)] {
+            let (mut worst, mut worst_mean, mut worst_items, mut stale) = (0f32, 0f64, Vec::new(), 0usize);
             for rep in 0..10 {
+                let junk: Vec<Tensor<4>> = (0..4).map(|_| Tensor::<4>::full([b, c, oh, ow], 1.0e6, &device)).collect();
+                for t in &junk { let _ = to_vec(t.clone()); }
+                drop(junk);
                 let got = to_vec(interp_diag::interp2x(x.clone(), latency));
+                stale = stale.max(got.iter().filter(|v| **v == 1.0e6).count());
                 let (max, mean, _) = diff(&got, &want);
                 if rep == 0 || max > worst {
                     worst = max;
@@ -356,19 +365,26 @@ fn interpolate_strategies() {
                 }
                 if rep == 0 { first.push(got); }
             }
-            println!("INTERP {label:20} batch {b}: worst of 10, max |gpu - cpu| {worst:.2e}, mean {worst_mean:.2e}, max per item {worst_items:?}");
+            println!("INTERP {label:20} batch {b}: worst of 10, max |gpu - cpu| {worst:.2e}, mean {worst_mean:.2e}, max per item {worst_items:?}, most values left at 1e6 {stale}");
             if !(worst <= 1e-4) { bad.push(format!("{label} batch {b}: {worst:e}")); }
         }
         // burn's own call, as the model makes it; which strategy autotune chose shows as an exact match with that one's output
         let got = to_vec(burn::tensor::module::interpolate(x.clone(), burn::tensor::ops::InterpolateOptions::new(burn::tensor::ops::InterpolateMode::Bilinear).with_align_corners(true).with_scale_factor([2.0, 2.0])));
         let (max, mean, _) = diff(&got, &want);
         let same = |o: &Vec<f32>| got.iter().zip(o).all(|(a, b)| a.to_bits() == b.to_bits());
-        let chose = match (same(&first[0]), same(&first[1])) { (true, true) => "both (identical outputs)", (true, false) => "maximize_throughput", (false, true) => "minimize_latency", _ => "neither" };
+        let chose = match (same(&first[1]), same(&first[0])) { (true, true) => "both (identical outputs)", (true, false) => "maximize_throughput", (false, true) => "minimize_latency", _ => "neither" };
         println!("INTERP {:20} batch {b}: max |gpu - cpu| {max:.2e}, mean {mean:.2e}, output equal to {chose}", "autotune");
         if !(max <= 1e-4) { bad.push(format!("autotune batch {b}: {max:e}")); }
+        // What the model uses instead (2 * the interpolation): the kernel and the plain form, against the CPU
+        let want2: Vec<f32> = want.iter().map(|v| 2.0 * v).collect();
+        for (label, got) in [("kernels::flow_double", kernels::flow_double(x.clone())), ("model::flow_double", model::flow_double(x.clone()))] {
+            let (max, mean, _) = diff(&to_vec(got), &want2);
+            println!("INTERP {label:20} batch {b}: max |gpu - 2 cpu| {max:.2e}, mean {mean:.2e}");
+            if !(max <= 2e-4) { bad.push(format!("{label} batch {b}: {max:e}")); }
+        }
     }
     println!("INTERP over 1e-4: {bad:?}");
-    assert!(!bad.iter().any(|s| s.starts_with("maximize_throughput")), "maximize_throughput: {bad:?}");
+    assert!(!bad.iter().any(|s| s.starts_with("maximize_throughput") || s.contains("flow_double")), "maximize_throughput or flow_double: {bad:?}");
 }
 
 /// The letterbox the CPU made before (image crate resize, Triangle), as gmflow.rs computes it
