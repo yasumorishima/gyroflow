@@ -305,7 +305,7 @@ fn kernels_match_plain() {
         }
     }
     // Convolutions of the shapes of the model as im2col + matmul, against burn
-    for (cin, cout, kh, kw, stride, ph, pw, hh, ww) in [(3usize, 64usize, 7usize, 7usize, 2usize, 3usize, 3usize, H, W), (64, 64, 3, 3, 1, 1, 1, H / 2, W / 2), (256, 192, 3, 3, 1, 1, 1, h, w), (384, 128, 1, 5, 1, 0, 2, h, w), (384, 128, 5, 1, 1, 2, 0, h, w)] {
+    for (cin, cout, kh, kw, stride, ph, pw, hh, ww) in [(3usize, 64usize, 7usize, 7usize, 2usize, 3usize, 3usize, H, W), (64, 64, 3, 3, 1, 1, 1, H / 2, W / 2), (64, 96, 3, 3, 2, 1, 1, H / 2, W / 2), (256, 192, 3, 3, 1, 1, 1, h, w), (384, 128, 1, 5, 1, 0, 2, h, w), (384, 128, 5, 1, 1, 2, 0, h, w)] {
         let x = rnd([2, cin, hh, ww], 1.0);
         let wt = rnd([cout, cin, kh, kw], 0.02); // outputs of order 1, as the other checks
         let bias = Tensor::<1>::random([cout], Distribution::Normal(0.0, 0.1), &device);
@@ -318,8 +318,9 @@ fn kernels_match_plain() {
         check(&format!("conv {cin}->{cout} {kh}x{kw}/{stride} implicit"), got, want);
     }
     // conv_gemm (columns gathered in the kernel) against gemm on the im2col columns, at the GRU's 1x5 and 5x1 and the
-    // trident's stride 2, and at a size whose OH*OW is not a multiple of 4 (im2col + gemm)
-    for (cin, cout, kh, kw, stride, ph, pw, hh, ww) in [(128usize, 384usize, 1usize, 5usize, 1usize, 0usize, 2usize, h, w), (128, 384, 5, 1, 1, 2, 0, h, w), (128, 128, 3, 3, 2, 1, 1, h, w), (16, 64, 3, 3, 1, 1, 1, 7, 9)] {
+    // trident's stride 2, at a size whose OH*OW is not a multiple of 4 (im2col + gemm), and at output widths not a
+    // multiple of 4 (vectors of 4 positions across two output rows)
+    for (cin, cout, kh, kw, stride, ph, pw, hh, ww) in [(128usize, 384usize, 1usize, 5usize, 1usize, 0usize, 2usize, h, w), (128, 384, 5, 1, 1, 2, 0, h, w), (128, 128, 3, 3, 2, 1, 1, h, w), (16, 64, 3, 3, 1, 1, 1, 7, 9), (16, 64, 3, 3, 1, 1, 1, 6, 10), (16, 64, 3, 3, 2, 1, 1, 8, 14)] {
         let x = rnd([2, cin, hh, ww], 1.0);
         let wm = Tensor::<3>::random([1, cout, cin * kh * kw], Distribution::Normal(0.0, 1.0 / ((cin * kh * kw) as f64).sqrt()), &device);
         let want = kernels::gemm(wm.clone(), kernels::im2col(x.clone(), kh, kw, stride, ph, pw), None).unsqueeze_dim::<4>(0);
