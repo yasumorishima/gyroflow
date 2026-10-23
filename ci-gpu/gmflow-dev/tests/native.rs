@@ -125,6 +125,7 @@ fn matches_pytorch() {
     // With the kernels as configured, and without them (which part breaks, if one does); all printed before the assert
     let im2col = std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true);
     let mut bad = Vec::new();
+    let mut kernels_pair0: Option<Vec<f32>> = None;
     for (what, kernels_on) in [("kernels", true), ("plain ops", false)] {
         st.ops = model::Ops { kernels: kernels_on, conv_im2col: im2col, gru_factored: true, own_gemm: im2col && kernels_on, gemm_linear: im2col && kernels_on };
         for k in 0..3 {
@@ -135,6 +136,7 @@ fn matches_pytorch() {
             let fwd = to_vec(both.clone().narrow(0, 0, 1));
             let bwd = to_vec(both.narrow(0, 1, 1));
             let secs = started.elapsed().as_secs_f64();
+            if kernels_on && k == 0 { kernels_pair0 = Some([fwd.clone(), bwd.clone()].concat()); }
             for (dir, got, file) in [("a -> b", fwd, format!("pair{k}_torch.f32")), ("b -> a", bwd, format!("pair{k}_bwd_torch.f32"))] {
                 let (max, mean, _) = diff(&got, &read_f32(&env_path("GMFLOW_REF_DIR").join(&file)));
                 println!("bidirectional ({what}) pair {k} {dir}: max |burn - torch| {max:.2e} px, mean {mean:.2e} px ({secs:.3} s for both, without the CNN)");
@@ -143,6 +145,41 @@ fn matches_pytorch() {
         }
     }
     st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col, gemm_linear: im2col };
+    // Where a wrong bidirectional pass departs (it failed now and then with the same wrong flow on MSL and WGSL, the plain
+    // ops too), run after every gated pass: traced passes keep every stage alive, which changes what burn fuses and does in
+    // place. Pair 0 with the kernels: the first item of a traced bidirectional pass against a traced one-way pass of the
+    // same features, stage by stage (equal up to rounding when right), and the traced bidirectional pass against the gated
+    // untraced one, both items
+    {
+        let fa = model.features(inp(0, 0), &st);
+        let fb = model.features(inp(0, 1), &st);
+        let mut t_bi = Trace::default();
+        let traced = to_vec(model.flow(&fa, &fb, true, &st, Some(&mut t_bi)));
+        let mut t_one = Trace::default();
+        let _ = model.flow(&fa, &fb, false, &st, Some(&mut t_one));
+        if let Some(untraced) = &kernels_pair0 {
+            let (m, _, _) = diff(&traced, untraced);
+            println!("BISTAGE traced bidirectional pass against the gated untraced one (both items): max {m:.2e}");
+        }
+        for (name, tb) in &t_bi.tensors {
+            let Some((_, to)) = t_one.tensors.iter().find(|(n, _)| n == name) else { continue };
+            let (db, dt) = (tb.dims(), to.dims());
+            if db[1..] != dt[1..] || dt[0] != 1 {
+                println!("BISTAGE {name}: shapes {db:?} and {dt:?}");
+                continue;
+            }
+            let (m, mean, _) = diff(&to_vec(tb.clone().narrow(0, 0, 1)), &to_vec(to.clone()));
+            println!("BISTAGE {name:22}: max |bi[0] - one-way| {m:.2e}, mean {mean:.2e}");
+        }
+    }
+    // Then a one-way pass of pair 0 again (forward: the CNN on both frames and the one-way flow) against PyTorch: wrong if
+    // something the passes share (weights, statics) was left wrong; right if only the bidirectional path goes wrong, or
+    // if the fault did not last
+    {
+        let flow = to_vec(model.forward(inp(0, 0), inp(0, 1), &st));
+        let (max, mean, _) = diff(&flow, &read_f32(&dir.join("pair0_torch.f32")));
+        println!("AFTER the bidirectional passes, one-way pair 0: max |burn - torch| {max:.2e} px, mean {mean:.2e} px");
+    }
     assert!(bad.is_empty(), "bidirectional: {bad:?}");
 
     // The tracker, per frame: before, two one-way passes (each through the CNN with both frames); now, the CNN of the new
