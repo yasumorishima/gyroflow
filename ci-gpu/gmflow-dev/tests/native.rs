@@ -26,15 +26,17 @@ const GEMM_TILES: [kernels::GemmTile; 5] = [
 
 /// The configurations measured: (label, ops)
 fn configs() -> Vec<(&'static str, model::Ops)> {
-    let o = |kernels, conv_im2col, gru_factored, own_gemm, gemm_linear| model::Ops { kernels, conv_im2col, gru_factored, own_gemm, gemm_linear };
+    let o = |kernels, conv_im2col, gru_factored, own_gemm, gemm_linear, fused| model::Ops { kernels, conv_im2col, gru_factored, own_gemm, gemm_linear, fused };
     vec![
-        ("plain", o(false, false, false, false, false)),
-        ("kernels", o(true, false, false, false, false)),
-        ("kernels+gru", o(true, false, true, false, false)),
-        ("kernels+im2col", o(true, true, false, false, false)),
-        ("kernels+im2col+gru", o(true, true, true, false, false)),
-        ("kernels+im2col+gru+gemm", o(true, true, true, true, false)),
-        ("kernels+im2col+gru+gemm+linear", o(true, true, true, true, true)),
+        ("plain", o(false, false, false, false, false, false)),
+        ("kernels", o(true, false, false, false, false, false)),
+        ("kernels+gru", o(true, false, true, false, false, false)),
+        ("kernels+gru+fused", o(true, false, true, false, false, true)),
+        ("kernels+im2col", o(true, true, false, false, false, false)),
+        ("kernels+im2col+gru", o(true, true, true, false, false, false)),
+        ("kernels+im2col+gru+gemm", o(true, true, true, true, false, false)),
+        ("kernels+im2col+gru+gemm+linear", o(true, true, true, true, true, false)),
+        ("kernels+im2col+gru+gemm+linear+fused", o(true, true, true, true, true, true)),
     ]
 }
 
@@ -127,7 +129,7 @@ fn matches_pytorch() {
     let mut bad = Vec::new();
     let mut kernels_pair0: Option<Vec<f32>> = None;
     for (what, kernels_on) in [("kernels", true), ("plain ops", false)] {
-        st.ops = model::Ops { kernels: kernels_on, conv_im2col: im2col, gru_factored: true, own_gemm: im2col && kernels_on, gemm_linear: im2col && kernels_on };
+        st.ops = model::Ops { kernels: kernels_on, conv_im2col: im2col, gru_factored: true, own_gemm: im2col && kernels_on, gemm_linear: im2col && kernels_on, fused: kernels_on };
         for k in 0..3 {
             let fa = model.features(inp(k, 0), &st);
             let fb = model.features(inp(k, 1), &st);
@@ -144,7 +146,7 @@ fn matches_pytorch() {
             }
         }
     }
-    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col, gemm_linear: im2col };
+    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col, gemm_linear: im2col, fused: true };
     // Where a wrong bidirectional pass departs (it failed now and then with the same wrong flow on MSL and WGSL, the plain
     // ops too), run after every gated pass: traced passes keep every stage alive, which changes what burn fuses and does in
     // place. Pair 0 with the kernels: the first item of a traced bidirectional pass against a traced one-way pass of the
@@ -212,7 +214,8 @@ fn matches_pytorch() {
     }
     let last = &times[times.len() - 5..];
     let mean = last.iter().sum::<f64>() / 5.0;
-    println!("warm, {label}: {mean:.3} s per pass (mean of the last 5 of {} passes: {:?})", times.len(), last.iter().map(|t| format!("{t:.3}")).collect::<Vec<_>>());
+    let sd = (last.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / 5.0).sqrt();
+    println!("warm, {label}: {mean:.3} s per pass, sd {sd:.3} (the last 5 of {} passes: {:?})", times.len(), last.iter().map(|t| format!("{t:.3}")).collect::<Vec<_>>());
     }
 }
 
@@ -269,6 +272,28 @@ fn kernels_match_plain() {
     check("convex upsampling", kernels::convex_upsample(flow.clone(), mask.clone()), model::convex_upsample(flow.clone(), mask));
     let flow8 = rnd([b, 2, H / 8, W / 8], 3.0);
     check("flow doubled", kernels::flow_double(flow8.clone()), model::flow_double(flow8));
+    // The flow head's last convolution (256 -> 2, 3x3) by conv_small, against burn
+    {
+        let x = rnd([b, 256, h, w], 1.0);
+        let wt = rnd([2, 256, 3, 3], 0.02);
+        let bias = Tensor::<1>::random([2], Distribution::Normal(0.0, 0.1), &device);
+        let want = burn::tensor::module::conv2d(x.clone(), wt.clone(), Some(bias.clone()), burn::tensor::ops::ConvOptions::new([1, 1], [1, 1], [1, 1], 1));
+        check("conv_small 256->2 3x3", kernels::conv_small(x, wt, bias, 1, 1), want);
+    }
+    // Split-window attention at both sizes of the model, shifted and not, at the one-way and bidirectional batches (f0
+    // and f1 concatenated: 2 and 4), against the plain operations
+    for (hh, ww, splits) in [(H / 4, W / 4, 8usize), (H / 8, W / 8, 2)] {
+        let win = model::Windows::new(hh, ww, splits, &device);
+        for bn in [2usize, 4] {
+            let r3 = |s: [usize; 3]| Tensor::<3>::random(s, Distribution::Normal(0.0, 1.0), &device);
+            let (q, k, v) = (r3([bn, hh * ww, c]), r3([bn, hh * ww, c]), r3([bn, hh * ww, c]));
+            for shift in [false, true] {
+                let got = kernels::window_attention(q.clone(), k.clone(), v.clone(), hh, ww, splits, shift);
+                let want = model::split_window_attention(q.clone(), k.clone(), v.clone(), &win, shift, false);
+                check(&format!("window attention {hh}x{ww}/{splits} b{bn} shift {shift}"), got.unsqueeze_dim::<4>(0), want.unsqueeze_dim::<4>(0));
+            }
+        }
+    }
     // Convolutions of the shapes of the model as im2col + matmul, against burn
     for (cin, cout, kh, kw, stride, ph, pw, hh, ww) in [(3usize, 64usize, 7usize, 7usize, 2usize, 3usize, 3usize, H, W), (64, 64, 3, 3, 1, 1, 1, H / 2, W / 2), (256, 192, 3, 3, 1, 1, 1, h, w), (384, 128, 1, 5, 1, 0, 2, h, w), (384, 128, 5, 1, 1, 2, 0, h, w)] {
         let x = rnd([2, cin, hh, ww], 1.0);
@@ -479,6 +504,7 @@ fn stage_times() {
         let mut order: Vec<String> = Vec::new();
         let mut sums: std::collections::HashMap<String, f64> = Default::default();
         let mut total = 0.0;
+        let mut totals = Vec::new();
         for (start, marks) in &runs {
             let mut prev = *start;
             for (n, t) in marks {
@@ -488,9 +514,10 @@ fn stage_times() {
                 prev = *t;
             }
             total += (prev - *start).as_secs_f64();
+            totals.push(format!("{:.3}", (prev - *start).as_secs_f64()));
         }
         let k = runs.len() as f64;
-        println!("{what} ({want}): {:.3} s per pass with a wait at each stage (mean of {})", total / k, runs.len());
+        println!("{what} ({want}): {:.3} s per pass with a wait at each stage (mean of {}: {totals:?})", total / k, runs.len());
         for l in order {
             let v = sums[&l] / k;
             println!("  {l:22} {:8.1} ms  {:5.1} %", v * 1e3, 100.0 * v * k / total);
@@ -594,6 +621,15 @@ fn matmul_ceiling() {
     let q = rnd3([2 * 64, 180, 128]);
     let kt = rnd3([2 * 64, 128, 180]);
     time("window attention @1/4 x2: [128,180,128]@[128,128,180]", 2.0 * (128 * 180 * 180 * 128) as f64, &|| first(q.clone().matmul(kt.clone())));
+    // The whole attention of a shifted layer at 1/4 (both matmuls, mask, softmax, window layout), as the model runs it
+    {
+        let (hh, ww) = (H / 4, W / 4);
+        let win = model::Windows::new(hh, ww, 8, &device);
+        let (aq, ak, av) = (rnd3([2, hh * ww, 128]), rnd3([2, hh * ww, 128]), rnd3([2, hh * ww, 128]));
+        let fl = 2.0 * 2.0 * (128 * 180 * 180 * 128) as f64;
+        time("window attention @1/4 x2, shifted, whole: plain ops", fl, &|| first(model::split_window_attention(aq.clone(), ak.clone(), av.clone(), &win, true, false)));
+        time("window attention @1/4 x2, shifted, whole: kernels", fl, &|| first(kernels::window_attention(aq.clone(), ak.clone(), av.clone(), hh, ww, 8, true)));
+    }
     let s = rnd2([2048, 2048]);
     time("square 2048^3", 2.0 * 2048f64.powi(3), &|| first2(s.clone().matmul(s.clone())));
     let like = Tensor::<1>::zeros([1 << 20], &device);
@@ -612,7 +648,7 @@ fn bidirectional_repeat() {
     let model = load(&device);
     let mut st = Statics::new(H, W, &device);
     let im2col = std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true);
-    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col, gemm_linear: im2col };
+    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col, gemm_linear: im2col, fused: true };
     let inp = |k: usize, i: usize| tensor4(&dir.join(format!("pair{k}_in{i}.f32")), [1, 3, H, W], &device);
     let mut bad = Vec::new();
     for k in 0..3 {

@@ -612,6 +612,341 @@ fn launch_gemm(a: CubeTensor, b: CubeTensor, bias: Option<CubeTensor>, tile: Gem
     out
 }
 
+// ---------------------------------------------------------------- split-window attention and small convolutions
+
+/// The row of q, k, v [B, H*W, C] (as [B*H*W, C]) at position p of window bw of split-window attention (unimatch
+/// split_feature: windows in row-major order per image, positions row-major in a window), the map rolled by minus half a
+/// window first when shifted (torch.roll(x, -s): out[i] = in[i + s]). The output goes back to the same row (merge_splits,
+/// then the roll by plus half a window), so neither the window layout nor the roll is made in memory
+#[cube]
+fn window_token(bw: usize, p: usize, #[comptime] h: usize, #[comptime] w: usize, #[comptime] splits: usize, #[comptime] shift: bool) -> usize {
+    let wh = comptime!(h / splits);
+    let ww = comptime!(w / splits);
+    let kk = comptime!(splits * splits);
+    let b = bw / kk;
+    let wi = bw % kk;
+    let mut y = (wi / splits) * wh + p / ww;
+    let mut x = (wi % splits) * ww + p % ww;
+    if shift {
+        y = (y + comptime!(wh / 2)) % h;
+        x = (x + comptime!(ww / 2)) % w;
+    }
+    (b * h + y) * w + x
+}
+
+/// generate_shift_window_attn_mask: the region (0, 1, 2) of coordinate v of a side n split into windows of `win`, at the
+/// borders of the windows shifted by half a window
+#[cube]
+fn shift_region(v: usize, #[comptime] n: usize, #[comptime] win: usize) -> usize {
+    let mut r = 2usize;
+    if v < comptime!(n - win) {
+        r = 0usize;
+    } else if v < comptime!(n - win / 2) {
+        r = 1usize;
+    }
+    r
+}
+
+/// The label of position p of window wi in the shifted map (the attention mask is -100 between different labels)
+#[cube]
+fn shift_label(wi: usize, p: usize, #[comptime] h: usize, #[comptime] w: usize, #[comptime] splits: usize) -> usize {
+    let wh = comptime!(h / splits);
+    let ww = comptime!(w / splits);
+    shift_region((wi / splits) * wh + p / ww, h, wh) * 3usize + shift_region((wi % splits) * ww + p % ww, w, ww)
+}
+
+/// The two matmuls of split-window attention, one cube per block of one window (the tiling and inner loop of gemm_kernel):
+/// with `scores`, q @ k^T / sqrt(C) of each window [Bw, L, L] (k read transposed: the channel index fastest, so that
+/// neighbouring threads read neighbouring values of one key; staged with rows padded by 4 as a is); otherwise
+/// probabilities [Bw, L, L] @ v of each window, written to the rows of the positions [B*H*W, C]
+#[cube(launch)]
+fn window_attn_gemm_kernel<F: Float>(
+    a: &Tensor<F>,       // scores: q [B, H*W, C]; else: probabilities [Bw, L, L]
+    b: &Tensor<F>,       // scores: k [B, H*W, C]; else: v [B, H*W, C]
+    out: &mut Tensor<F>, // scores: [Bw, L, L]; else: [B, H*W, C]
+    #[comptime] scores: bool,
+    #[comptime] shift: bool,
+    #[comptime] h: usize,
+    #[comptime] w: usize,
+    #[comptime] splits: usize,
+    #[comptime] block: usize,
+    #[comptime] kstep: usize,
+    #[comptime] per: usize,
+    #[define(F)] _dtype: ElemType,
+) {
+    let c_n = b.shape(2);
+    let l_n = if scores { out.shape(1) } else { a.shape(1) };
+    let k_n = if scores { c_n } else { l_n };
+    let n_n = if scores { l_n } else { c_n };
+    let bw = CUBE_POS_Z as usize;
+    let bm = block;
+    let bk = kstep;
+    let th = comptime!(block / per);
+    let row_s = comptime!(block + 4);
+    let loads = comptime!(kstep * per * per / block);
+    let m0 = CUBE_POS_Y as usize * bm;
+    let n0 = CUBE_POS_X as usize * bm;
+    let tx = UNIT_POS_X as usize;
+    let ty = UNIT_POS_Y as usize;
+    let t = ty * th + tx;
+    let zero = F::new(0.0_f32);
+    let mut a_s = Shared::<[F]>::new_slice(comptime!(kstep * (block + 4)));
+    let mut b_s = Shared::<[F]>::new_slice(comptime!(kstep * (block + 4)));
+    let mut acc = Array::<F>::new(comptime!(per * per));
+    let mut bv = Array::<F>::new(per);
+    #[unroll]
+    for i in 0..per * per {
+        acc[i] = zero;
+    }
+    let k_tiles = (k_n + bk - 1usize) / bk;
+    for kt in 0..k_tiles {
+        let k0 = kt * bk;
+        #[unroll]
+        for e in 0..loads {
+            let idx = t + e * th * th;
+            let am = idx / bk;
+            let ak = idx % bk;
+            let mut va = zero;
+            if m0 + am < l_n && k0 + ak < k_n {
+                let row = if scores { window_token(bw, m0 + am, h, w, splits, shift) } else { bw * l_n + m0 + am };
+                va = a[row * k_n + k0 + ak];
+            }
+            a_s[ak * row_s + am] = va;
+            let mut vb = zero;
+            if scores {
+                let bn = idx / bk;
+                let bkk = idx % bk;
+                if k0 + bkk < k_n && n0 + bn < n_n {
+                    vb = b[window_token(bw, n0 + bn, h, w, splits, shift) * c_n + k0 + bkk];
+                }
+                b_s[bkk * row_s + bn] = vb;
+            } else {
+                let bkk = idx / bm;
+                let bn = idx % bm;
+                if k0 + bkk < k_n && n0 + bn < n_n {
+                    vb = b[window_token(bw, k0 + bkk, h, w, splits, shift) * c_n + n0 + bn];
+                }
+                b_s[bkk * row_s + bn] = vb;
+            }
+        }
+        sync_cube();
+        #[unroll]
+        for kk in 0..bk {
+            #[unroll]
+            for j in 0..per {
+                bv[j] = b_s[kk * row_s + tx + j * th];
+            }
+            #[unroll]
+            for i in 0..per {
+                let av = a_s[kk * row_s + ty + i * th];
+                #[unroll]
+                for j in 0..per {
+                    acc[i * per + j] += av * bv[j];
+                }
+            }
+        }
+        sync_cube();
+    }
+    let scale = F::sqrt(F::cast_from(c_n as u32));
+    #[unroll]
+    for i in 0..per {
+        let row = m0 + ty + i * th;
+        if row < l_n {
+            // The output row: of the window's scores, or of the position (both n_n wide)
+            let orow = if scores { bw * l_n + row } else { window_token(bw, row, h, w, splits, shift) };
+            #[unroll]
+            for j in 0..per {
+                let col = n0 + tx + j * th;
+                if col < n_n {
+                    let v = if scores { acc[i * per + j] / scale } else { acc[i * per + j] };
+                    out[orow * n_n + col] = v;
+                }
+            }
+        }
+    }
+}
+
+/// Threads of a cube of window_softmax_kernel (its reductions halve 64 in 6 steps)
+pub const ATTN_SOFTMAX_THREADS: usize = 64;
+
+/// The softmax of the attention scores [Bw, L, L] over the keys, in place, with the -100 between positions of different
+/// regions of the shifted map added first (as unimatch adds the mask to the scaled scores). One cube per row; the row
+/// maximum and sum by a tree in shared memory (fixed order: the same result every run; no plane operations, which
+/// lavapipe and WGSL on Metal may not have)
+#[cube(launch)]
+fn window_softmax_kernel<F: Float>(
+    s: &mut Tensor<F>, // [Bw, L, L]
+    #[comptime] shift: bool,
+    #[comptime] h: usize,
+    #[comptime] w: usize,
+    #[comptime] splits: usize,
+    #[define(F)] _dtype: ElemType,
+) {
+    let l_n = s.shape(2);
+    let row = CUBE_POS_Y as usize * l_n + CUBE_POS_X as usize;
+    let t = UNIT_POS_X as usize;
+    let threads = comptime!(ATTN_SOFTMAX_THREADS);
+    let wi = (row / l_n) % comptime!(splits * splits);
+    let p = row % l_n;
+    let base = row * l_n;
+    let label_p = shift_label(wi, p, h, w, splits);
+    let per_thread = (l_n + threads - 1usize) / threads;
+    let mut red = Shared::<[F]>::new_slice(threads);
+    let minus = F::new(-100.0_f32);
+    let mut m = F::new(-1e30_f32);
+    for e in 0..per_thread {
+        let j = t + e * threads;
+        if j < l_n {
+            let mut v = s[base + j];
+            if shift {
+                if shift_label(wi, j, h, w, splits) != label_p {
+                    v += minus;
+                }
+            }
+            m = Max::max(m, v);
+        }
+    }
+    red[t] = m;
+    sync_cube();
+    let mut half = 32usize;
+    for _ in 0..6usize {
+        if t < half {
+            red[t] = Max::max(red[t], red[t + half]);
+        }
+        sync_cube();
+        half = half / 2usize;
+    }
+    let m = red[0];
+    sync_cube();
+    let mut sum = F::new(0.0_f32);
+    for e in 0..per_thread {
+        let j = t + e * threads;
+        if j < l_n {
+            let mut v = s[base + j];
+            if shift {
+                if shift_label(wi, j, h, w, splits) != label_p {
+                    v += minus;
+                }
+            }
+            let ex = F::exp(v - m);
+            s[base + j] = ex;
+            sum += ex;
+        }
+    }
+    red[t] = sum;
+    sync_cube();
+    let mut half = 32usize;
+    for _ in 0..6usize {
+        if t < half {
+            red[t] = red[t] + red[t + half];
+        }
+        sync_cube();
+        half = half / 2usize;
+    }
+    let total = red[0];
+    for e in 0..per_thread {
+        let j = t + e * threads;
+        if j < l_n {
+            s[base + j] = s[base + j] / total;
+        }
+    }
+}
+
+fn launch_window_attention(q: CubeTensor, k: CubeTensor, v: CubeTensor, h: usize, w: usize, splits: usize, shift: bool) -> CubeTensor {
+    let (q, k, v) = (into_contiguous(q), into_contiguous(k), into_contiguous(v));
+    let s = q.meta.shape().clone();
+    assert!(s[1] == h * w && h % splits == 0 && w % splits == 0, "window_attention: {s:?} for {h}x{w} in {splits}x{splits} windows");
+    assert_eq!(ATTN_SOFTMAX_THREADS, 64, "window_softmax_kernel reduces 64 values");
+    let (b_n, c_n) = (s[0], s[2]);
+    let l = (h / splits) * (w / splits);
+    let bw = b_n * splits * splits;
+    let dtype = q.dtype;
+    let tile = GEMM_DEFAULT;
+    let dim = CubeDim::new_2d(tile.threads() as u32, tile.threads() as u32);
+    let scores_shape = Shape::new([bw, l, l]);
+    let buffer = q.client.empty(scores_shape.num_elements() * dtype.size());
+    let scores = CubeTensor::new_contiguous(q.client.clone(), q.device.clone(), scores_shape, buffer, dtype);
+    let count = cubecl::CubeCount::Static(l.div_ceil(tile.block) as u32, l.div_ceil(tile.block) as u32, bw as u32);
+    window_attn_gemm_kernel::launch(&scores.client, count, dim, q.clone().into_tensor_arg(), k.into_tensor_arg(), scores.clone().into_tensor_arg(), true, shift, h, w, splits, tile.block, tile.kstep, tile.per, dtype_to_storage_type(dtype));
+    let count = cubecl::CubeCount::Static(l as u32, bw as u32, 1);
+    window_softmax_kernel::launch(&scores.client, count, CubeDim::new_2d(ATTN_SOFTMAX_THREADS as u32, 1), scores.clone().into_tensor_arg(), shift, h, w, splits, dtype_to_storage_type(dtype));
+    let buffer = q.client.empty(s.num_elements() * dtype.size());
+    let out = CubeTensor::new_contiguous(q.client.clone(), q.device.clone(), s, buffer, dtype);
+    let count = cubecl::CubeCount::Static(c_n.div_ceil(tile.block) as u32, l.div_ceil(tile.block) as u32, bw as u32);
+    window_attn_gemm_kernel::launch(&out.client, count, dim, scores.into_tensor_arg(), v.into_tensor_arg(), out.clone().into_tensor_arg(), false, shift, h, w, splits, tile.block, tile.kstep, tile.per, dtype_to_storage_type(dtype));
+    out
+}
+
+/// A convolution with few output channels (the flow head's last, 256 -> 2, 3x3): one thread per output position computing
+/// all its output channels, so each input value of the position is read once (im2col + matmul made a 106 MB column
+/// buffer each refinement step for 0.1 GFLOP). Stride 1, symmetric zero padding; the bias added last, as after a matmul
+#[cube(launch)]
+fn conv_small_kernel<F: Float>(
+    x: &Tensor<F>,       // [N, C, H, W]
+    weight: &Tensor<F>,  // [CO, C, KH, KW]
+    bias: &Tensor<F>,    // [CO]
+    out: &mut Tensor<F>, // [N, CO, OH, OW]
+    #[comptime] co: usize,
+    #[comptime] kh: usize,
+    #[comptime] kw: usize,
+    #[comptime] ph: usize,
+    #[comptime] pw: usize,
+    #[define(F)] _dtype: ElemType,
+) {
+    let idx = ABSOLUTE_POS as usize;
+    let (n_n, c_n, h, w) = (x.shape(0), x.shape(1), x.shape(2), x.shape(3));
+    let (oh, ow) = (out.shape(2), out.shape(3));
+    if idx >= n_n * oh * ow {
+        terminate!();
+    }
+    let ox = idx % ow;
+    let oy = (idx / ow) % oh;
+    let n = idx / (oh * ow);
+    let phi = comptime!(ph as i32);
+    let pwi = comptime!(pw as i32);
+    let mut acc = Array::<F>::new(co);
+    #[unroll]
+    for o in 0..co {
+        acc[o] = F::new(0.0_f32);
+    }
+    for c in 0..c_n {
+        let base = (n * c_n + c) * h * w;
+        for ky in 0..kh {
+            let sy = oy as i32 + ky as i32 - phi;
+            for kx in 0..kw {
+                let sx = ox as i32 + kx as i32 - pwi;
+                if sy >= 0 && sy < h as i32 && sx >= 0 && sx < w as i32 {
+                    let v = x[base + sy as usize * w + sx as usize];
+                    #[unroll]
+                    for o in 0..co {
+                        acc[o] += v * weight[((o * c_n + c) * kh + ky) * kw + kx];
+                    }
+                }
+            }
+        }
+    }
+    let p = oy * ow + ox;
+    #[unroll]
+    for o in 0..co {
+        out[(n * co + o) * oh * ow + p] = acc[o] + bias[o];
+    }
+}
+
+fn conv_small_shape(x: &Shape, weight: &Shape, ph: usize, pw: usize) -> Shape {
+    Shape::new([x[0], weight[0], x[2] + 2 * ph - weight[2] + 1, x[3] + 2 * pw - weight[3] + 1])
+}
+
+fn launch_conv_small(x: CubeTensor, weight: CubeTensor, bias: CubeTensor, ph: usize, pw: usize) -> CubeTensor {
+    let (x, weight, bias) = (into_contiguous(x), into_contiguous(weight), into_contiguous(bias));
+    let ws = weight.meta.shape().clone();
+    let shape = conv_small_shape(x.meta.shape(), &ws, ph, pw);
+    let n = shape[0] * shape[2] * shape[3];
+    let dtype = x.dtype;
+    let (out, count, dim) = output_for(&x, shape, n);
+    conv_small_kernel::launch(&out.client, count, dim, x.into_tensor_arg(), weight.into_tensor_arg(), bias.into_tensor_arg(), out.clone().into_tensor_arg(), ws[0], ws[2], ws[3], ph, pw, dtype_to_storage_type(dtype));
+    out
+}
+
 // ---------------------------------------------------------------- preprocessing on the GPU
 
 /// A frame of 8-bit grey (luma), packed 3 bytes to an i32 word (always positive, so that no conversion can change it), as
@@ -760,6 +1095,10 @@ pub trait GmflowKernels: burn::backend::Backend {
     fn im2col(x: FloatTensor<Self>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> FloatTensor<Self>;
     #[fusion(dtype = a, shape = gemm_shape(a, b))]
     fn gemm(a: FloatTensor<Self>, b: FloatTensor<Self>, bias: FloatTensor<Self>, has_bias: bool, block: usize, kstep: usize, per: usize) -> FloatTensor<Self>;
+    #[fusion(dtype = q, shape = q)]
+    fn window_attention(q: FloatTensor<Self>, k: FloatTensor<Self>, v: FloatTensor<Self>, h: usize, w: usize, splits: usize, shift: bool) -> FloatTensor<Self>;
+    #[fusion(dtype = x, shape = conv_small_shape(x, weight, *ph, *pw))]
+    fn conv_small(x: FloatTensor<Self>, weight: FloatTensor<Self>, bias: FloatTensor<Self>, ph: usize, pw: usize) -> FloatTensor<Self>;
     #[fusion(meta = preprocess_meta)]
     #[allow(clippy::too_many_arguments)]
     fn preprocess(frame: IntTensor<Self>, w0: usize, new_w: usize, new_h: usize, pad_x: usize, pad_y: usize, out_h: usize, out_w: usize) -> FloatTensor<Self>;
@@ -786,6 +1125,12 @@ impl GmflowKernels for CubeBackend {
     }
     fn gemm(a: FloatTensor<Self>, b: FloatTensor<Self>, bias: FloatTensor<Self>, has_bias: bool, block: usize, kstep: usize, per: usize) -> FloatTensor<Self> {
         launch_gemm(a, b, has_bias.then_some(bias), GemmTile { block, kstep, per })
+    }
+    fn window_attention(q: FloatTensor<Self>, k: FloatTensor<Self>, v: FloatTensor<Self>, h: usize, w: usize, splits: usize, shift: bool) -> FloatTensor<Self> {
+        launch_window_attention(q, k, v, h, w, splits, shift)
+    }
+    fn conv_small(x: FloatTensor<Self>, weight: FloatTensor<Self>, bias: FloatTensor<Self>, ph: usize, pw: usize) -> FloatTensor<Self> {
+        launch_conv_small(x, weight, bias, ph, pw)
     }
     fn preprocess(frame: IntTensor<Self>, w0: usize, new_w: usize, new_h: usize, pad_x: usize, pad_y: usize, out_h: usize, out_w: usize) -> FloatTensor<Self> {
         launch_preprocess(frame, w0, new_w, new_h, pad_x, pad_y, out_h, out_w)
@@ -838,6 +1183,18 @@ pub fn gemm_tiled(a: BurnTensor<3>, b: BurnTensor<3>, bias: Option<BurnTensor<1>
     let has_bias = bias.is_some();
     let bias = match bias { Some(v) => v.into_dispatch(), None => a.clone().into_dispatch() };
     BurnTensor::from_dispatch(Dispatch::gemm(a.into_dispatch(), b.into_dispatch(), bias, has_bias, tile.block, tile.kstep, tile.per))
+}
+
+/// unimatch single_head_split_window_attention without the window layout or the roll in memory, in three launches (scores,
+/// masked softmax, probabilities @ v): q, k, v [B, H*W, C] of an H x W map in splits x splits windows -> [B, H*W, C]
+pub fn window_attention(q: BurnTensor<3>, k: BurnTensor<3>, v: BurnTensor<3>, h: usize, w: usize, splits: usize, shift: bool) -> BurnTensor<3> {
+    BurnTensor::from_dispatch(Dispatch::window_attention(q.into_dispatch(), k.into_dispatch(), v.into_dispatch(), h, w, splits, shift))
+}
+
+/// A stride-1 convolution with few output channels (conv_small_kernel): x [N, C, H, W], weight [CO, C, KH, KW], bias [CO]
+/// -> [N, CO, H + 2 ph - KH + 1, W + 2 pw - KW + 1]
+pub fn conv_small(x: BurnTensor<4>, weight: BurnTensor<4>, bias: BurnTensor<1>, ph: usize, pw: usize) -> BurnTensor<4> {
+    BurnTensor::from_dispatch(Dispatch::conv_small(x.into_dispatch(), weight.into_dispatch(), bias.into_dispatch(), ph, pw))
 }
 
 /// A 2D convolution (symmetric zero padding, no dilation or groups) as im2col + one batched matmul, the columns made in
