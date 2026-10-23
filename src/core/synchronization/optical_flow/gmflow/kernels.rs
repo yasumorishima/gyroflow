@@ -488,6 +488,10 @@ impl GemmTile {
 }
 
 pub const GEMM_DEFAULT: GemmTile = GemmTile { block: 64, kstep: 8, per: 4 };
+/// The tiling of gemm4 that gemm uses. Measured on the macOS CI GPU (conv / GRU / FFN shapes, GFLOPS), WGSL: 4x4 569 / 577 /
+/// 641 (gemm_kernel 64 / 8 / 4: 457 / 498 / 530), 8x4 321 / 405 / 449, 4x8 431 / 472 / 486, 8x8 244 / 329 / 332; MSL 4x4
+/// 599 / 611 / 671, 4x8 fastest at 653 / 662 / 681 (MSL keeps burn's matmuls on its matrix units)
+pub const GEMM4_DEFAULT: Gemm4Tile = Gemm4Tile { pm: 4, pn: 4, kstep: 8 };
 /// Threads per side of every tiling used (the workgroup is GEMM_THREADS squared)
 pub const GEMM_THREADS: usize = 16;
 
@@ -1311,9 +1315,9 @@ pub fn im2col(x: BurnTensor<4>, kh: usize, kw: usize, stride: usize, ph: usize, 
 }
 
 /// a [Ba, M, K] @ b [Bb, K, N] (+ bias [M] per row) -> [max(Ba, Bb), M, N], a batch of 1 shared by all: the matmul for
-/// devices without f32 matrix units (gemm_kernel)
+/// devices without f32 matrix units. gemm4_kernel with GEMM4_DEFAULT where N is a multiple of 4, gemm_kernel otherwise
 pub fn gemm(a: BurnTensor<3>, b: BurnTensor<3>, bias: Option<BurnTensor<1>>) -> BurnTensor<3> {
-    gemm_tiled(a, b, bias, GEMM_DEFAULT)
+    gemm4_tiled(a, b, bias, GEMM4_DEFAULT)
 }
 
 /// gemm with a given tiling (the tests measure several)
@@ -1332,7 +1336,7 @@ pub fn gemm4_tiled(a: BurnTensor<3>, b: BurnTensor<3>, bias: Option<BurnTensor<1
     // f32 (the model's type)
     assert!(tile.kstep * (16 * tile.pm + 4 + 16 * tile.pn) * 4 <= 16 << 10, "gemm4: tiling {tile:?} needs more than 16 KiB of shared memory");
     if b.dims()[2] % 4 != 0 {
-        return gemm(a, b, bias);
+        return gemm_tiled(a, b, bias, GEMM_DEFAULT);
     }
     let has_bias = bias.is_some();
     let bias = match bias { Some(v) => v.into_dispatch(), None => a.clone().into_dispatch() };

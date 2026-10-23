@@ -25,8 +25,9 @@ const GEMM_TILES: [kernels::GemmTile; 5] = [
 ];
 
 /// The tilings of kernels::gemm4 checked and timed (rows / columns per thread, k step)
-const GEMM4_TILES: [kernels::Gemm4Tile; 4] = [
-    kernels::Gemm4Tile { pm: 4, pn: 4, kstep: 8 },
+const GEMM4_TILES: [kernels::Gemm4Tile; 5] = [
+    kernels::GEMM4_DEFAULT,
+    kernels::Gemm4Tile { pm: 4, pn: 4, kstep: 16 },
     kernels::Gemm4Tile { pm: 8, pn: 4, kstep: 8 },
     kernels::Gemm4Tile { pm: 4, pn: 8, kstep: 8 },
     kernels::Gemm4Tile { pm: 8, pn: 8, kstep: 8 },
@@ -318,13 +319,14 @@ fn kernels_match_plain() {
     // block and k not a multiple of the 8, 16 or 32 step (every tiling meets partial tiles in all three); a scaled by 1/sqrt(K) so that the outputs are of order 1
     let rnd3 = |shape: [usize; 3], sd: f64| Tensor::<3>::random(shape, Distribution::Normal(0.0, sd), &device);
     assert_eq!(GEMM_TILES[0], kernels::GEMM_DEFAULT, "the default tiling comes first");
+    assert_eq!(GEMM4_TILES[0], kernels::GEMM4_DEFAULT, "the default gemm4 tiling comes first");
     for (ba, bb, m, k, nn) in [(1usize, 1usize, 192usize, 2304usize, 11520usize), (1, 2, 126, 1152, 11520), (1, 2, 384, 640, 11520), (1, 1, 64, 147, 46080), (2, 2, 180, 128, 180), (1, 2, 2, 1152, 11520), (2, 1, 100, 256, 500)] {
         let a = rnd3([ba, m, k], 1.0 / (k as f64).sqrt());
         let bm = rnd3([bb, k, nn], 1.0);
         let want = a.clone().matmul(bm.clone()).unsqueeze_dim::<4>(0);
         check(&format!("gemm [{ba},{m},{k}]x[{bb},{k},{nn}]"), kernels::gemm(a.clone(), bm.clone(), None).unsqueeze_dim::<4>(0), want.clone());
-        // gemm is gemm_tiled with GEMM_TILES[0]: the others
-        for tile in &GEMM_TILES[1..] {
+        // gemm is gemm4 (or gemm_tiled with GEMM_TILES[0] where N is not a multiple of 4): every gemm_kernel tiling
+        for tile in &GEMM_TILES {
             let tile = *tile;
             let label = format!("gemm {}/{}/{} [{ba},{m},{k}]x[{bb},{k},{nn}]", tile.block, tile.kstep, tile.per);
             check(&label, kernels::gemm_tiled(a.clone(), bm.clone(), None, tile).unsqueeze_dim::<4>(0), want.clone());
@@ -340,7 +342,7 @@ fn kernels_match_plain() {
         let bias = Tensor::<1>::random([100], Distribution::Normal(0.0, 0.1), &device);
         let want = (a.clone().matmul(bm.clone()) + bias.clone().reshape([1, 100, 1])).unsqueeze_dim::<4>(0);
         check("gemm with bias [1,100,300]x[2,300,333]", kernels::gemm(a.clone(), bm.clone(), Some(bias.clone())).unsqueeze_dim::<4>(0), want.clone());
-        for tile in &GEMM_TILES[1..] {
+        for tile in &GEMM_TILES {
             let tile = *tile;
             let label = format!("gemm {}/{}/{} with bias [1,100,300]x[2,300,333]", tile.block, tile.kstep, tile.per);
             check(&label, kernels::gemm_tiled(a.clone(), bm.clone(), Some(bias.clone()), tile).unsqueeze_dim::<4>(0), want.clone());
