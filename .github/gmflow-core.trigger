@@ -11,3 +11,4 @@ ab5d253 gmflow: own register-tiled matmul (kernels::gemm) for the im2col convolu
 40fe539 gmflow: gemm kernel with usize literals (an untyped 0 in a branch was taken as i32 by the cube macro)
 549fc5f gmflow: gemm with 128 x 128 blocks, 8 x 8 outputs a thread, k step 8 (4 multiply-adds per value read from shared memory), rows of a padded to 132; burn for convolutions of under 32 outputs
 gemm tilings and gemm_linear 2026-10-22T23:42:48Z
+gemm 64/8/4 and linear layers 2026-10-23T02:22:27Z
