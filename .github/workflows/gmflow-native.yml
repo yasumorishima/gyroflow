@@ -100,7 +100,10 @@ jobs:
           grep -q "test result: ok. 1 passed" preprocess.log
       - name: Each kernel against the plain operations it replaces
         run: |
-          cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact kernels_match_plain 2>&1 | tee kernels.log
+          # Autotune as usual (its cache on, which matches_pytorch then reads), its choices logged
+          { echo '[autotune.logger]'; echo 'level = "full"'; echo 'file = "autotune_kernels.log"'; } > cubecl.toml
+          cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact kernels_match_plain 2>&1 | tee kernels.log || true
+          rm -f cubecl.toml
           grep -q "test result: ok. 1 passed" kernels.log
       - name: burn's bilinear interpolation with each cubek strategy, batches 1 to 3 (the occasional bidirectional failure)
         run: |
@@ -126,7 +129,7 @@ jobs:
           cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matches_pytorch 2>&1 | tee pytorch.log || true
           rm -f cubecl.toml
           grep -q "test result: ok. 1 passed" pytorch.log
-      - name: matches_pytorch 4 more times in fresh processes, autotune cache off (the occasional bidirectional failure; counted, not gated)
+      - name: matches_pytorch 4 more times, each after kernels_match_plain on an empty autotune cache (the occasional bidirectional failure; counted, not gated)
         if: matrix.best != '' && !cancelled()
         env:
           GMFLOW_BPK: ${{ runner.temp }}/gmflow.bpk
@@ -134,27 +137,26 @@ jobs:
           GMFLOW_WARM_RUNS: '0'
           GMFLOW_IM2COL: ${{ matrix.im2col }}
         run: |
-          # It failed in runs whose autotune had nothing cached for these shapes: each run tunes afresh, its choices
-          # logged; the stage-by-stage lines (BISTAGE) of a failed run show where the bidirectional pass departs
+          # Every failure so far came in matches_pytorch with autotune's cache on, after kernels_match_plain had tuned and
+          # stored keys (bucketed shapes) that the model reuses; 22 runs with the cache off all passed. Each round here:
+          # the cache emptied (cubecl keeps it in target/environment at the workspace root), kernels_match_plain, then
+          # matches_pytorch with the cache on, both logged
           failed=0
           for i in 1 2 3 4; do
-            {
-              echo '[autotune]'
-              echo 'disable_cache = true'
-              echo '[autotune.logger]'
-              echo 'level = "full"'
-              echo 'file = "autotune_again_'"$i"'.log"'
-            } > cubecl.toml
-            if cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matches_pytorch > again_$i.log 2>&1; then
-              echo "run $i: ok"
+            rm -rf "$GITHUB_WORKSPACE/target/environment"
+            { echo '[autotune.logger]'; echo 'level = "full"'; echo 'file = "autotune_seed_'"$i"'.log"'; } > cubecl.toml
+            cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact kernels_match_plain > seed_$i.log 2>&1 || echo "round $i: kernels_match_plain failed"
+            { echo '[autotune.logger]'; echo 'level = "full"'; echo 'file = "autotune_seeded_'"$i"'.log"'; } > cubecl.toml
+            if cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matches_pytorch > seeded_$i.log 2>&1; then
+              echo "round $i: ok"
             else
-              echo "run $i: FAILED"; failed=$((failed + 1))
-              grep -E '^(BISTAGE|AFTER)' again_$i.log || true
+              echo "round $i: FAILED"; failed=$((failed + 1))
+              grep -E '^(BISTAGE|AFTER)' seeded_$i.log || true
             fi
-            grep -E '^bidirectional \(kernels\) pair 0' again_$i.log || true
+            grep -E '^bidirectional \(kernels\) pair 0' seeded_$i.log || true
           done
           rm -f cubecl.toml
-          echo "failed runs: $failed of 4"
+          echo "failed rounds: $failed of 4"
       - name: The bidirectional pass 6 times in fresh processes, autotune cache off, its choices logged
         if: matrix.best != ''
         env:
