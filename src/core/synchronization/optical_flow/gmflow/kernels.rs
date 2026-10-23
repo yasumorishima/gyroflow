@@ -638,7 +638,7 @@ fn gemm4_kernel<F: Float, N: Size>(
     #[define(F)] _dtype: ElemType,
 ) {
     let (m_n, k_n, n_n) = (a.shape(1), a.shape(2), b.shape(2));
-    let nv = n_n / 4usize;
+    let nv = n_n / b.vector_size();
     let batch = CUBE_POS_Z as usize;
     let a_off = if a.shape(0) == 1usize { 0usize } else { batch * m_n * k_n };
     let b_off = if b.shape(0) == 1usize { 0usize } else { batch * k_n * nv };
@@ -732,6 +732,8 @@ fn launch_gemm4(a: CubeTensor, b: CubeTensor, bias: Option<CubeTensor>, tile: Ge
     assert!(sa[2] == sb[1], "gemm4: inner dimensions {} and {}", sa[2], sb[1]);
     assert!(sa[0] == sb[0] || sa[0] == 1 || sb[0] == 1, "gemm4: batches {} and {}", sa[0], sb[0]);
     assert!(sb[2] % 4 == 0 && tile.pn % 4 == 0, "gemm4: {} columns, tiling {tile:?}", sb[2]);
+    // gemm4_kernel indexes its 16 x 16 threads and 4-wide vectors with literals
+    assert_eq!(GEMM_THREADS, 16, "gemm4: threads per side");
     let shape = gemm_shape(&sa, &sb);
     let (batch, m, n) = (shape[0], shape[1], shape[2]);
     let dtype = a.dtype;
@@ -1326,11 +1328,12 @@ pub fn gemm_tiled(a: BurnTensor<3>, b: BurnTensor<3>, bias: Option<BurnTensor<1>
 
 /// gemm by gemm4_kernel with a given tiling; columns not a multiple of 4: gemm (the tests measure and check several)
 pub fn gemm4_tiled(a: BurnTensor<3>, b: BurnTensor<3>, bias: Option<BurnTensor<1>>, tile: Gemm4Tile) -> BurnTensor<3> {
+    assert!(tile.pn % 4 == 0 && (16 * tile.pm * tile.kstep) % 256 == 0, "gemm4: tiling {tile:?}");
+    // f32 (the model's type)
+    assert!(tile.kstep * (16 * tile.pm + 4 + 16 * tile.pn) * 4 <= 16 << 10, "gemm4: tiling {tile:?} needs more than 16 KiB of shared memory");
     if b.dims()[2] % 4 != 0 {
         return gemm(a, b, bias);
     }
-    assert!(tile.pn % 4 == 0 && (16 * tile.pm * tile.kstep) % 256 == 0, "gemm4: tiling {tile:?}");
-    assert!(tile.kstep * (16 * tile.pm + 4 + 16 * tile.pn) * 4 <= 16 << 10, "gemm4: tiling {tile:?} needs more than 16 KiB of shared memory");
     let has_bias = bias.is_some();
     let bias = match bias { Some(v) => v.into_dispatch(), None => a.clone().into_dispatch() };
     BurnTensor::from_dispatch(Dispatch::gemm4(a.into_dispatch(), b.into_dispatch(), bias, has_bias, tile.pm, tile.pn, tile.kstep))

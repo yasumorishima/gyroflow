@@ -345,7 +345,11 @@ fn kernels_match_plain() {
             let label = format!("gemm {}/{}/{} with bias [1,100,300]x[2,300,333]", tile.block, tile.kstep, tile.per);
             check(&label, kernels::gemm_tiled(a.clone(), bm.clone(), Some(bias.clone()), tile).unsqueeze_dim::<4>(0), want.clone());
         }
-        // gemm4 with a bias, columns a multiple of 4 (333 above falls back to gemm)
+        for tile in GEMM4_TILES {
+            let label = format!("gemm4 {}x{}/{} with bias [1,100,300]x[2,300,333] (gemm)", tile.pm, tile.pn, tile.kstep);
+            check(&label, kernels::gemm4_tiled(a.clone(), bm.clone(), Some(bias.clone()), tile).unsqueeze_dim::<4>(0), want.clone());
+        }
+        // gemm4 with a bias, columns a multiple of 4 (333 falls back to gemm)
         let b4 = rnd3([2, 300, 332], 1.0);
         let want4 = (a.clone().matmul(b4.clone()) + bias.clone().reshape([1, 100, 1])).unsqueeze_dim::<4>(0);
         for tile in GEMM4_TILES {
