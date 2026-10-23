@@ -126,6 +126,35 @@ jobs:
           cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matches_pytorch 2>&1 | tee pytorch.log || true
           rm -f cubecl.toml
           grep -q "test result: ok. 1 passed" pytorch.log
+      - name: matches_pytorch 4 more times in fresh processes, autotune cache off (the occasional bidirectional failure; counted, not gated)
+        if: matrix.best != '' && !cancelled()
+        env:
+          GMFLOW_BPK: ${{ runner.temp }}/gmflow.bpk
+          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
+          GMFLOW_WARM_RUNS: '0'
+          GMFLOW_IM2COL: ${{ matrix.im2col }}
+        run: |
+          # It failed in runs whose autotune had nothing cached for these shapes: each run tunes afresh, its choices
+          # logged; the stage-by-stage lines (BISTAGE) of a failed run show where the bidirectional pass departs
+          failed=0
+          for i in 1 2 3 4; do
+            {
+              echo '[autotune]'
+              echo 'disable_cache = true'
+              echo '[autotune.logger]'
+              echo 'level = "full"'
+              echo 'file = "autotune_again_'"$i"'.log"'
+            } > cubecl.toml
+            if cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matches_pytorch > again_$i.log 2>&1; then
+              echo "run $i: ok"
+            else
+              echo "run $i: FAILED"; failed=$((failed + 1))
+              grep -E '^(BISTAGE|AFTER)' again_$i.log || true
+            fi
+            grep -E '^bidirectional \(kernels\) pair 0' again_$i.log || true
+          done
+          rm -f cubecl.toml
+          echo "failed runs: $failed of 4"
       - name: The bidirectional pass 6 times in fresh processes, autotune cache off, its choices logged
         if: matrix.best != ''
         env:
