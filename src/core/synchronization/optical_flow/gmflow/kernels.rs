@@ -612,6 +612,139 @@ fn launch_gemm(a: CubeTensor, b: CubeTensor, bias: Option<CubeTensor>, tile: Gem
     out
 }
 
+/// The tiling of gemm4: rows and columns of outputs per thread (PN a multiple of 4) and the k step; the cube is
+/// GEMM_THREADS x GEMM_THREADS threads, its block 16 PM x 16 PN
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gemm4Tile {
+    pub pm: usize,
+    pub pn: usize,
+    pub kstep: usize,
+}
+
+/// gemm with each thread's outputs contiguous (PM rows x PN columns) and b and out read and written 4 columns at a time
+/// (Vector<F, 4>): per k step a thread reads PM values of a from shared memory (the same for the 16 threads of a row of
+/// the cube) and PN / 4 vectors of b, for PM * PN multiply-adds, where gemm_kernel reads 8 scalars for 16. Each output
+/// is summed over k in the same order as gemm_kernel. The columns of b and out [.., N] must be a multiple of 4
+#[cube(launch)]
+fn gemm4_kernel<F: Float, N: Size>(
+    a: &Tensor<F>,                  // [Ba, M, K]
+    b: &Tensor<Vector<F, N>>,       // [Bb, K, Nn]
+    bias: &Tensor<F>,               // [M], read only with has_bias
+    out: &mut Tensor<Vector<F, N>>, // [B, M, Nn]
+    #[comptime] has_bias: bool,
+    #[comptime] pm: usize,
+    #[comptime] pn: usize,
+    #[comptime] kstep: usize,
+    #[define(F)] _dtype: ElemType,
+) {
+    let (m_n, k_n, n_n) = (a.shape(1), a.shape(2), b.shape(2));
+    let nv = n_n / 4usize;
+    let batch = CUBE_POS_Z as usize;
+    let a_off = if a.shape(0) == 1usize { 0usize } else { batch * m_n * k_n };
+    let b_off = if b.shape(0) == 1usize { 0usize } else { batch * k_n * nv };
+    let bm = comptime!(16 * pm);
+    let bnv = comptime!(4 * pn);
+    let pv = comptime!(pn / 4);
+    let a_row = comptime!(16 * pm + 4);
+    let loads_a = comptime!(16 * pm * kstep / 256);
+    let loads_b = comptime!((kstep * 4 * pn + 255) / 256);
+    let tile_b = comptime!(kstep * 4 * pn);
+    let m0 = CUBE_POS_Y as usize * bm;
+    let n0 = CUBE_POS_X as usize * bnv;
+    let tx = UNIT_POS_X as usize;
+    let ty = UNIT_POS_Y as usize;
+    let t = ty * 16usize + tx;
+    let zero = F::new(0.0_f32);
+    let zv = Vector::<F, N>::broadcast(zero);
+    let mut a_s = Shared::<[F]>::new_slice(comptime!(kstep * (16 * pm + 4)));
+    let mut b_s = Shared::<[Vector<F, N>]>::new_slice(comptime!(kstep * 4 * pn));
+    let mut acc = Array::<Vector<F, N>>::new(comptime!(pm * pn / 4));
+    let mut bvv = Array::<Vector<F, N>>::new(pv);
+    #[unroll]
+    for i in 0..pm * pv {
+        acc[i] = zv;
+    }
+    let k_tiles = (k_n + kstep - 1usize) / kstep;
+    for kt in 0..k_tiles {
+        let k0 = kt * kstep;
+        #[unroll]
+        for e in 0..loads_a {
+            let idx = t + e * 256usize;
+            let am = idx / kstep;
+            let ak = idx % kstep;
+            let mut va = zero;
+            if m0 + am < m_n && k0 + ak < k_n {
+                va = a[a_off + (m0 + am) * k_n + k0 + ak];
+            }
+            a_s[ak * a_row + am] = va;
+        }
+        #[unroll]
+        for e in 0..loads_b {
+            let idx = t + e * 256usize;
+            if idx < tile_b {
+                let bkk = idx / bnv;
+                let bc = idx % bnv;
+                let mut vb = zv;
+                if k0 + bkk < k_n && n0 + bc < nv {
+                    vb = b[b_off + (k0 + bkk) * nv + n0 + bc];
+                }
+                b_s[bkk * bnv + bc] = vb;
+            }
+        }
+        sync_cube();
+        #[unroll]
+        for kk in 0..kstep {
+            #[unroll]
+            for v in 0..pv {
+                bvv[v] = b_s[kk * bnv + tx * pv + v];
+            }
+            #[unroll]
+            for i in 0..pm {
+                let av = Vector::<F, N>::broadcast(a_s[kk * a_row + ty * pm + i]);
+                #[unroll]
+                for v in 0..pv {
+                    acc[i * pv + v] += av * bvv[v];
+                }
+            }
+        }
+        sync_cube();
+    }
+    #[unroll]
+    for i in 0..pm {
+        let row = m0 + ty * pm + i;
+        if row < m_n {
+            let add = if has_bias { bias[row] } else { zero };
+            let addv = Vector::<F, N>::broadcast(add);
+            #[unroll]
+            for v in 0..pv {
+                let col = n0 + tx * pv + v;
+                if col < nv {
+                    out[(batch * m_n + row) * nv + col] = acc[i * pv + v] + addv;
+                }
+            }
+        }
+    }
+}
+
+fn launch_gemm4(a: CubeTensor, b: CubeTensor, bias: Option<CubeTensor>, tile: Gemm4Tile) -> CubeTensor {
+    let (a, b) = (into_contiguous(a), into_contiguous(b));
+    let (sa, sb) = (a.meta.shape().clone(), b.meta.shape().clone());
+    assert!(sa[2] == sb[1], "gemm4: inner dimensions {} and {}", sa[2], sb[1]);
+    assert!(sa[0] == sb[0] || sa[0] == 1 || sb[0] == 1, "gemm4: batches {} and {}", sa[0], sb[0]);
+    assert!(sb[2] % 4 == 0 && tile.pn % 4 == 0, "gemm4: {} columns, tiling {tile:?}", sb[2]);
+    let shape = gemm_shape(&sa, &sb);
+    let (batch, m, n) = (shape[0], shape[1], shape[2]);
+    let dtype = a.dtype;
+    let buffer = a.client.empty(shape.num_elements() * dtype.size());
+    let out = CubeTensor::new_contiguous(a.client.clone(), a.device.clone(), shape, buffer, dtype);
+    let count = cubecl::CubeCount::Static((n / 4).div_ceil(4 * tile.pn) as u32, m.div_ceil(16 * tile.pm) as u32, batch as u32);
+    let dim = CubeDim::new_2d(GEMM_THREADS as u32, GEMM_THREADS as u32);
+    let has_bias = bias.is_some();
+    let bias = into_contiguous(bias.unwrap_or_else(|| a.clone()));
+    gemm4_kernel::launch(&out.client, count, dim, 4usize, a.into_tensor_arg(), b.into_tensor_arg(), bias.into_tensor_arg(), out.clone().into_tensor_arg(), has_bias, tile.pm, tile.pn, tile.kstep, dtype_to_storage_type(dtype));
+    out
+}
+
 // ---------------------------------------------------------------- split-window attention and small convolutions
 
 /// The row of q, k, v [B, H*W, C] (as [B*H*W, C]) at position p of window bw of split-window attention (unimatch
@@ -1096,6 +1229,8 @@ pub trait GmflowKernels: burn::backend::Backend {
     fn im2col(x: FloatTensor<Self>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> FloatTensor<Self>;
     #[fusion(dtype = a, shape = gemm_shape(a, b))]
     fn gemm(a: FloatTensor<Self>, b: FloatTensor<Self>, bias: FloatTensor<Self>, has_bias: bool, block: usize, kstep: usize, per: usize) -> FloatTensor<Self>;
+    #[fusion(dtype = a, shape = gemm_shape(a, b))]
+    fn gemm4(a: FloatTensor<Self>, b: FloatTensor<Self>, bias: FloatTensor<Self>, has_bias: bool, pm: usize, pn: usize, kstep: usize) -> FloatTensor<Self>;
     #[fusion(dtype = q, shape = q)]
     fn window_attention(q: FloatTensor<Self>, k: FloatTensor<Self>, v: FloatTensor<Self>, h: usize, w: usize, splits: usize, shift: bool) -> FloatTensor<Self>;
     #[fusion(dtype = x, shape = conv_small_shape(x, weight, *ph, *pw))]
@@ -1126,6 +1261,9 @@ impl GmflowKernels for CubeBackend {
     }
     fn gemm(a: FloatTensor<Self>, b: FloatTensor<Self>, bias: FloatTensor<Self>, has_bias: bool, block: usize, kstep: usize, per: usize) -> FloatTensor<Self> {
         launch_gemm(a, b, has_bias.then_some(bias), GemmTile { block, kstep, per })
+    }
+    fn gemm4(a: FloatTensor<Self>, b: FloatTensor<Self>, bias: FloatTensor<Self>, has_bias: bool, pm: usize, pn: usize, kstep: usize) -> FloatTensor<Self> {
+        launch_gemm4(a, b, has_bias.then_some(bias), Gemm4Tile { pm, pn, kstep })
     }
     fn window_attention(q: FloatTensor<Self>, k: FloatTensor<Self>, v: FloatTensor<Self>, h: usize, w: usize, splits: usize, shift: bool) -> FloatTensor<Self> {
         launch_window_attention(q, k, v, h, w, splits, shift)
@@ -1184,6 +1322,18 @@ pub fn gemm_tiled(a: BurnTensor<3>, b: BurnTensor<3>, bias: Option<BurnTensor<1>
     let has_bias = bias.is_some();
     let bias = match bias { Some(v) => v.into_dispatch(), None => a.clone().into_dispatch() };
     BurnTensor::from_dispatch(Dispatch::gemm(a.into_dispatch(), b.into_dispatch(), bias, has_bias, tile.block, tile.kstep, tile.per))
+}
+
+/// gemm by gemm4_kernel with a given tiling; columns not a multiple of 4: gemm (the tests measure and check several)
+pub fn gemm4_tiled(a: BurnTensor<3>, b: BurnTensor<3>, bias: Option<BurnTensor<1>>, tile: Gemm4Tile) -> BurnTensor<3> {
+    if b.dims()[2] % 4 != 0 {
+        return gemm(a, b, bias);
+    }
+    assert!(tile.pn % 4 == 0 && (16 * tile.pm * tile.kstep) % 256 == 0, "gemm4: tiling {tile:?}");
+    assert!(tile.kstep * (16 * tile.pm + 4 + 16 * tile.pn) * 4 <= 16 << 10, "gemm4: tiling {tile:?} needs more than 16 KiB of shared memory");
+    let has_bias = bias.is_some();
+    let bias = match bias { Some(v) => v.into_dispatch(), None => a.clone().into_dispatch() };
+    BurnTensor::from_dispatch(Dispatch::gemm4(a.into_dispatch(), b.into_dispatch(), bias, has_bias, tile.pm, tile.pn, tile.kstep))
 }
 
 /// unimatch single_head_split_window_attention without the window layout or the roll in memory, in three launches (scores,

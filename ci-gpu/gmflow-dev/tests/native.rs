@@ -24,6 +24,14 @@ const GEMM_TILES: [kernels::GemmTile; 5] = [
     kernels::GemmTile { block: 128, kstep: 8, per: 8 },
 ];
 
+/// The tilings of kernels::gemm4 checked and timed (rows / columns per thread, k step)
+const GEMM4_TILES: [kernels::Gemm4Tile; 4] = [
+    kernels::Gemm4Tile { pm: 4, pn: 4, kstep: 8 },
+    kernels::Gemm4Tile { pm: 8, pn: 4, kstep: 8 },
+    kernels::Gemm4Tile { pm: 4, pn: 8, kstep: 8 },
+    kernels::Gemm4Tile { pm: 8, pn: 8, kstep: 8 },
+];
+
 /// The configurations measured: (label, ops)
 fn configs() -> Vec<(&'static str, model::Ops)> {
     let o = |kernels, conv_im2col, gru_factored, own_gemm, gemm_linear, fused| model::Ops { kernels, conv_im2col, gru_factored, own_gemm, gemm_linear, fused };
@@ -321,6 +329,10 @@ fn kernels_match_plain() {
             let label = format!("gemm {}/{}/{} [{ba},{m},{k}]x[{bb},{k},{nn}]", tile.block, tile.kstep, tile.per);
             check(&label, kernels::gemm_tiled(a.clone(), bm.clone(), None, tile).unsqueeze_dim::<4>(0), want.clone());
         }
+        for tile in GEMM4_TILES {
+            let label = format!("gemm4 {}x{}/{} [{ba},{m},{k}]x[{bb},{k},{nn}]", tile.pm, tile.pn, tile.kstep);
+            check(&label, kernels::gemm4_tiled(a.clone(), bm.clone(), None, tile).unsqueeze_dim::<4>(0), want.clone());
+        }
     }
     {
         let a = rnd3([1, 100, 300], 0.06);
@@ -332,6 +344,13 @@ fn kernels_match_plain() {
             let tile = *tile;
             let label = format!("gemm {}/{}/{} with bias [1,100,300]x[2,300,333]", tile.block, tile.kstep, tile.per);
             check(&label, kernels::gemm_tiled(a.clone(), bm.clone(), Some(bias.clone()), tile).unsqueeze_dim::<4>(0), want.clone());
+        }
+        // gemm4 with a bias, columns a multiple of 4 (333 above falls back to gemm)
+        let b4 = rnd3([2, 300, 332], 1.0);
+        let want4 = (a.clone().matmul(b4.clone()) + bias.clone().reshape([1, 100, 1])).unsqueeze_dim::<4>(0);
+        for tile in GEMM4_TILES {
+            let label = format!("gemm4 {}x{}/{} with bias [1,100,300]x[2,300,332]", tile.pm, tile.pn, tile.kstep);
+            check(&label, kernels::gemm4_tiled(a.clone(), b4.clone(), Some(bias.clone()), tile).unsqueeze_dim::<4>(0), want4.clone());
         }
     }
     assert!(failed.is_empty(), "kernels that differ from the plain operations: {failed:?}");
@@ -617,6 +636,12 @@ fn matmul_ceiling() {
         time(&format!("tile {block}/{kstep}/{per} conv [1,192,2304]@[1,2304,L]"), conv_flops, &|| first(kernels::gemm_tiled(w.clone(), cols.clone(), None, tile)));
         time(&format!("tile {block}/{kstep}/{per} GRU [1,384,640]@[2,640,L]"), 2.0 * (2 * 384 * 640 * l) as f64, &|| first(kernels::gemm_tiled(gw.clone(), gc.clone(), None, tile)));
         time(&format!("tile {block}/{kstep}/{per} FFN [1,2L,256]@[1,256,1024]"), 2.0 * (tokens * 256 * 1024) as f64, &|| first(kernels::gemm_tiled(a3.clone(), fc1_3.clone(), None, tile)));
+    }
+    for tile in GEMM4_TILES {
+        let kernels::Gemm4Tile { pm, pn, kstep } = tile;
+        time(&format!("gemm4 {pm}x{pn}/{kstep} conv [1,192,2304]@[1,2304,L]"), conv_flops, &|| first(kernels::gemm4_tiled(w.clone(), cols.clone(), None, tile)));
+        time(&format!("gemm4 {pm}x{pn}/{kstep} GRU [1,384,640]@[2,640,L]"), 2.0 * (2 * 384 * 640 * l) as f64, &|| first(kernels::gemm4_tiled(gw.clone(), gc.clone(), None, tile)));
+        time(&format!("gemm4 {pm}x{pn}/{kstep} FFN [1,2L,256]@[1,256,1024]"), 2.0 * (tokens * 256 * 1024) as f64, &|| first(kernels::gemm4_tiled(a3.clone(), fc1_3.clone(), None, tile)));
     }
     let q = rnd3([2 * 64, 180, 128]);
     let kt = rnd3([2 * 64, 128, 180]);

@@ -284,8 +284,9 @@ mod inference {
         Ok(r)
     }
 
-    // Which implementations run: see model.rs, Ops. The convolutions are chosen per GPU (im2col_is_faster)
-    const OPS: Ops = Ops { kernels: true, conv_im2col: false, gru_factored: true, own_gemm: false, gemm_linear: false, fused: false };
+    // Which implementations run: see model.rs, Ops. The convolutions are chosen per GPU (im2col_is_faster). The fused
+    // window attention and flow head convolution on every GPU (macOS CI GPU: WGSL 2.25 -> 1.82 s a pass, MSL 1.21 -> 1.11 s)
+    const OPS: Ops = Ops { kernels: true, conv_im2col: false, gru_factored: true, own_gemm: false, gemm_linear: false, fused: true };
 
     // burn convolves with implicit GEMM on matrix units only where the device has them for exactly the types of the
     // tensors (f32 inputs, or tf32 that burn stages f32 to, with an f32 accumulator); otherwise its 3x3 convolutions are
