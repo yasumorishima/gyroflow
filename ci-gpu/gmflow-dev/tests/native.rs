@@ -14,7 +14,7 @@ use std::time::Instant;
 const H: usize = 320;
 const W: usize = 576;
 
-/// The tilings of kernels::gemm the ceiling test times (block / k step / outputs per thread per side), the default first;
+/// The tilings of gemm_kernel (kernels::gemm_tiled) the ceiling test times (block / k step / outputs per thread per side), the default first;
 /// kernels_match_plain checks every one of them against burn's matmul
 const GEMM_TILES: [kernels::GemmTile; 5] = [
     kernels::GEMM_DEFAULT,

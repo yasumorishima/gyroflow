@@ -469,7 +469,7 @@ fn launch_im2col(x: CubeTensor, kh: usize, kw: usize, stride: usize, ph: usize, 
 
 // ---------------------------------------------------------------- matmul for GPUs without f32 matrix units
 
-/// The tiling of gemm: rows and columns of the block of the output a cube computes, its k step, and outputs per thread
+/// The tiling of gemm_kernel (gemm_tiled; gemm itself uses gemm4 where it can): rows and columns of the block of the output a cube computes, its k step, and outputs per thread
 /// per side (block / per threads per side, outputs strided by that so that neighbouring threads read neighbouring
 /// values). Measured on the macOS CI GPU (conv / GRU / FFN shapes, GFLOPS), WGSL: 64 / 8 / 4 458 / 480 / 524, 64 / 16 / 4
 /// 257 / 273 / 296, 32 / 16 / 2 340 / 405 / 472, 32 / 32 / 2 286 / 298 / 328, 128 / 8 / 8 143 / 188 / 192 (64 accumulators a
@@ -1320,7 +1320,7 @@ pub fn gemm(a: BurnTensor<3>, b: BurnTensor<3>, bias: Option<BurnTensor<1>>) -> 
     gemm4_tiled(a, b, bias, GEMM4_DEFAULT)
 }
 
-/// gemm with a given tiling (the tests measure several)
+/// gemm_kernel with a given tiling (the tests measure several)
 pub fn gemm_tiled(a: BurnTensor<3>, b: BurnTensor<3>, bias: Option<BurnTensor<1>>, tile: GemmTile) -> BurnTensor<3> {
     let th = tile.threads();
     assert!(tile.block % tile.per == 0 && th == GEMM_THREADS && (tile.block * tile.kstep) % (th * th) == 0, "gemm: tiling {tile:?}");
@@ -1377,7 +1377,7 @@ pub fn conv2d_im2col(x: BurnTensor<4>, weight: BurnTensor<4>, bias: Option<BurnT
         let len = chunk.min(n - start);
         let part = if len == n { x.clone() } else { x.clone().narrow(0, start, len) };
         let cols: BurnTensor<3> = BurnTensor::from_dispatch(Dispatch::im2col(part.into_dispatch(), kh, kw, stride, ph, pw));
-        // Few output channels (the flow head's 2) would leave most of a 128-row block of gemm idle
+        // Few output channels (the flow head's 2) would leave most of a 64-row block of gemm idle
         outs.push(if own_gemm && cout >= 32 { gemm(wmat.clone(), cols, None) } else { wmat.clone().matmul(cols) }); // [len, Cout, OH*OW]
         start += len;
     }
