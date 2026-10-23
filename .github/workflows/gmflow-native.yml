@@ -62,7 +62,7 @@ jobs:
       matrix:
         include:
           - { name: lavapipe, os: ubuntu-24.04, warm: '0', features: '', im2col: '1', best: '' }
-          - { name: metal-wgsl, os: macos-14, warm: '10', features: '', im2col: '1', best: kernels+im2col+gru+gemm+linear+fused }
+          - { name: metal-wgsl, os: macos-14, warm: '10', features: '', im2col: '1', best: kernels+im2col+gru+gemm+linear+fused+implicit }
           - { name: metal-msl, os: macos-15, warm: '10', features: msl, im2col: '0', best: kernels+gru+fused }
     name: native-${{ matrix.name }}
     runs-on: ${{ matrix.os }}

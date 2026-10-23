@@ -751,6 +751,158 @@ fn launch_gemm4(a: CubeTensor, b: CubeTensor, bias: Option<CubeTensor>, tile: Ge
     out
 }
 
+/// Implicit GEMM convolution: gemm4_kernel with the tile of b gathered from x [N, C, H, W] (the columns of F.unfold made
+/// on the fly, zero outside of the map) instead of read from an im2col buffer, which for the 3x3 convolutions at 1/4 and
+/// 1/2 is 9 times the input, written and read once per convolution. a: the weight [1, Co, K], K = C KH KW in im2col order;
+/// out [N, Co, OH*OW], OH*OW a multiple of 4. Each output is summed over k in the same order as im2col + gemm4
+#[cube(launch)]
+fn conv_gemm4_kernel<F: Float, N: Size>(
+    a: &Tensor<F>,                  // [1, Co, K]
+    x: &Tensor<F>,                  // [N, C, H, W]
+    out: &mut Tensor<Vector<F, N>>, // [N, Co, OH*OW]
+    #[comptime] kh: usize,
+    #[comptime] kw: usize,
+    #[comptime] stride: usize,
+    #[comptime] ph: usize,
+    #[comptime] pw: usize,
+    #[comptime] pm: usize,
+    #[comptime] pn: usize,
+    #[comptime] kstep: usize,
+    #[define(F)] _dtype: ElemType,
+) {
+    let (m_n, k_n) = (a.shape(1), a.shape(2));
+    let (c_n, h, w) = (x.shape(1), x.shape(2), x.shape(3));
+    let ow = (w + comptime!(2 * pw) - kw) / stride + 1usize;
+    let nv = out.shape(2) / out.vector_size();
+    let batch = CUBE_POS_Z as usize;
+    let bm = comptime!(16 * pm);
+    let bnv = comptime!(4 * pn);
+    let pv = comptime!(pn / 4);
+    let a_row = comptime!(16 * pm + 4);
+    let loads_a = comptime!(16 * pm * kstep / 256);
+    let tile_b = comptime!(kstep * 4 * pn);
+    let khw = comptime!(kh * kw);
+    let phi = comptime!(ph as i32);
+    let pwi = comptime!(pw as i32);
+    let m0 = CUBE_POS_Y as usize * bm;
+    let n0 = CUBE_POS_X as usize * bnv;
+    let tx = UNIT_POS_X as usize;
+    let ty = UNIT_POS_Y as usize;
+    let t = ty * 16usize + tx;
+    let zero = F::new(0.0_f32);
+    let zv = Vector::<F, N>::broadcast(zero);
+    let mut a_s = Shared::<[F]>::new_slice(comptime!(kstep * (16 * pm + 4)));
+    let mut b_s = Shared::<[Vector<F, N>]>::new_slice(comptime!(kstep * 4 * pn));
+    let mut acc = Array::<Vector<F, N>>::new(comptime!(pm * pn / 4));
+    let mut bvv = Array::<Vector<F, N>>::new(pv);
+    #[unroll]
+    for i in 0..pm * pv {
+        acc[i] = zv;
+    }
+    // This thread's load of b: row bkk of the tile and the 4 output positions of vector column bc, the same at every k
+    // step (tile_b is at most the 256 threads); the top left of their windows in x
+    let bkk = t / bnv;
+    let bc = t % bnv;
+    let mut iy0 = Array::<i32>::new(4);
+    let mut ix0 = Array::<i32>::new(4);
+    #[unroll]
+    for j in 0..4 {
+        let p = (n0 + bc) * 4usize + j;
+        iy0[j] = ((p / ow) * stride) as i32 - phi;
+        ix0[j] = ((p % ow) * stride) as i32 - pwi;
+    }
+    let x_base = batch * c_n * h * w;
+    let k_tiles = (k_n + kstep - 1usize) / kstep;
+    for kt in 0..k_tiles {
+        let k0 = kt * kstep;
+        #[unroll]
+        for e in 0..loads_a {
+            let idx = t + e * 256usize;
+            let am = idx / kstep;
+            let ak = idx % kstep;
+            let mut va = zero;
+            if m0 + am < m_n && k0 + ak < k_n {
+                va = a[(m0 + am) * k_n + k0 + ak];
+            }
+            a_s[ak * a_row + am] = va;
+        }
+        if t < tile_b {
+            let mut vb = zv;
+            let k = k0 + bkk;
+            if k < k_n && n0 + bc < nv {
+                let c = k / khw;
+                let r = k % khw;
+                let ky = (r / kw) as i32;
+                let kx = (r % kw) as i32;
+                let base = x_base + c * h * w;
+                #[unroll]
+                for j in 0..4 {
+                    let iy = iy0[j] + ky;
+                    let ix = ix0[j] + kx;
+                    if iy >= 0 && iy < h as i32 && ix >= 0 && ix < w as i32 {
+                        vb.insert_dynamic(j, x[base + iy as usize * w + ix as usize]);
+                    }
+                }
+            }
+            b_s[bkk * bnv + bc] = vb;
+        }
+        sync_cube();
+        #[unroll]
+        for kk in 0..kstep {
+            #[unroll]
+            for v in 0..pv {
+                bvv[v] = b_s[kk * bnv + tx * pv + v];
+            }
+            #[unroll]
+            for i in 0..pm {
+                let av = Vector::<F, N>::broadcast(a_s[kk * a_row + ty * pm + i]);
+                #[unroll]
+                for v in 0..pv {
+                    acc[i * pv + v] += av * bvv[v];
+                }
+            }
+        }
+        sync_cube();
+    }
+    #[unroll]
+    for i in 0..pm {
+        let row = m0 + ty * pm + i;
+        if row < m_n {
+            #[unroll]
+            for v in 0..pv {
+                let col = n0 + tx * pv + v;
+                if col < nv {
+                    out[(batch * m_n + row) * nv + col] = acc[i * pv + v];
+                }
+            }
+        }
+    }
+}
+
+fn conv_gemm_shape(w: &Shape, x: &Shape, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> Shape {
+    let oh = (x[2] + 2 * ph - kh) / stride + 1;
+    let ow = (x[3] + 2 * pw - kw) / stride + 1;
+    Shape::new([x[0], w[1], oh * ow])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_conv_gemm(w: CubeTensor, x: CubeTensor, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> CubeTensor {
+    let (w, x) = (into_contiguous(w), into_contiguous(x));
+    let (sw, sx) = (w.meta.shape().clone(), x.meta.shape().clone());
+    assert!(sw[0] == 1 && sw[2] == sx[1] * kh * kw, "conv_gemm: weight {sw:?} for x {sx:?} and a {kh}x{kw} kernel");
+    let shape = conv_gemm_shape(&sw, &sx, kh, kw, stride, ph, pw);
+    let tile = GEMM4_DEFAULT;
+    assert!(shape[2] % 4 == 0 && tile.kstep * 4 * tile.pn <= 256 && GEMM_THREADS == 16, "conv_gemm: {shape:?}, tiling {tile:?}");
+    let (batch, m, n) = (shape[0], shape[1], shape[2]);
+    let dtype = x.dtype;
+    let buffer = x.client.empty(shape.num_elements() * dtype.size());
+    let out = CubeTensor::new_contiguous(x.client.clone(), x.device.clone(), shape, buffer, dtype);
+    let count = cubecl::CubeCount::Static((n / 4).div_ceil(4 * tile.pn) as u32, m.div_ceil(16 * tile.pm) as u32, batch as u32);
+    let dim = CubeDim::new_2d(GEMM_THREADS as u32, GEMM_THREADS as u32);
+    conv_gemm4_kernel::launch(&out.client, count, dim, 4usize, w.into_tensor_arg(), x.into_tensor_arg(), out.clone().into_tensor_arg(), kh, kw, stride, ph, pw, tile.pm, tile.pn, tile.kstep, dtype_to_storage_type(dtype));
+    out
+}
+
 // ---------------------------------------------------------------- split-window attention and small convolutions
 
 /// The row of q, k, v [B, H*W, C] (as [B*H*W, C]) at position p of window bw of split-window attention (unimatch
@@ -1237,6 +1389,9 @@ pub trait GmflowKernels: burn::backend::Backend {
     fn gemm(a: FloatTensor<Self>, b: FloatTensor<Self>, bias: FloatTensor<Self>, has_bias: bool, block: usize, kstep: usize, per: usize) -> FloatTensor<Self>;
     #[fusion(dtype = a, shape = gemm_shape(a, b))]
     fn gemm4(a: FloatTensor<Self>, b: FloatTensor<Self>, bias: FloatTensor<Self>, has_bias: bool, pm: usize, pn: usize, kstep: usize) -> FloatTensor<Self>;
+    #[fusion(dtype = x, shape = conv_gemm_shape(w, x, *kh, *kw, *stride, *ph, *pw))]
+    #[allow(clippy::too_many_arguments)]
+    fn conv_gemm(w: FloatTensor<Self>, x: FloatTensor<Self>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> FloatTensor<Self>;
     #[fusion(dtype = q, shape = q)]
     fn window_attention(q: FloatTensor<Self>, k: FloatTensor<Self>, v: FloatTensor<Self>, h: usize, w: usize, splits: usize, shift: bool) -> FloatTensor<Self>;
     #[fusion(dtype = x, shape = conv_small_shape(x, weight, *ph, *pw))]
@@ -1270,6 +1425,9 @@ impl GmflowKernels for CubeBackend {
     }
     fn gemm4(a: FloatTensor<Self>, b: FloatTensor<Self>, bias: FloatTensor<Self>, has_bias: bool, pm: usize, pn: usize, kstep: usize) -> FloatTensor<Self> {
         launch_gemm4(a, b, has_bias.then_some(bias), Gemm4Tile { pm, pn, kstep })
+    }
+    fn conv_gemm(w: FloatTensor<Self>, x: FloatTensor<Self>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> FloatTensor<Self> {
+        launch_conv_gemm(w, x, kh, kw, stride, ph, pw)
     }
     fn window_attention(q: FloatTensor<Self>, k: FloatTensor<Self>, v: FloatTensor<Self>, h: usize, w: usize, splits: usize, shift: bool) -> FloatTensor<Self> {
         launch_window_attention(q, k, v, h, w, splits, shift)
@@ -1341,6 +1499,32 @@ pub fn gemm4_tiled(a: BurnTensor<3>, b: BurnTensor<3>, bias: Option<BurnTensor<1
     let has_bias = bias.is_some();
     let bias = match bias { Some(v) => v.into_dispatch(), None => a.clone().into_dispatch() };
     BurnTensor::from_dispatch(Dispatch::gemm4(a.into_dispatch(), b.into_dispatch(), bias, has_bias, tile.pm, tile.pn, tile.kstep))
+}
+
+/// w [1, Co, C*KH*KW] @ the KH x KW columns of x [N, C, H, W] (stride, symmetric zero padding) -> [N, Co, OH*OW], the
+/// columns gathered in the kernel (conv_gemm4_kernel); OH*OW not a multiple of 4: im2col + gemm
+pub fn conv_gemm(w: BurnTensor<3>, x: BurnTensor<4>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> BurnTensor<3> {
+    let [_, _, h, ww] = x.dims();
+    let (oh, ow) = ((h + 2 * ph - kh) / stride + 1, (ww + 2 * pw - kw) / stride + 1);
+    if (oh * ow) % 4 != 0 {
+        return gemm(w, im2col(x, kh, kw, stride, ph, pw), None);
+    }
+    BurnTensor::from_dispatch(Dispatch::conv_gemm(w.into_dispatch(), x.into_dispatch(), kh, kw, stride, ph, pw))
+}
+
+/// A 2D convolution (symmetric zero padding, no dilation or groups) by conv_gemm: no column buffer. x [N, C, H, W],
+/// weight [Cout, C, KH, KW] -> [N, Cout, OH, OW]
+pub fn conv2d_implicit(x: BurnTensor<4>, weight: BurnTensor<4>, bias: Option<BurnTensor<1>>, stride: usize, padding: [usize; 2]) -> BurnTensor<4> {
+    let [n, c, h, w] = x.dims();
+    let [cout, cin, kh, kw] = weight.dims();
+    assert_eq!(c, cin, "conv2d_implicit: channels");
+    let (ph, pw) = (padding[0], padding[1]);
+    let (oh, ow) = ((h + 2 * ph - kh) / stride + 1, (w + 2 * pw - kw) / stride + 1);
+    let out = conv_gemm(weight.reshape([1, cout, c * kh * kw]), x, kh, kw, stride, ph, pw).reshape([n, cout, oh, ow]);
+    match bias {
+        Some(b) => out + b.reshape([1, cout, 1, 1]),
+        None => out,
+    }
 }
 
 /// unimatch single_head_split_window_attention without the window layout or the roll in memory, in three launches (scores,

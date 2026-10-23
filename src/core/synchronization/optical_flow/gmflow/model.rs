@@ -60,6 +60,9 @@ pub struct Ops {
     /// Split-window attention by kernels::window_attention (no window layout or roll in memory, the softmax in one
     /// launch) and the flow head's last convolution (2 outputs) by kernels::conv_small
     pub fused: bool,
+    /// The im2col convolutions with own_gemm (Co >= 32) and the GRU's by kernels::conv_gemm: the columns gathered in the
+    /// matmul instead of made in memory
+    pub implicit: bool,
 }
 
 /// A convolution of this model: 1x1 ones and the plain path through burn, the others as im2col + matmul if asked
@@ -79,7 +82,11 @@ fn conv_fwd(conv: &Conv2d, x: Tensor<4>, ops: Ops) -> Tensor<4> {
     if !ops.conv_im2col || (kh == 1 && kw == 1) || conv.stride[0] != conv.stride[1] { return conv.forward(x); }
     match conv.padding {
         PaddingConfig2d::Explicit(t, l, b, r) if t == b && l == r => {
-            kernels::conv2d_im2col(x, conv.weight.val(), conv.bias.as_ref().map(|b| b.val()), conv.stride[0], [t, l], IM2COL_MAX_BYTES, ops.own_gemm)
+            if ops.implicit && ops.own_gemm && conv.weight.val().dims()[0] >= 32 {
+                kernels::conv2d_implicit(x, conv.weight.val(), conv.bias.as_ref().map(|b| b.val()), conv.stride[0], [t, l])
+            } else {
+                kernels::conv2d_im2col(x, conv.weight.val(), conv.bias.as_ref().map(|b| b.val()), conv.stride[0], [t, l], IM2COL_MAX_BYTES, ops.own_gemm)
+            }
         }
         _ => conv.forward(x),
     }
@@ -175,6 +182,11 @@ impl CnnEncoder {
         }
         let x = conv_fwd(&self.conv2, x, ops);
         let w = self.trident_conv.weight.val();
+        if ops.conv_im2col && ops.own_gemm && ops.implicit {
+            let quarter = kernels::conv2d_implicit(x.clone(), w.clone(), None, 1, [1, 1]);
+            let eighth = kernels::conv2d_implicit(x, w, None, 2, [1, 1]);
+            return (quarter, eighth);
+        }
         if ops.conv_im2col {
             let quarter = kernels::conv2d_im2col(x.clone(), w.clone(), None, 1, [1, 1], IM2COL_MAX_BYTES, ops.own_gemm);
             let eighth = kernels::conv2d_im2col(x, w, None, 2, [1, 1], IM2COL_MAX_BYTES, ops.own_gemm);
@@ -670,7 +682,7 @@ impl BasicUpdateBlock {
     fn forward(&self, net: Tensor<4>, inp: Tensor<4>, corr: Tensor<4>, flow: Tensor<4>, ops: Ops, factored: Option<(&GruFactored, &GruConstants)>) -> (Tensor<4>, Tensor<4>) {
         let motion = self.motion(flow, corr, ops);
         let net = match factored {
-            Some((g, c)) => g.step(c, net, motion, ops.own_gemm),
+            Some((g, c)) => g.step(c, net, motion, ops.own_gemm, ops.implicit),
             None => self.gru(net, Tensor::cat(vec![inp, motion], 1), ops),
         };
         let delta = conv_fwd(&self.flow_head.conv2, relu(conv_fwd(&self.flow_head.conv1, net.clone(), ops)), ops);
@@ -746,6 +758,16 @@ fn gru_cols(x: Tensor<4>, horizontal: bool) -> Tensor<3> {
     kernels::im2col(x, kh, kw, 1, ph, pw)
 }
 
+/// w [1, Co, C*5] @ the 1x5 (horizontal) or 5x1 columns of x: by kernels::conv_gemm (columns gathered in the matmul)
+/// with `implicit` and own_gemm
+fn mmc(w: Tensor<3>, x: Tensor<4>, horizontal: bool, own: bool, implicit: bool) -> Tensor<3> {
+    if implicit && own {
+        let (kh, kw, ph, pw) = if horizontal { (1, 5, 0, 2) } else { (5, 1, 2, 0) };
+        return kernels::conv_gemm(w, x, kh, kw, 1, ph, pw);
+    }
+    mm(w, gru_cols(x, horizontal), own)
+}
+
 /// What the GRU of every refinement step shares: h0 and inp are the same in all six (unimatch computes them again each
 /// time), so their parts of the convolutions are computed once. [N, C, H*W]
 pub struct GruConstants {
@@ -755,7 +777,14 @@ pub struct GruConstants {
 }
 
 impl GruFactored {
-    pub fn constants(&self, h0: Tensor<4>, inp: Tensor<4>, own: bool) -> GruConstants {
+    pub fn constants(&self, h0: Tensor<4>, inp: Tensor<4>, own: bool, implicit: bool) -> GruConstants {
+        if implicit && own {
+            return GruConstants {
+                zr1: mmc(self.zr1_h.clone(), h0, true, own, implicit) + mmc(self.zr1_i.clone(), inp.clone(), true, own, implicit) + self.zr1_b.clone(),
+                q1: mmc(self.q1_i.clone(), inp.clone(), true, own, implicit) + self.q1_b.clone(),
+                zrq2: mmc(self.zrq2_i.clone(), inp, false, own, implicit) + self.zrq2_b.clone(),
+            };
+        }
         let ci1 = gru_cols(inp.clone(), true);
         let ci2 = gru_cols(inp, false);
         let ch1 = gru_cols(h0, true);
@@ -767,25 +796,25 @@ impl GruFactored {
     }
 
     /// SepConvGRU(h0, [inp, motion]), the same as `BasicUpdateBlock::gru` up to the order of the sums
-    pub fn step(&self, c: &GruConstants, h0: Tensor<4>, motion: Tensor<4>, own: bool) -> Tensor<4> {
+    pub fn step(&self, c: &GruConstants, h0: Tensor<4>, motion: Tensor<4>, own: bool, implicit: bool) -> Tensor<4> {
         let [n, ch, hh, ww] = h0.dims();
         let flat = |t: Tensor<4>| t.reshape([n, ch, hh * ww]);
         let map = |t: Tensor<3>| t.reshape([n, ch, hh, ww]);
         let one_minus = |z: Tensor<3>| z.neg().add_scalar(1.0);
         // Horizontal
-        let m1 = mm(self.zrq1_m.clone(), gru_cols(motion.clone(), true), own); // [N, 384, L]
+        let m1 = mmc(self.zrq1_m.clone(), motion.clone(), true, own, implicit); // [N, 384, L]
         let zr = c.zr1.clone() + m1.clone().narrow(1, 0, 256);
         let z = sigmoid(zr.clone().narrow(1, 0, 128));
         let r = sigmoid(zr.narrow(1, 128, 128));
         let h0f = flat(h0.clone());
-        let q = tanh(mm(self.q1_h.clone(), gru_cols(map(r * h0f.clone()), true), own) + c.q1.clone() + m1.narrow(1, 256, 128));
+        let q = tanh(mmc(self.q1_h.clone(), map(r * h0f.clone()), true, own, implicit) + c.q1.clone() + m1.narrow(1, 256, 128));
         let h1 = one_minus(z.clone()) * h0f + z * q;
         // Vertical
-        let m2 = mm(self.zrq2_m.clone(), gru_cols(motion, false), own);
-        let zr = mm(self.zr2_h.clone(), gru_cols(map(h1.clone()), false), own) + c.zrq2.clone().narrow(1, 0, 256) + m2.clone().narrow(1, 0, 256);
+        let m2 = mmc(self.zrq2_m.clone(), motion, false, own, implicit);
+        let zr = mmc(self.zr2_h.clone(), map(h1.clone()), false, own, implicit) + c.zrq2.clone().narrow(1, 0, 256) + m2.clone().narrow(1, 0, 256);
         let z = sigmoid(zr.clone().narrow(1, 0, 128));
         let r = sigmoid(zr.narrow(1, 128, 128));
-        let q = tanh(mm(self.q2_h.clone(), gru_cols(map(r * h1.clone()), false), own) + c.zrq2.clone().narrow(1, 256, 128) + m2.narrow(1, 256, 128));
+        let q = tanh(mmc(self.q2_h.clone(), map(r * h1.clone()), false, own, implicit) + c.zrq2.clone().narrow(1, 256, 128) + m2.narrow(1, 256, 128));
         map(one_minus(z.clone()) * h1 + z * q)
     }
 }
@@ -867,7 +896,7 @@ impl Statics {
             quarter: Windows::new(h / 4, w / 4, 8, device),
             mean: c3([0.485, 0.456, 0.406]),
             std: c3([0.229, 0.224, 0.225]),
-            ops: Ops { kernels: true, conv_im2col: false, gru_factored: false, own_gemm: false, gemm_linear: false, fused: false },
+            ops: Ops { kernels: true, conv_im2col: false, gru_factored: false, own_gemm: false, gemm_linear: false, fused: false, implicit: false },
         }
     }
 }
@@ -992,7 +1021,7 @@ impl Gmflow {
         let mut net = net0.clone();
         let factored = ops.gru_factored.then(|| {
             let g = self.refine.factor_gru();
-            let c = g.constants(net0.clone(), inp.clone(), ops.own_gemm);
+            let c = g.constants(net0.clone(), inp.clone(), ops.own_gemm, ops.implicit);
             (g, c)
         });
         for i in 0..REFINE_ITERATIONS {
