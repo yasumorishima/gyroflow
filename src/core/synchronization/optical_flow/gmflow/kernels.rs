@@ -803,7 +803,7 @@ fn window_softmax_kernel<F: Float>(
                     v += minus;
                 }
             }
-            m = Max::max(m, v);
+            m = F::max(m, v);
         }
     }
     red[t] = m;
@@ -811,7 +811,7 @@ fn window_softmax_kernel<F: Float>(
     let mut half = 32usize;
     for _ in 0..6usize {
         if t < half {
-            red[t] = Max::max(red[t], red[t + half]);
+            red[t] = F::max(red[t], red[t + half]);
         }
         sync_cube();
         half = half / 2usize;
@@ -855,7 +855,8 @@ fn window_softmax_kernel<F: Float>(
 fn launch_window_attention(q: CubeTensor, k: CubeTensor, v: CubeTensor, h: usize, w: usize, splits: usize, shift: bool) -> CubeTensor {
     let (q, k, v) = (into_contiguous(q), into_contiguous(k), into_contiguous(v));
     let s = q.meta.shape().clone();
-    assert!(s[1] == h * w && h % splits == 0 && w % splits == 0, "window_attention: {s:?} for {h}x{w} in {splits}x{splits} windows");
+    assert!(s[1] == h * w && h % splits == 0 && w % splits == 0 && s[2] > 0, "window_attention: {s:?} for {h}x{w} in {splits}x{splits} windows");
+    assert!(k.meta.shape() == &s && v.meta.shape() == &s, "window_attention: q {s:?}, k {:?}, v {:?}", k.meta.shape(), v.meta.shape());
     assert_eq!(ATTN_SOFTMAX_THREADS, 64, "window_softmax_kernel reduces 64 values");
     let (b_n, c_n) = (s[0], s[2]);
     let l = (h / splits) * (w / splits);

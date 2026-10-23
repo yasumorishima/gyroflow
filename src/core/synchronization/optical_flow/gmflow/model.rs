@@ -67,7 +67,7 @@ fn conv_fwd(conv: &Conv2d, x: Tensor<4>, ops: Ops) -> Tensor<4> {
     let [kh, kw] = conv.kernel_size;
     // Few output channels (the flow head's last, 256 -> 2): a direct kernel rather than columns 9 times the input for a
     // matmul of 2 rows
-    if ops.fused && conv.weight.val().dims()[0] < 32 && kh * kw > 1 && conv.stride[0] == 1 && conv.stride[1] == 1 {
+    if ops.fused && conv.weight.val().dims()[0] < 32 && kh * kw > 1 && conv.stride == [1, 1] && conv.dilation == [1, 1] && conv.groups == 1 {
         if let PaddingConfig2d::Explicit(t, l, b, r) = conv.padding {
             if let Some(bias) = &conv.bias {
                 if t == b && l == r {
