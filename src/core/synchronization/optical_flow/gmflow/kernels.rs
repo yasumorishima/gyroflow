@@ -492,6 +492,10 @@ pub const GEMM_DEFAULT: GemmTile = GemmTile { block: 64, kstep: 8, per: 4 };
 /// 641 (gemm_kernel 64 / 8 / 4: 457 / 498 / 530), 8x4 321 / 405 / 449, 4x8 431 / 472 / 486, 8x8 244 / 329 / 332; MSL 4x4
 /// 599 / 611 / 671, 4x8 fastest at 653 / 662 / 681 (MSL keeps burn's matmuls on its matrix units)
 pub const GEMM4_DEFAULT: Gemm4Tile = Gemm4Tile { pm: 4, pn: 4, kstep: 8 };
+/// gemm4_kernel and conv_gemm4_kernel launched unchecked: cubecl then does not clamp each buffer index (both kernels test
+/// their own indices). On WGSL it also turns off naga's loop bounding (cubecl-wgpu sets force_loop_bounding only when
+/// checked), which the WGSL text does not show. Off; the tests set it to measure and check both
+pub static GEMM4_UNCHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Threads per side of every tiling used (the workgroup is GEMM_THREADS squared)
 pub const GEMM_THREADS: usize = 16;
 
@@ -629,7 +633,7 @@ pub struct Gemm4Tile {
 /// (Vector<F, 4>): per k step a thread reads PM values of a from shared memory (the same for the 16 threads of a row of
 /// the cube) and PN / 4 vectors of b, for PM * PN multiply-adds, where gemm_kernel reads 8 scalars for 16. Each output
 /// is summed over k in the same order as gemm_kernel. The columns of b and out [.., N] must be a multiple of 4
-#[cube(launch)]
+#[cube(launch, launch_unchecked)]
 fn gemm4_kernel<F: Float, N: Size>(
     a: &Tensor<F>,                  // [Ba, M, K]
     b: &Tensor<Vector<F, N>>,       // [Bb, K, Nn]
@@ -745,9 +749,19 @@ fn launch_gemm4(a: CubeTensor, b: CubeTensor, bias: Option<CubeTensor>, tile: Ge
     let out = CubeTensor::new_contiguous(a.client.clone(), a.device.clone(), shape, buffer, dtype);
     let count = cubecl::CubeCount::Static((n / 4).div_ceil(4 * tile.pn) as u32, m.div_ceil(16 * tile.pm) as u32, batch as u32);
     let dim = CubeDim::new_2d(GEMM_THREADS as u32, GEMM_THREADS as u32);
+    if let Some(bias) = &bias {
+        assert_eq!(bias.meta.shape().num_elements(), m, "gemm4: a bias per row");
+    }
     let has_bias = bias.is_some();
     let bias = into_contiguous(bias.unwrap_or_else(|| a.clone()));
-    gemm4_kernel::launch(&out.client, count, dim, 4usize, a.into_tensor_arg(), b.into_tensor_arg(), bias.into_tensor_arg(), out.clone().into_tensor_arg(), has_bias, tile.pm, tile.pn, tile.kstep, dtype_to_storage_type(dtype));
+    let (a, b, bias, o) = (a.into_tensor_arg(), b.into_tensor_arg(), bias.into_tensor_arg(), out.clone().into_tensor_arg());
+    if GEMM4_UNCHECKED.load(std::sync::atomic::Ordering::Relaxed) {
+        // SAFETY: every read and write of gemm4_kernel is inside its own tests of rows, k and columns, the bias read only
+        // with has_bias, the batch offsets 0 for a batch of 1 (the asserts above)
+        unsafe { gemm4_kernel::launch_unchecked(&out.client, count, dim, 4usize, a, b, bias, o, has_bias, tile.pm, tile.pn, tile.kstep, dtype_to_storage_type(dtype)) };
+    } else {
+        gemm4_kernel::launch(&out.client, count, dim, 4usize, a, b, bias, o, has_bias, tile.pm, tile.pn, tile.kstep, dtype_to_storage_type(dtype));
+    }
     out
 }
 
@@ -755,7 +769,7 @@ fn launch_gemm4(a: CubeTensor, b: CubeTensor, bias: Option<CubeTensor>, tile: Ge
 /// on the fly, zero outside of the map) instead of read from an im2col buffer, which for the 3x3 convolutions at 1/4 and
 /// 1/2 is 9 times the input, written and read once per convolution. a: the weight [1, Co, K], K = C KH KW in im2col order;
 /// out [N, Co, OH*OW], OH*OW a multiple of 4. Each output is summed over k in the same order as im2col + gemm4
-#[cube(launch)]
+#[cube(launch, launch_unchecked)]
 fn conv_gemm4_kernel<F: Float, N: Size>(
     a: &Tensor<F>,                  // [1, Co, K]
     x: &Tensor<F>,                  // [N, C, H, W]
@@ -899,7 +913,14 @@ fn launch_conv_gemm(w: CubeTensor, x: CubeTensor, kh: usize, kw: usize, stride: 
     let out = CubeTensor::new_contiguous(x.client.clone(), x.device.clone(), shape, buffer, dtype);
     let count = cubecl::CubeCount::Static((n / 4).div_ceil(4 * tile.pn) as u32, m.div_ceil(16 * tile.pm) as u32, batch as u32);
     let dim = CubeDim::new_2d(GEMM_THREADS as u32, GEMM_THREADS as u32);
-    conv_gemm4_kernel::launch(&out.client, count, dim, 4usize, w.into_tensor_arg(), x.into_tensor_arg(), out.clone().into_tensor_arg(), kh, kw, stride, ph, pw, tile.pm, tile.pn, tile.kstep, dtype_to_storage_type(dtype));
+    let (w, x, o) = (w.into_tensor_arg(), x.into_tensor_arg(), out.clone().into_tensor_arg());
+    if GEMM4_UNCHECKED.load(std::sync::atomic::Ordering::Relaxed) {
+        // SAFETY: the weight is read inside the tests of rows and k, x inside k < C KH KW and the map (padding read as
+        // zero), the output written inside the tests of rows and columns (the asserts above)
+        unsafe { conv_gemm4_kernel::launch_unchecked(&out.client, count, dim, 4usize, w, x, o, kh, kw, stride, ph, pw, tile.pm, tile.pn, tile.kstep, dtype_to_storage_type(dtype)) };
+    } else {
+        conv_gemm4_kernel::launch(&out.client, count, dim, 4usize, w, x, o, kh, kw, stride, ph, pw, tile.pm, tile.pn, tile.kstep, dtype_to_storage_type(dtype));
+    }
     out
 }
 

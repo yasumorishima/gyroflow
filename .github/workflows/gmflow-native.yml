@@ -208,6 +208,14 @@ jobs:
         run: |
           cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact profile_passes > profile.raw 2>&1 || { tail -n 40 profile.raw; exit 1; }
           python3 ../profile_summary.py profile.raw "PROFILE-START" "PROFILE-END" 3 | tee profile.log
+      - name: The compiled source of the gemm4 and implicit GEMM kernels, checked and unchecked
+        if: matrix.best != ''
+        env:
+          CUBECL_DEBUG_LOG: ${{ github.workspace }}/ci-gpu/gmflow-dev/sources.log
+        run: |
+          cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact kernel_sources 2>&1 | tee kernel_sources.log
+          grep -q "test result: ok. 1 passed" kernel_sources.log
+          ls -l sources.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:

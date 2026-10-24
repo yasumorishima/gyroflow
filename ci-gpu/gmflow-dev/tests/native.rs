@@ -9,6 +9,7 @@ use gmflow_dev::kernels;
 use burn::tensor::{ Distribution, Tensor };
 use gmflow_dev::*;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 const H: usize = 320;
@@ -636,6 +637,11 @@ fn matmul_ceiling() {
     time("same conv, im2col kernel + matmul (conv2d_im2col)", conv_flops, &|| first4(kernels::conv2d_im2col(x.clone(), wt.clone(), None, 1, [1, 1], 120 << 20, false)));
     time("same conv, im2col kernel + kernels::gemm", conv_flops, &|| first4(kernels::conv2d_im2col(x.clone(), wt.clone(), None, 1, [1, 1], 120 << 20, true)));
     time("same conv, implicit gemm (conv2d_implicit)", conv_flops, &|| first4(kernels::conv2d_implicit(x.clone(), wt.clone(), None, 1, [1, 1])));
+    // The same two launched unchecked (no clamp of each buffer index by cubecl)
+    kernels::GEMM4_UNCHECKED.store(true, Ordering::Relaxed);
+    time("same conv, im2col kernel + kernels::gemm, unchecked", conv_flops, &|| first4(kernels::conv2d_im2col(x.clone(), wt.clone(), None, 1, [1, 1], 120 << 20, true)));
+    time("same conv, implicit gemm (conv2d_implicit), unchecked", conv_flops, &|| first4(kernels::conv2d_implicit(x.clone(), wt.clone(), None, 1, [1, 1])));
+    kernels::GEMM4_UNCHECKED.store(false, Ordering::Relaxed);
     time("kernels::gemm [1,Co,K]@[1,K,L]", conv_flops, &|| first(kernels::gemm(w.clone(), cols.clone(), None)));
     let gw = rnd3([1, 384, 640]);
     let gc = rnd3([2, 640, l]);
@@ -662,6 +668,15 @@ fn matmul_ceiling() {
         time(&format!("gemm4 {pm}x{pn}/{kstep} GRU [1,384,640]@[2,640,L]"), 2.0 * (2 * 384 * 640 * l) as f64, &|| first(kernels::gemm4_tiled(gw.clone(), gc.clone(), None, tile)));
         time(&format!("gemm4 {pm}x{pn}/{kstep} FFN [1,2L,256]@[1,256,1024]"), 2.0 * (tokens * 256 * 1024) as f64, &|| first(kernels::gemm4_tiled(a3.clone(), fc1_3.clone(), None, tile)));
     }
+    kernels::GEMM4_UNCHECKED.store(true, Ordering::Relaxed);
+    {
+        let tile = kernels::GEMM4_DEFAULT;
+        let kernels::Gemm4Tile { pm, pn, kstep } = tile;
+        time(&format!("gemm4 {pm}x{pn}/{kstep} unchecked conv [1,192,2304]@[1,2304,L]"), conv_flops, &|| first(kernels::gemm4_tiled(w.clone(), cols.clone(), None, tile)));
+        time(&format!("gemm4 {pm}x{pn}/{kstep} unchecked GRU [1,384,640]@[2,640,L]"), 2.0 * (2 * 384 * 640 * l) as f64, &|| first(kernels::gemm4_tiled(gw.clone(), gc.clone(), None, tile)));
+        time(&format!("gemm4 {pm}x{pn}/{kstep} unchecked FFN [1,2L,256]@[1,256,1024]"), 2.0 * (tokens * 256 * 1024) as f64, &|| first(kernels::gemm4_tiled(a3.clone(), fc1_3.clone(), None, tile)));
+    }
+    kernels::GEMM4_UNCHECKED.store(false, Ordering::Relaxed);
     let q = rnd3([2 * 64, 180, 128]);
     let kt = rnd3([2 * 64, 128, 180]);
     time("window attention @1/4 x2: [128,180,128]@[128,128,180]", 2.0 * (128 * 180 * 180 * 128) as f64, &|| first(q.clone().matmul(kt.clone())));
@@ -679,6 +694,46 @@ fn matmul_ceiling() {
     let like = Tensor::<1>::zeros([1 << 20], &device);
     let peak_flops = (16 * gmflow_dev::bench::FMA_ITERS * (1 << 20)) as f64;
     time("arithmetic peak (independent multiply-add chains)", peak_flops, &|| gmflow_dev::bench::fma_peak(like.clone()).slice([0..1]));
+}
+
+/// Compiles conv_gemm4_kernel and gemm4_kernel (the model's 3x3, stride 1, default tiling) checked and unchecked, and
+/// im2col_kernel (always checked). Checks the checked results against burn's conv2d and the unchecked against the
+/// checked. With CUBECL_DEBUG_LOG=<file> cubecl writes each compiled source there: the workflow keeps it (sources.log),
+/// to compare what WGSL and MSL make of the same kernel. 32 output channels: conv2d_im2col uses gemm from 32 up
+#[test]
+#[ignore]
+fn kernel_sources() {
+    let (device, name) = device();
+    println!("device: {name}");
+    let x = Tensor::<4>::random([1, 16, 8, 16], Distribution::Normal(0.0, 1.0), &device);
+    let wt = Tensor::<4>::random([32, 16, 3, 3], Distribution::Normal(0.0, 1.0), &device).mul_scalar(0.02);
+    let run = |unchecked: bool| {
+        kernels::GEMM4_UNCHECKED.store(unchecked, Ordering::Relaxed);
+        let implicit = to_vec(kernels::conv2d_implicit(x.clone(), wt.clone(), None, 1, [1, 1]));
+        let im2col = to_vec(kernels::conv2d_im2col(x.clone(), wt.clone(), None, 1, [1, 1], 120 << 20, true));
+        kernels::GEMM4_UNCHECKED.store(false, Ordering::Relaxed);
+        (implicit, im2col)
+    };
+    let (ci, cm) = run(false);
+    let (ui, um) = run(true);
+    let options = burn::tensor::ops::ConvOptions::new([1, 1], [1, 1], [1, 1], 1);
+    let want = to_vec(burn::tensor::module::conv2d(x.clone(), wt.clone(), None, options));
+    // Checked against burn within rounding; unchecked against checked equal (the same arithmetic in the same order)
+    let mut failed = Vec::new();
+    let rows = [
+        ("implicit vs burn conv2d", &ci, &want, 1e-4f32),
+        ("im2col + gemm vs burn conv2d", &cm, &want, 1e-4f32),
+        ("implicit unchecked vs checked", &ui, &ci, 0.0f32),
+        ("im2col + gemm unchecked vs checked", &um, &cm, 0.0f32),
+    ];
+    for (label, got, base, limit) in rows {
+        let (max, mean, _) = diff(got, base);
+        println!("{label:36}: max {max:.2e}, mean {mean:.2e} (limit {limit:.0e})");
+        if max > limit {
+            failed.push(format!("{label}: max {max:e} over {limit:e}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:?}");
 }
 
 /// The bidirectional pass alone, against unimatch with the gate of matches_pytorch: run several times in fresh processes
