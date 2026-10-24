@@ -216,6 +216,18 @@ jobs:
           cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact kernel_sources 2>&1 | tee kernel_sources.log
           grep -q "test result: ok. 1 passed" kernel_sources.log
           ls -l sources.log
+      - name: What naga makes of those kernels on Metal (the WGSL of sources.log as MSL)
+        if: matrix.name == 'metal-wgsl'
+        run: |
+          cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact naga_msl 2>&1 | tee naga_msl.log
+          grep -q "test result: ok. 1 passed" naga_msl.log
+      - name: Whether Metal compiles them as wgpu-hal does (MSL 3.1, invariance preserved)
+        if: matrix.name == 'metal-wgsl'
+        continue-on-error: true
+        run: |
+          xcrun -sdk macosx metal --version
+          for f in naga_*.metal; do xcrun -sdk macosx metal -std=metal3.1 -fpreserve-invariance -c "$f" -o "${f%.metal}.air"; done
+          ls -l naga_*.air
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -223,4 +235,5 @@ jobs:
           retention-days: 7
           path: |
             ci-gpu/gmflow-dev/*.log
+            ci-gpu/gmflow-dev/*.metal
             ci-gpu/gmflow-dev/Cargo.lock

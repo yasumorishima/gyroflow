@@ -209,8 +209,16 @@ fn matches_pytorch() {
     // Warm: the same pair again until the time settles (spread of the last 5 under 5 %) or 30 passes
     let runs: usize = std::env::var("GMFLOW_WARM_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
     if runs == 0 { return; }
-    for (label, ops) in configs() {
+    let mut measured: Vec<(String, model::Ops, bool)> = configs().into_iter().map(|(label, ops)| (label.to_string(), ops, false)).collect();
+    // The two own-GEMM configurations again with gemm4 and conv_gemm4 launched unchecked (the same source; on WGSL naga
+    // then bounds none of their loops). conv_gemm4 runs only with implicit
+    for name in ["kernels+im2col+gru+gemm+linear+fused", "kernels+im2col+gru+gemm+linear+fused+implicit"] {
+        let ops = configs().into_iter().find(|(label, _)| *label == name).expect("the configuration").1;
+        measured.push((format!("{name}, unchecked"), ops, true));
+    }
+    for (label, ops, unchecked) in measured {
     st.ops = ops;
+    kernels::GEMM4_UNCHECKED.store(unchecked, Ordering::Relaxed);
     let mut times = Vec::new();
     for _ in 0..30 {
         let started = Instant::now();
@@ -228,6 +236,7 @@ fn matches_pytorch() {
     let sd = (last.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / 5.0).sqrt();
     println!("warm, {label}: {mean:.3} s per pass, sd {sd:.3} (the last 5 of {} passes: {:?})", times.len(), last.iter().map(|t| format!("{t:.3}")).collect::<Vec<_>>());
     }
+    kernels::GEMM4_UNCHECKED.store(false, Ordering::Relaxed);
 }
 
 /// Each kernel against the plain tensor operations it replaces, on random inputs of the real sizes. Limit set before the
@@ -734,6 +743,65 @@ fn kernel_sources() {
         }
     }
     assert!(failed.is_empty(), "{failed:?}");
+}
+
+/// What naga makes of conv_gemm4_kernel and gemm4_kernel on Metal: the WGSL that kernel_sources logged (sources.log)
+/// translated to MSL with the options wgpu-hal 30 uses for cubecl's modules (cubecl-wgpu: no runtime checks except loop
+/// bounding when checked, workgroup memory not zeroed; MSL 3.1, the version wgpu-hal picks on macOS 14; binding i to
+/// buffer i, then the sizes buffer), to compare with the MSL cubecl writes itself (sources.log of the metal-msl job).
+/// wgpu-hal then compiles with MSL 3.1 and invariance preserved, cubecl's MSL with Metal's default options. No GPU
+#[test]
+#[ignore]
+fn naga_msl() {
+    use naga::back::msl;
+    let log = std::fs::read_to_string("sources.log").expect("sources.log, from kernel_sources with CUBECL_DEBUG_LOG");
+    let mut written = Vec::new();
+    for block in log.split("[END_KERNEL_COMPILATION]") {
+        let Some(name) = block.lines().find_map(|l| l.strip_prefix("name: gmflow_dev::kernels::")) else { continue };
+        let kernel = name.split("::").next().unwrap_or_default();
+        if kernel != "conv_gemm4_kernel" && kernel != "gemm4_kernel" {
+            continue;
+        }
+        let mode = block.lines().find_map(|l| l.trim().strip_prefix("mode: ")).expect("the execution mode").trim_end_matches(',');
+        let start = block.find("```wgsl\n").expect("the WGSL source") + "```wgsl\n".len();
+        let src = &block[start..];
+        let src = &src[..src.find("\n```").expect("the end of the source")];
+        let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{kernel} {mode}: {}", e.emit_to_string(src)));
+        let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{kernel} {mode}: {e:?}"));
+        // The bindings as wgpu-hal maps cubecl's layout (one group, binding i at layout entry i): buffer i, then the sizes
+        // buffer, as every binding is a storage buffer or the info
+        let mut resources = msl::BindingMap::new();
+        for (_, var) in module.global_variables.iter() {
+            if let Some(binding) = &var.binding {
+                assert_eq!(binding.group, 0, "{kernel} {mode}: one bind group");
+                let mutable = matches!(var.space, naga::AddressSpace::Storage { access } if access.contains(naga::StorageAccess::STORE));
+                resources.insert(binding.clone(), msl::BindTarget { buffer: Some(binding.binding as u8), mutable, ..Default::default() });
+            }
+        }
+        let count = resources.keys().map(|b| b.binding + 1).max().expect("bindings");
+        assert_eq!(count as usize, resources.len(), "{kernel} {mode}: bindings 0..{count}");
+        let entry = msl::EntryPointResources { resources, sizes_buffer: Some(count as u8), ..Default::default() };
+        let options = msl::Options {
+            lang_version: (3, 1),
+            fake_missing_bindings: false,
+            per_entry_point_map: module.entry_points.iter().map(|ep| (ep.name.clone(), entry.clone())).collect(),
+            zero_initialize_workgroup_memory: false,
+            force_loop_bounding: mode == "Checked",
+            emit_int_div_checks: false,
+            ..Default::default()
+        };
+        let (out, translated) = msl::write_string(&module, &info, &options, &msl::PipelineOptions::default()).unwrap_or_else(|e| panic!("{kernel} {mode}: {e:?}"));
+        // naga leaves out an entry point it cannot bind instead of failing
+        assert!(translated.entry_point_names.iter().all(|r| r.is_ok()), "{kernel} {mode}: {:?}", translated.entry_point_names);
+        let path = format!("naga_{kernel}_{}.metal", mode.to_lowercase());
+        std::fs::write(&path, &out).unwrap();
+        println!("{path}: {} lines", out.lines().count());
+        written.push(path);
+    }
+    written.sort();
+    assert_eq!(written, ["naga_conv_gemm4_kernel_checked.metal", "naga_conv_gemm4_kernel_unchecked.metal", "naga_gemm4_kernel_checked.metal", "naga_gemm4_kernel_unchecked.metal"]);
 }
 
 /// The bidirectional pass alone, against unimatch with the gate of matches_pytorch: run several times in fresh processes

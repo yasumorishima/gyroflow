@@ -23,6 +23,8 @@ burn = { version = "=0.22.1", default-features = false, features = ["std", "auto
 [dev-dependencies]
 # The CPU preprocessing of Gyroflow (gmflow.rs), which the GPU one must match
 image = { version = "=0.25.10", default-features = false }
+# The WGSL -> MSL translation of wgpu 30 on Metal, run on the logged kernel sources (naga_msl)
+naga = { version = "=30.0.1", features = ["wgsl-in", "msl-out"] }
 
 [features]
 # Native MSL kernels on Metal (cooperative matrices), falling back to WGSL where the device or the compiler lacks it
