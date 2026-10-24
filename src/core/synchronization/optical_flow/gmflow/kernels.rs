@@ -803,8 +803,8 @@ fn conv_gemm4_kernel<F: Float, N: Size>(
     // step (tile_b is at most the 256 threads); the top left of their windows in x
     let bkk = t / bnv;
     let bc = t % bnv;
-    let mut iy0 = Array::<i32>::new(4);
-    let mut ix0 = Array::<i32>::new(4);
+    let mut iy0 = Array::<i32>::new(4usize);
+    let mut ix0 = Array::<i32>::new(4usize);
     #[unroll]
     for j in 0..4 {
         let p = (n0 + bc) * 4usize + j;
