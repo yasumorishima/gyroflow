@@ -835,26 +835,34 @@ fn conv_gemm4_kernel<F: Float, N: Size>(
             let am = idx / kstep;
             let ak = idx % kstep;
             let mut va = zero;
-            if m0 + am < m_n && k0 + ak < k_n {
-                va = a[(m0 + am) * k_n + k0 + ak];
+            if m0 + am < m_n {
+                if k0 + ak < k_n {
+                    va = a[(m0 + am) * k_n + k0 + ak];
+                }
             }
             a_s[ak * a_row + am] = va;
         }
         if t < tile_b {
             let mut vb = zv;
             let k = k0 + bkk;
-            if k < k_n && n0 + bc < nv {
-                let c = k / khw;
-                let r = k % khw;
-                let ky = (r / kw) as i32;
-                let kx = (r % kw) as i32;
-                let base = x_base + c * h * w;
-                #[unroll]
-                for j in 0..4 {
-                    let iy = iy0[j] + ky;
-                    let ix = ix0[j] + kx;
-                    if iy >= 0 && iy < h as i32 && ix >= 0 && ix < w as i32 {
-                        vb.insert_dynamic(j, x[base + iy as usize * w + ix as usize]);
+            // Nested tests, no &&: naga turns each && of WGSL into branches on a local bool (this kernel had 15), which
+            // the MSL that cubecl writes does not have. One unsigned compare per axis: a negative index wraps above the size
+            if k < k_n {
+                if n0 + bc < nv {
+                    let c = k / khw;
+                    let r = k % khw;
+                    let ky = (r / kw) as i32;
+                    let kx = (r % kw) as i32;
+                    let base = x_base + c * h * w;
+                    #[unroll]
+                    for j in 0..4 {
+                        let iy = iy0[j] + ky;
+                        let ix = ix0[j] + kx;
+                        if (iy as u32) < h as u32 {
+                            if (ix as u32) < w as u32 {
+                                vb.insert_dynamic(j, x[base + iy as usize * w + ix as usize]);
+                            }
+                        }
                     }
                 }
             }
