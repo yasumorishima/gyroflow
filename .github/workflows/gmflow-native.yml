@@ -263,7 +263,9 @@ jobs:
             case $v in
               none*) want="meta_rewrites=0 override=false lang_set=true invariance_set=true" ;;
               default_options) want="meta_rewrites=0 override=false lang_set=false invariance_set=false" ;;
-              meta_constant) want="meta_rewrites=1 override=false lang_set=true invariance_set=true" ;;
+              # Since round 6h the implicit kernel takes its sizes as constants and may read no metadata at all; then
+              # naga has no info parameter to rewrite (checked below against the dumped source)
+              meta_constant) want="meta_rewrites=[01] override=false lang_set=true invariance_set=true" ;;
             esac
             # Every compile of the implicit kernel (checked and unchecked) as the variant says, and at least one. Explicit
             # exits: bash -e does not stop on a negated command or on one before the last of an && list
@@ -273,8 +275,14 @@ jobs:
             ls msl_$v/conv_gemm4_kernel*.metal
           done
           for f in msl_meta_constant/conv_gemm4_kernel*.metal; do
-            if ! grep -q "constant info_st const\* info_var" "$f" || grep -q "info_var\." "$f"; then echo "meta_constant: $f not rewritten"; exit 1; fi
+            if grep -q "info_var" "$f"; then
+              if ! grep -q "constant info_st const\* info_var" "$f" || grep -q "info_var\." "$f"; then echo "meta_constant: $f not rewritten"; exit 1; fi
+              echo "$f: info rewritten"
+            else
+              echo "$f: no info parameter"
+            fi
           done
+          grep -c "info_var" msl_none/conv_gemm4_kernel*.metal || true
           if grep -q "constant info_st" msl_none/conv_gemm4_kernel*.metal msl_none_again/conv_gemm4_kernel*.metal; then echo "stock: rewritten"; exit 1; fi
           head -n 1 msl_none/conv_gemm4_kernel*.metal
           # The whole WGSL path with the info buffer as a constant pointer (round 6f: implicit 27.6 -> 17.2 ms): every
