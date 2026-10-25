@@ -1,0 +1,62 @@
+# Work branch only (never part of #1143): the matmul on the matrix units of Apple GPUs from WGSL (ci-coop, wgpu's
+# cooperative matrices, simdgroup_matrix on Metal) on the macOS runners: does the paravirtual GPU offer them, does the
+# kernel match burn's matmul, and how fast is it against kernels::gemm at the shapes of the model.
+name: gmflow coop
+
+on:
+  push:
+    branches: ['wip/gmflow-native']
+    paths: ['ci-coop/**', '.github/workflows/gmflow-coop.yml']
+  workflow_dispatch:
+    inputs:
+      memo:
+        description: why this run
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gmflow-coop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  coop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    name: coop-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: ci-coop
+    steps:
+      - uses: actions/checkout@v4
+      - name: macOS version
+        run: sw_vers
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustc --version
+      - name: Build the tests
+        run: time cargo test --release --test coop --no-run
+      - name: The generated WGSL and the MSL naga makes of it
+        run: |
+          cargo test --release --test coop -- --ignored --nocapture --exact coop_source 2>&1 | tee source.log
+          grep -q "test result: ok. 1 passed" source.log
+      - name: Against burn's matmul, then timed against kernels::gemm
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --release --test coop -- --ignored --nocapture --exact coop_gemm 2>&1 | tee coop.log
+          grep -q "test result: ok. 1 passed" coop.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coop-${{ matrix.os }}
+          retention-days: 7
+          path: |
+            ci-coop/*.log
+            ci-coop/Cargo.lock

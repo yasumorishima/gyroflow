@@ -1,0 +1,21 @@
+# Work branch only (never part of #1143): a probe of the matrix units of Apple GPUs from WGSL (src/coop.rs) on the
+# macOS runners, next to the model's kernels::gemm, in its own crate and workflow (gmflow-coop.yml). Metal only.
+[package]
+name = "gmflow-coop"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+burn-cubecl = { version = "=0.22.1" }
+cubecl = { version = "=0.11.1" }
+burn = { version = "=0.22.1", default-features = false, features = ["std", "autotune", "fusion", "cubecl", "extension", "wgpu"] }
+
+[dev-dependencies]
+# The WGSL -> MSL translation of wgpu 30 on Metal, run on the generated kernel (coop_source)
+naga = { version = "=30.0.1", features = ["wgsl-in", "msl-out"] }
+
+[profile.release]
+debug = false
