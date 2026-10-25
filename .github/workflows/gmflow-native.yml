@@ -274,7 +274,7 @@ jobs:
           for f in msl_meta_constant/conv_gemm4_kernel*.metal; do
             if ! grep -q "constant info_st const\* info_var" "$f" || grep -q "info_var\." "$f"; then echo "meta_constant: $f not rewritten"; exit 1; fi
           done
-          if grep -q "constant info_st" msl_none/conv_gemm4_kernel*.metal; then echo "none: rewritten"; exit 1; fi
+          if grep -q "constant info_st" msl_none/conv_gemm4_kernel*.metal msl_none_again/conv_gemm4_kernel*.metal; then echo "stock: rewritten"; exit 1; fi
           head -n 1 msl_none/conv_gemm4_kernel*.metal
       - uses: actions/upload-artifact@v4
         if: always()

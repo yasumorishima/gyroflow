@@ -33,7 +33,9 @@ new = """                // gmflow round 6f (CI only, wgpu_hal_hook.py)
                 if gm_has("meta_constant") {
                     let from = "device info_st const& info_var";
                     gm_rewrites = source.matches(from).count();
-                    source = source.replace(from, "constant info_st const* info_var").replace("info_var.", "info_var->");
+                    if gm_rewrites > 0 {
+                        source = source.replace(from, "constant info_st const* info_var").replace("info_var.", "info_var->");
+                    }
                 }
                 let mut gm_override = false;
                 if let Ok(dir) = std::env::var("GMFLOW_MSL_OVERRIDE") {

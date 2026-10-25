@@ -841,11 +841,12 @@ fn implicit_variants() {
     let im2col = to_vec(kernels::conv2d_im2col(x.clone(), wt.clone(), None, 1, [1, 1], 120 << 20, true));
     let (max, mean, scale) = diff(&implicit, &im2col);
     println!("VAR {variant:16} implicit against im2col + kernels::gemm: max {max:.2e}, mean {mean:.2e} (values up to {scale:.2e})");
-    assert!(scale > 0.0, "{variant}: the implicit conv is all zero");
+    assert!(scale > 0.0 && scale.is_finite(), "{variant}: the implicit conv is all zero or not finite ({scale:e})");
     assert!(max <= 1e-5 * scale, "{variant}: the implicit conv differs from im2col + kernels::gemm by {max:e}");
     // 64 outputs on the CPU (padding 1, stride 1), corners and edges included: each within 1e-4 of the sum of the
     // absolute products. float32 rounding of a sum of 2304 products is of order 1e-6 to 1e-5 of it; one wrong or
-    // missing tap is about 1/2304 = 4e-4
+    // missing tap is about 1/2304 = 4e-4 on average (systematic errors, as a wrong offset, are far over it; the comparison
+    // with im2col + kernels::gemm above covers every output)
     let (xs, ws) = (to_vec(x.clone()), to_vec(wt.clone()));
     let (hh, ww) = (H / 4, W / 4);
     let mut worst = 0f64;
@@ -865,6 +866,8 @@ fn implicit_variants() {
             }
         }
         let err = (implicit[(co * hh + oy) * ww + ox] as f64 - sum).abs() / abs.max(1e-30);
+        // Each one (a NaN would pass a running max)
+        assert!(err <= 1e-4, "{variant}: the implicit conv at co {co}, y {oy}, x {ox} is off the CPU by {err:e} of the absolute sum");
         worst = worst.max(err);
     }
     println!("VAR {variant:16} implicit against the CPU at 64 outputs: worst error {worst:.2e} of the sum of absolute products");
