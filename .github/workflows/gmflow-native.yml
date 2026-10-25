@@ -276,6 +276,25 @@ jobs:
           done
           if grep -q "constant info_st" msl_none/conv_gemm4_kernel*.metal msl_none_again/conv_gemm4_kernel*.metal; then echo "stock: rewritten"; exit 1; fi
           head -n 1 msl_none/conv_gemm4_kernel*.metal
+          # The whole WGSL path with the info buffer as a constant pointer (round 6f: implicit 27.6 -> 17.2 ms): every
+          # matmul and conv of matmul_ceiling and the stages, stock against meta_constant in the same build, then the model
+          # against PyTorch with its warm timings under meta_constant (the stock ones are in pytorch.log). The autotune cache
+          # of the earlier steps is kept, so both pick the same kernels
+          export GMFLOW_BPK="$RUNNER_TEMP/gmflow.bpk" GMFLOW_REF_DIR="$GITHUB_WORKSPACE/ci-gpu/out"
+          for v in none meta_constant; do
+            var=$v; [ "$v" = none ] && var=
+            GMFLOW_MSL_VARIANT=$var cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matmul_ceiling > ceil_$v.log 2>&1 || { tail -n 40 ceil_$v.log; exit 1; }
+            grep "^CEIL " ceil_$v.log | sed "s/^/$v /"
+            GMFLOW_MSL_VARIANT=$var GMFLOW_PROFILE_OPS="${{ matrix.best }}" cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact stage_times > stages_$v.log 2>&1 || { tail -n 40 stages_$v.log; exit 1; }
+            tail -n 30 stages_$v.log
+          done
+          GMFLOW_MSL_VARIANT=meta_constant GMFLOW_WARM_RUNS=10 GMFLOW_IM2COL="${{ matrix.im2col }}" cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matches_pytorch > pytorch_meta_constant.log 2>&1 || { tail -n 60 pytorch_meta_constant.log; exit 1; }
+          grep -E "^warm,|test result" pytorch_meta_constant.log
+          # Which compiles had the info parameter rewritten (a kernel without metadata has none to rewrite)
+          for f in ceil_meta_constant.log stages_meta_constant.log pytorch_meta_constant.log; do
+            echo "$f: $(grep -c 'GMFLOW_MSL_HOOK .*variant=meta_constant meta_rewrites=1' "$f" || true) compiles rewritten, $(grep -c 'GMFLOW_MSL_HOOK .*variant=meta_constant meta_rewrites=0' "$f" || true) without the parameter"
+            if ! grep -q 'GMFLOW_MSL_HOOK .*variant=meta_constant meta_rewrites=1' "$f"; then echo "$f: nothing rewritten"; exit 1; fi
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
