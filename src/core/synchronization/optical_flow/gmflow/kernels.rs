@@ -796,8 +796,6 @@ fn conv_gemm4_kernel<F: Float, N: Size>(
     let loads_a = comptime!(16 * pm * kstep / 256);
     let tile_b = comptime!(kstep * 4 * pn);
     let khw = comptime!(kh * kw);
-    let phi = comptime!(ph as i32);
-    let pwi = comptime!(pw as i32);
     let m0 = CUBE_POS_Y as usize * bm;
     let n0 = CUBE_POS_X as usize * bnv;
     let tx = UNIT_POS_X as usize;
@@ -814,16 +812,18 @@ fn conv_gemm4_kernel<F: Float, N: Size>(
         acc[i] = zv;
     }
     // This thread's load of b: row bkk of the tile and the 4 output positions of vector column bc, the same at every k
-    // step (tile_b is at most the 256 threads); the top left of their windows in x
+    // step (tile_b is at most the 256 threads); the top left of their windows in x. Unsigned only: above the map the
+    // subtraction wraps around and adding ky or kx wraps back, so one compare per axis tests 0 <= index < size. naga
+    // wraps every signed add, subtract and multiply in as_type casts on Metal (this kernel had 16); the MSL of cubecl does not
     let bkk = t / bnv;
     let bc = t % bnv;
-    let mut iy0 = Array::<i32>::new(4usize);
-    let mut ix0 = Array::<i32>::new(4usize);
+    let mut iy0 = Array::<usize>::new(4usize);
+    let mut ix0 = Array::<usize>::new(4usize);
     #[unroll]
     for j in 0..4 {
         let p = (n0 + bc) * 4usize + j;
-        iy0[j] = ((p / ow) * stride) as i32 - phi;
-        ix0[j] = ((p % ow) * stride) as i32 - pwi;
+        iy0[j] = (p / ow) * stride - ph;
+        ix0[j] = (p % ow) * stride - pw;
     }
     let x_base = batch * c_n * h * w;
     let k_tiles = (k_n + kstep - 1usize) / kstep;
@@ -845,22 +845,22 @@ fn conv_gemm4_kernel<F: Float, N: Size>(
         if t < tile_b {
             let mut vb = zv;
             let k = k0 + bkk;
-            // Nested tests, no &&: naga turns each && of WGSL into branches on a local bool (this kernel had 15), which
-            // the MSL that cubecl writes does not have. One unsigned compare per axis: a negative index wraps above the size
+            // Nested tests, no && (round 6c: naga turns each && of WGSL into branches on a local bool; removing them
+            // alone did not change the time)
             if k < k_n {
                 if n0 + bc < nv {
                     let c = k / khw;
                     let r = k % khw;
-                    let ky = (r / kw) as i32;
-                    let kx = (r % kw) as i32;
+                    let ky = r / kw;
+                    let kx = r % kw;
                     let base = x_base + c * h * w;
                     #[unroll]
                     for j in 0..4 {
                         let iy = iy0[j] + ky;
                         let ix = ix0[j] + kx;
-                        if (iy as u32) < h as u32 {
-                            if (ix as u32) < w as u32 {
-                                vb.insert_dynamic(j, x[base + iy as usize * w + ix as usize]);
+                        if iy < h {
+                            if ix < w {
+                                vb.insert_dynamic(j, x[base + iy * w + ix]);
                             }
                         }
                     }
