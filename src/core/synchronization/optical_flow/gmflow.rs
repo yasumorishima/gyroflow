@@ -277,13 +277,14 @@ mod inference {
         // layers) by kernels::gemm (WGSL on the macOS CI GPU: the linear layers too, 3.08 s a pass against 3.29 s)
         let own = im2col_is_faster(device);
         let gemm = own && gemm_fits(device);
-        // The convolutions of 32 and more outputs by implicit GEMM instead of im2col + kernels::gemm: measured on Apple
-        // GPUs only (WGSL on the macOS 14 CI GPU: 1.67 -> 1.35 s a pass), where it needs the sizes as compile-time
-        // constants (kernels::conv_gemm4_kernel: naga binds cubecl's metadata in device memory on Metal)
-        let implicit = gemm && cfg!(target_vendor = "apple");
+        // The convolutions of more than 1x1 by implicit GEMM instead of im2col + kernels::gemm: measured on Apple GPUs
+        // only (WGSL on the macOS 14 CI GPU: 1.67 -> 1.35 s a pass), so not on the AMD and Intel GPUs of Intel Macs. It
+        // needs the sizes as compile-time constants there (kernels::conv_gemm4_kernel: naga binds cubecl's metadata in
+        // device memory on Metal)
+        let implicit = gemm && cfg!(target_vendor = "apple") && on_apple_gpu();
         statics.ops = Ops { conv_im2col: own, own_gemm: gemm, gemm_linear: gemm, fused: own, implicit, ..OPS };
         log::info!("gmflow: convolutions {}", match (own, gemm, implicit) {
-            (true, true, true) => "by implicit GEMM kernels (im2col + kernels::gemm under 32 outputs), linear layers by kernels::gemm too",
+            (true, true, true) => "by implicit GEMM kernels (the GRU's too; 1x1 by burn, the 2 outputs of the flow head by kernels::conv_small), linear layers by kernels::gemm",
             (true, true, false) => "as im2col + kernels::gemm, linear layers by kernels::gemm too",
             (true, false, _) => "as im2col + matmul",
             _ => "by burn",
@@ -291,6 +292,12 @@ mod inference {
         let r = std::sync::Arc::new(Runner { model, statics });
         *slot = Some(r.clone());
         Ok(r)
+    }
+
+    // An Apple GPU: the adapter's name, which init puts after "wgpu: " in the device name (Apple M1 ..., Apple
+    // Paravirtual device), not an AMD or Intel GPU of an Intel Mac
+    fn on_apple_gpu() -> bool {
+        gpu().map(|(_, name)| name.starts_with("wgpu: Apple")).unwrap_or(false)
     }
 
     // Which implementations run: see model.rs, Ops. The convolutions are chosen per GPU (im2col_is_faster), and so are the
@@ -332,6 +339,7 @@ mod inference {
     #[cfg(test)]
     pub fn convolutions() -> &'static str {
         match &*RUNNER.lock() {
+            Some(r) if r.statics.ops.implicit => "implicit GEMM + kernels::gemm",
             Some(r) if r.statics.ops.own_gemm => "im2col + kernels::gemm",
             Some(r) if r.statics.ops.conv_im2col => "im2col + matmul",
             Some(_) => "by burn",
