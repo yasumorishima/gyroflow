@@ -804,6 +804,53 @@ fn naga_msl() {
     assert_eq!(written, ["naga_conv_gemm4_kernel_checked.metal", "naga_conv_gemm4_kernel_unchecked.metal", "naga_gemm4_kernel_checked.metal", "naga_gemm4_kernel_unchecked.metal"]);
 }
 
+/// The implicit GEMM conv of matmul_ceiling, with im2col + kernels::gemm and kernels::gemm alone as controls, timed the
+/// same way: run once per GMFLOW_MSL_VARIANT in its own process with wgpu-hal patched to change what it hands to Metal
+/// (wgpu_hal_hook.py), to tell whether the WGSL path loses on naga's MSL or on the compile options. The variant only
+/// labels the rows here; the implicit conv must still equal im2col + kernels::gemm (equal before, in all three paths)
+#[test]
+#[ignore]
+fn implicit_variants() {
+    let (device, name) = device();
+    let variant = std::env::var("GMFLOW_MSL_VARIANT").unwrap_or_default();
+    let variant = if variant.is_empty() { "stock".to_owned() } else { variant };
+    println!("device: {name}, variant {variant}");
+    let rnd3 = |s: [usize; 3]| Tensor::<3>::random(s, Distribution::Normal(0.0, 1.0), &device);
+    let rnd4 = |s: [usize; 4]| Tensor::<4>::random(s, Distribution::Normal(0.0, 1.0), &device);
+    let time = |label: &str, flops: f64, f: &dyn Fn() -> Tensor<1>| {
+        let mut keep = None;
+        for _ in 0..3 { keep = Some(f()); }
+        device.sync().expect("sync");
+        let reps = 10;
+        let start = Instant::now();
+        for _ in 0..reps { keep = Some(f()); }
+        device.sync().expect("sync");
+        drop(keep);
+        let secs = start.elapsed().as_secs_f64() / reps as f64;
+        println!("VAR {variant:16} {label:44} {:9.2} ms {:8.0} GFLOPS", secs * 1e3, flops / secs / 1e9);
+    };
+    let first = |t: Tensor<3>| t.slice([0..1, 0..1, 0..1]).reshape([1]);
+    let first4 = |t: Tensor<4>| t.slice([0..1, 0..1, 0..1, 0..1]).reshape([1]);
+    // The shapes of matmul_ceiling: conv 256->192 3x3 at 1/4, one image
+    let (n, cout, k, l) = (1usize, 192usize, 256 * 9, (H / 4) * (W / 4));
+    let conv_flops = 2.0 * (n * cout * k * l) as f64;
+    let x = rnd4([n, 256, H / 4, W / 4]);
+    let wt = rnd4([cout, 256, 3, 3]);
+    let implicit = to_vec(kernels::conv2d_implicit(x.clone(), wt.clone(), None, 1, [1, 1]));
+    let im2col = to_vec(kernels::conv2d_im2col(x.clone(), wt.clone(), None, 1, [1, 1], 120 << 20, true));
+    let (max, mean, scale) = diff(&implicit, &im2col);
+    println!("VAR {variant:16} implicit against im2col + kernels::gemm: max {max:.2e}, mean {mean:.2e} (values up to {scale:.2e})");
+    assert!(max <= 1e-5 * scale, "{variant}: the implicit conv differs from im2col + kernels::gemm by {max:e}");
+    time("implicit gemm (conv2d_implicit)", conv_flops, &|| first4(kernels::conv2d_implicit(x.clone(), wt.clone(), None, 1, [1, 1])));
+    time("im2col kernel + kernels::gemm", conv_flops, &|| first4(kernels::conv2d_im2col(x.clone(), wt.clone(), None, 1, [1, 1], 120 << 20, true)));
+    let w = rnd3([1, cout, k]);
+    let cols = rnd3([n, k, l]);
+    time("kernels::gemm [1,Co,K]@[1,K,L]", conv_flops, &|| first(kernels::gemm(w.clone(), cols.clone(), None)));
+    kernels::GEMM4_UNCHECKED.store(true, Ordering::Relaxed);
+    time("implicit gemm (conv2d_implicit), unchecked", conv_flops, &|| first4(kernels::conv2d_implicit(x.clone(), wt.clone(), None, 1, [1, 1])));
+    kernels::GEMM4_UNCHECKED.store(false, Ordering::Relaxed);
+}
+
 /// The bidirectional pass alone, against unimatch with the gate of matches_pytorch: run several times in fresh processes
 /// with the autotune cache off (the workflow), to catch a wrong result that depends on which kernels autotune picks
 #[test]
