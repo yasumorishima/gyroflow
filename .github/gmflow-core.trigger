@@ -16,3 +16,4 @@ flow_double 2026-10-23T09:20:13Z
 round 4b: fused kernels on by default
 round 4c: gemm4 as the default gemm
 round 5: implicit gemm (Ops.implicit, off in production)
+implicit GEMM convolutions on Apple
