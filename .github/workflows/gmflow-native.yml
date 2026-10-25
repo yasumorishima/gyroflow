@@ -238,6 +238,7 @@ jobs:
       - name: The implicit conv with wgpu-hal handing Metal other compile options or another source (naga against the options)
         if: matrix.name == 'metal-wgsl-15' && !cancelled()
         run: |
+          rm -f cubecl.toml
           # wgpu-hal from crates.io, checked against the checksum in the crates.io index, patched by wgpu_hal_hook.py and
           # used for this step only (the earlier steps ran the stock one)
           hv=30.0.1
@@ -277,23 +278,37 @@ jobs:
           if grep -q "constant info_st" msl_none/conv_gemm4_kernel*.metal msl_none_again/conv_gemm4_kernel*.metal; then echo "stock: rewritten"; exit 1; fi
           head -n 1 msl_none/conv_gemm4_kernel*.metal
           # The whole WGSL path with the info buffer as a constant pointer (round 6f: implicit 27.6 -> 17.2 ms): every
-          # matmul and conv of matmul_ceiling and the stages, stock against meta_constant in the same build, then the model
-          # against PyTorch with its warm timings under meta_constant (the stock ones are in pytorch.log). The autotune cache
-          # of the earlier steps is kept, so both pick the same kernels
+          # matmul and conv of matmul_ceiling, the stages, and the model against PyTorch with its warm timings, stock,
+          # rewritten, stock again (order and spread), in the same build. Autotune's cache is off in each process, so each
+          # variant picks its own kernels (cached choices would carry stock's tuning over), and its choices are logged
           export GMFLOW_BPK="$RUNNER_TEMP/gmflow.bpk" GMFLOW_REF_DIR="$GITHUB_WORKSPACE/ci-gpu/out"
-          for v in none meta_constant; do
-            var=$v; [ "$v" = none ] && var=
-            GMFLOW_MSL_VARIANT=$var cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matmul_ceiling > ceil_$v.log 2>&1 || { tail -n 40 ceil_$v.log; exit 1; }
-            grep "^CEIL " ceil_$v.log | sed "s/^/$v /"
-            GMFLOW_MSL_VARIANT=$var GMFLOW_PROFILE_OPS="${{ matrix.best }}" cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact stage_times > stages_$v.log 2>&1 || { tail -n 40 stages_$v.log; exit 1; }
-            tail -n 30 stages_$v.log
-          done
-          GMFLOW_MSL_VARIANT=meta_constant GMFLOW_WARM_RUNS=10 GMFLOW_IM2COL="${{ matrix.im2col }}" cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact matches_pytorch > pytorch_meta_constant.log 2>&1 || { tail -n 60 pytorch_meta_constant.log; exit 1; }
-          grep -E "^warm,|test result" pytorch_meta_constant.log
-          # Which compiles had the info parameter rewritten (a kernel without metadata has none to rewrite)
-          for f in ceil_meta_constant.log stages_meta_constant.log pytorch_meta_constant.log; do
-            echo "$f: $(grep -c 'GMFLOW_MSL_HOOK .*variant=meta_constant meta_rewrites=1' "$f" || true) compiles rewritten, $(grep -c 'GMFLOW_MSL_HOOK .*variant=meta_constant meta_rewrites=0' "$f" || true) without the parameter"
-            if ! grep -q 'GMFLOW_MSL_HOOK .*variant=meta_constant meta_rewrites=1' "$f"; then echo "$f: nothing rewritten"; exit 1; fi
+          for v in none meta_constant none_again; do
+            var=$v; case $v in none*) var= ;; esac
+            for t in matmul_ceiling stage_times matches_pytorch; do
+              { echo '[autotune]'; echo 'disable_cache = true'; echo '[autotune.logger]'; echo 'level = "full"'; echo "file = \"autotune_6g_${t}_$v.log\""; } > cubecl.toml
+              if ! GMFLOW_MSL_VARIANT=$var GMFLOW_PROFILE_OPS="${{ matrix.best }}" GMFLOW_WARM_RUNS=10 GMFLOW_IM2COL="${{ matrix.im2col }}" cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact $t > ${t}_$v.log 2>&1; then
+                echo "$v $t: FAILED"
+                grep -v GMFLOW_MSL_HOOK ${t}_$v.log | grep -E '^(BISTAGE|AFTER)|plain ops|panicked|max \|' | tail -n 60 || true
+                rm -f cubecl.toml
+                exit 1
+              fi
+            done
+            rm -f cubecl.toml
+            if ! grep -q '^CEIL .* ms' matmul_ceiling_$v.log; then echo "$v: no CEIL lines"; exit 1; fi
+            if ! grep -q '^warm, ' matches_pytorch_$v.log; then echo "$v: no warm lines"; exit 1; fi
+            grep '^CEIL .* ms' matmul_ceiling_$v.log | sed "s/^/$v /"
+            grep -v GMFLOW_MSL_HOOK stage_times_$v.log | sed -n '/^one pass/,/^test result/p'
+            grep '^warm, ' matches_pytorch_$v.log | sed "s/^/$v /"
+            # What each compile was given, by entry point (a kernel without metadata has no parameter to rewrite)
+            echo "$v: $(cat matmul_ceiling_$v.log stage_times_$v.log matches_pytorch_$v.log | grep -o 'GMFLOW_MSL_HOOK .*' | sed 's/^GMFLOW_MSL_HOOK entry=[^ ]* //' | sort | uniq -c | tr '\n' ';')"
+            case $v in
+              meta_constant)
+                for t in matmul_ceiling stage_times matches_pytorch; do
+                  if ! grep -q 'GMFLOW_MSL_HOOK .*variant=meta_constant meta_rewrites=1' ${t}_$v.log; then echo "$t: nothing rewritten"; exit 1; fi
+                done ;;
+              *)
+                if cat matmul_ceiling_$v.log stage_times_$v.log matches_pytorch_$v.log | grep -q 'GMFLOW_MSL_HOOK .*meta_rewrites=[1-9]'; then echo "$v: rewritten"; exit 1; fi ;;
+            esac
           done
       - uses: actions/upload-artifact@v4
         if: always()
