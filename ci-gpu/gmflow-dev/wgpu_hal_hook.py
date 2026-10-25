@@ -2,9 +2,11 @@
 
 The variant is a comma list of:
   default_options  MTLCompileOptions as created (what wgpu-hal gives the MSL passthrough that cubecl's msl feature uses)
-  lang_default     only leave the MSL version unset (Metal then takes the newest it has)
+  lang_default     only leave the MSL version unset (Metal then takes the newest it has: on macOS 15 that is the 3.2
+                   wgpu-hal sets, adapter.rs:707-710, so there it changes nothing)
   no_invariance    only leave preserveInvariance unset
-  meta_constant    bind cubecl's info buffer in the constant address space, as cubecl's own MSL does, instead of device
+  meta_constant    bind cubecl's info buffer as a constant pointer, as cubecl's own MSL does, instead of a device
+                   reference (every use of info_var in naga's output is a member access, info_var.)
 GMFLOW_MSL_DUMP=<dir> writes each source as compiled, GMFLOW_MSL_OVERRIDE=<dir> compiles <dir>/<entry point>.metal instead
 when that file exists. Each compile prints one GMFLOW_MSL_HOOK line, which the workflow checks.
 """
@@ -31,7 +33,7 @@ new = """                // gmflow round 6f (CI only, wgpu_hal_hook.py)
                 if gm_has("meta_constant") {
                     let from = "device info_st const& info_var";
                     gm_rewrites = source.matches(from).count();
-                    source = source.replace(from, "constant info_st& info_var");
+                    source = source.replace(from, "constant info_st const* info_var").replace("info_var.", "info_var->");
                 }
                 let mut gm_override = false;
                 if let Ok(dir) = std::env::var("GMFLOW_MSL_OVERRIDE") {

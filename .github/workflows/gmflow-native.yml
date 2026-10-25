@@ -241,8 +241,8 @@ jobs:
           # wgpu-hal from crates.io, checked against the checksum in the crates.io index, patched by wgpu_hal_hook.py and
           # used for this step only (the earlier steps ran the stock one)
           hv=30.0.1
-          curl -sSfL -o "$RUNNER_TEMP/wgpu-hal.crate" "https://static.crates.io/crates/wgpu-hal/wgpu-hal-$hv.crate"
-          want=$(curl -sSfL https://index.crates.io/wg/pu/wgpu-hal | python3 -c 'import json, sys; v = sys.argv[1]; print(next(e["cksum"] for e in map(json.loads, sys.stdin) if e["vers"] == v))' "$hv")
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/wgpu-hal.crate" "https://static.crates.io/crates/wgpu-hal/wgpu-hal-$hv.crate"
+          want=$(curl -sSfL --retry 3 https://index.crates.io/wg/pu/wgpu-hal | python3 -c 'import json, sys; v = sys.argv[1]; print(next(e["cksum"] for e in map(json.loads, sys.stdin) if e["vers"] == v))' "$hv")
           got=$(shasum -a 256 "$RUNNER_TEMP/wgpu-hal.crate" | cut -d' ' -f1)
           echo "wgpu-hal $hv sha256 $got, index $want"
           [ "$got" = "$want" ]
@@ -250,28 +250,31 @@ jobs:
           python3 wgpu_hal_hook.py "$RUNNER_TEMP/wgpu-hal-$hv"
           printf '\n[patch.crates-io]\nwgpu-hal = { path = "%s" }\n' "$RUNNER_TEMP/wgpu-hal-$hv" >> Cargo.toml
           cargo test --release --features "${{ matrix.features }}" --test native --no-run
-          # Each variant in its own process; the hook line of the implicit kernel shows what Metal was given
-          for v in none default_options lang_default no_invariance meta_constant; do
-            var=$v; [ "$v" = none ] && var=
+          # Each variant in its own process; the hook line of the implicit kernel shows what Metal was given. On macOS 15
+          # wgpu-hal already asks for MSL 3.2, the newest, so default_options only drops preserveInvariance; the stock
+          # build runs first and last, which gives the spread between runs
+          for v in none default_options meta_constant none_again; do
+            var=$v; case $v in none*) var= ;; esac
             GMFLOW_MSL_VARIANT=$var GMFLOW_MSL_DUMP=msl_$v cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact implicit_variants > variant_$v.log 2>&1 || { tail -n 40 variant_$v.log; exit 1; }
             grep -E "^VAR |test result" variant_$v.log
             hook=$(grep "GMFLOW_MSL_HOOK entry=conv_gemm4_kernel" variant_$v.log | sort -u || true)
             echo "$hook"
             case $v in
-              none) want="meta_rewrites=0 override=false lang_set=true invariance_set=true" ;;
+              none*) want="meta_rewrites=0 override=false lang_set=true invariance_set=true" ;;
               default_options) want="meta_rewrites=0 override=false lang_set=false invariance_set=false" ;;
-              lang_default) want="meta_rewrites=0 override=false lang_set=false invariance_set=true" ;;
-              no_invariance) want="meta_rewrites=0 override=false lang_set=true invariance_set=false" ;;
               meta_constant) want="meta_rewrites=1 override=false lang_set=true invariance_set=true" ;;
             esac
             # Every compile of the implicit kernel (checked and unchecked) as the variant says, and at least one. Explicit
             # exits: bash -e does not stop on a negated command or on one before the last of an && list
             if [ -z "$hook" ]; then echo "$v: no hook line for the implicit kernel"; exit 1; fi
+            if [ "$(echo "$hook" | grep -o 'entry=[^ ]*' | sort -u | wc -l)" -ne 2 ]; then echo "$v: not both implicit kernels (checked, unchecked)"; exit 1; fi
             if echo "$hook" | grep -v -q -- "$want"; then echo "$v: a compile not as the variant says ($want)"; exit 1; fi
             ls msl_$v/conv_gemm4_kernel*.metal
           done
-          if ! grep -q "constant info_st& info_var" msl_meta_constant/conv_gemm4_kernel*.metal; then echo "meta_constant: not rewritten"; exit 1; fi
-          if grep -q "constant info_st& info_var" msl_none/conv_gemm4_kernel*.metal; then echo "none: rewritten"; exit 1; fi
+          for f in msl_meta_constant/conv_gemm4_kernel*.metal; do
+            if ! grep -q "constant info_st const\* info_var" "$f" || grep -q "info_var\." "$f"; then echo "meta_constant: $f not rewritten"; exit 1; fi
+          done
+          if grep -q "constant info_st" msl_none/conv_gemm4_kernel*.metal; then echo "none: rewritten"; exit 1; fi
           head -n 1 msl_none/conv_gemm4_kernel*.metal
       - uses: actions/upload-artifact@v4
         if: always()

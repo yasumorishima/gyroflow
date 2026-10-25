@@ -807,7 +807,8 @@ fn naga_msl() {
 /// The implicit GEMM conv of matmul_ceiling, with im2col + kernels::gemm and kernels::gemm alone as controls, timed the
 /// same way: run once per GMFLOW_MSL_VARIANT in its own process with wgpu-hal patched to change what it hands to Metal
 /// (wgpu_hal_hook.py), to tell whether the WGSL path loses on naga's MSL or on the compile options. The variant only
-/// labels the rows here; the implicit conv must still equal im2col + kernels::gemm (equal before, in all three paths)
+/// labels the rows here. The implicit conv must still match a CPU conv at sampled outputs, equal im2col +
+/// kernels::gemm (equal before, in all three paths) and equal itself launched unchecked
 #[test]
 #[ignore]
 fn implicit_variants() {
@@ -840,7 +841,39 @@ fn implicit_variants() {
     let im2col = to_vec(kernels::conv2d_im2col(x.clone(), wt.clone(), None, 1, [1, 1], 120 << 20, true));
     let (max, mean, scale) = diff(&implicit, &im2col);
     println!("VAR {variant:16} implicit against im2col + kernels::gemm: max {max:.2e}, mean {mean:.2e} (values up to {scale:.2e})");
+    assert!(scale > 0.0, "{variant}: the implicit conv is all zero");
     assert!(max <= 1e-5 * scale, "{variant}: the implicit conv differs from im2col + kernels::gemm by {max:e}");
+    // 64 outputs on the CPU (padding 1, stride 1), corners and edges included: each within 1e-4 of the sum of the
+    // absolute products. float32 rounding of a sum of 2304 products is of order 1e-6 to 1e-5 of it; one wrong or
+    // missing tap is about 1/2304 = 4e-4
+    let (xs, ws) = (to_vec(x.clone()), to_vec(wt.clone()));
+    let (hh, ww) = (H / 4, W / 4);
+    let mut worst = 0f64;
+    for i in 0..64usize {
+        let co = (i * 37) % cout;
+        let (oy, ox) = match i { 0 => (0, 0), 1 => (hh - 1, ww - 1), 2 => (0, ww - 1), 3 => (hh - 1, 0), _ => ((i * 131) % hh, (i * 977) % ww) };
+        let (mut sum, mut abs) = (0f64, 0f64);
+        for ci in 0..256usize {
+            for ky in 0..3usize {
+                for kx in 0..3usize {
+                    let (iy, ix) = (oy + ky, ox + kx);
+                    if iy < 1 || ix < 1 || iy > hh || ix > ww { continue; }
+                    let p = xs[(ci * hh + iy - 1) * ww + ix - 1] as f64 * ws[((co * 256 + ci) * 3 + ky) * 3 + kx] as f64;
+                    sum += p;
+                    abs += p.abs();
+                }
+            }
+        }
+        let err = (implicit[(co * hh + oy) * ww + ox] as f64 - sum).abs() / abs.max(1e-30);
+        worst = worst.max(err);
+    }
+    println!("VAR {variant:16} implicit against the CPU at 64 outputs: worst error {worst:.2e} of the sum of absolute products");
+    assert!(worst <= 1e-4,"{variant}: the implicit conv is off the CPU by {worst:e} of the absolute sum");
+    kernels::GEMM4_UNCHECKED.store(true, Ordering::Relaxed);
+    let unchecked = to_vec(kernels::conv2d_implicit(x.clone(), wt.clone(), None, 1, [1, 1]));
+    kernels::GEMM4_UNCHECKED.store(false, Ordering::Relaxed);
+    let (umax, _, _) = diff(&unchecked, &implicit);
+    assert!(umax == 0.0, "{variant}: unchecked differs from checked by {umax:e}");
     time("implicit gemm (conv2d_implicit)", conv_flops, &|| first4(kernels::conv2d_implicit(x.clone(), wt.clone(), None, 1, [1, 1])));
     time("im2col kernel + kernels::gemm", conv_flops, &|| first4(kernels::conv2d_im2col(x.clone(), wt.clone(), None, 1, [1, 1], 120 << 20, true)));
     let w = rnd3([1, cout, k]);
