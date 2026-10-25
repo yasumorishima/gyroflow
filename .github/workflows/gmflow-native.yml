@@ -88,7 +88,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           sw_vers
-          xcrun -sdk macosx metal --version
+          xcrun -sdk macosx metal --version || echo "no Metal toolchain in this Xcode"
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable && rustc --version
       - name: Build the tests
