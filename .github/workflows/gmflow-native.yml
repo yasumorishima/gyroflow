@@ -263,8 +263,8 @@ jobs:
             case $v in
               none*) want="meta_rewrites=0 override=false lang_set=true invariance_set=true" ;;
               default_options) want="meta_rewrites=0 override=false lang_set=false invariance_set=false" ;;
-              # Since round 6h the implicit kernel takes its sizes as constants and may read no metadata at all; then
-              # naga has no info parameter to rewrite (checked below against the dumped source)
+              # Since round 6h the implicit kernel takes its sizes as constants and reads no metadata, so naga leaves
+              # the info parameter out and there is nothing to rewrite (both checked at the end, after the timings)
               meta_constant) want="meta_rewrites=[01] override=false lang_set=true invariance_set=true" ;;
             esac
             # Every compile of the implicit kernel (checked and unchecked) as the variant says, and at least one. Explicit
@@ -273,14 +273,6 @@ jobs:
             if [ "$(echo "$hook" | grep -o 'entry=[^ ]*' | sort -u | wc -l)" -ne 2 ]; then echo "$v: not both implicit kernels (checked, unchecked)"; exit 1; fi
             if echo "$hook" | grep -v -q -- "$want"; then echo "$v: a compile not as the variant says ($want)"; exit 1; fi
             ls msl_$v/conv_gemm4_kernel*.metal
-          done
-          for f in msl_meta_constant/conv_gemm4_kernel*.metal; do
-            if grep -q "info_var" "$f"; then
-              if ! grep -q "constant info_st const\* info_var" "$f" || grep -q "info_var\." "$f"; then echo "meta_constant: $f not rewritten"; exit 1; fi
-              echo "$f: info rewritten"
-            else
-              echo "$f: no info parameter"
-            fi
           done
           grep -c "info_var" msl_none/conv_gemm4_kernel*.metal || true
           if grep -q "constant info_st" msl_none/conv_gemm4_kernel*.metal msl_none_again/conv_gemm4_kernel*.metal; then echo "stock: rewritten"; exit 1; fi
@@ -318,6 +310,9 @@ jobs:
                 if cat matmul_ceiling_$v.log stage_times_$v.log matches_pytorch_$v.log | grep -q 'GMFLOW_MSL_HOOK .*meta_rewrites=[1-9]'; then echo "$v: rewritten"; exit 1; fi ;;
             esac
           done
+          # Round 6h: the implicit kernel, compiled stock, must read no metadata (no info parameter in naga's MSL)
+          if grep -l "info_var" msl_none/conv_gemm4_kernel*.metal msl_none_again/conv_gemm4_kernel*.metal; then echo "stock: the implicit kernel still reads metadata"; exit 1; fi
+          if grep "GMFLOW_MSL_HOOK entry=conv_gemm4_kernel" variant_meta_constant.log | grep -q "meta_rewrites=1"; then echo "meta_constant: the implicit kernel still had an info parameter"; exit 1; fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:

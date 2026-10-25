@@ -769,9 +769,10 @@ fn launch_gemm4(a: CubeTensor, b: CubeTensor, bias: Option<CubeTensor>, tile: Ge
 /// on the fly, zero outside of the map) instead of read from an im2col buffer, which for the 3x3 convolutions at 1/4 and
 /// 1/2 is 9 times the input, written and read once per convolution. a: the weight [1, Co, K], K = C KH KW in im2col order;
 /// out [N, Co, OH*OW], OH*OW a multiple of 4. Each output is summed over k in the same order as im2col + gemm4. The sizes
-/// are compile-time constants, one kernel per shape (the batch stays a launch dimension): read from cubecl's metadata
-/// they cost the WGSL path on Apple 60% (27.6 against 17.2 ms for the 3x3 256->192 at 1/4, macOS 15), as naga binds that
-/// buffer in device memory where cubecl's own MSL takes it as constant (rounds 6f and 6g, with wgpu-hal patched)
+/// are compile-time constants, one kernel per shape (the batch stays a launch dimension), so that the kernel reads none
+/// of cubecl's metadata: naga binds that buffer in device memory where cubecl's own MSL takes it as constant, and with
+/// wgpu-hal patched to bind it as constant this kernel took 17.2 against 27.6 ms on WGSL (the 3x3 256->192 at 1/4,
+/// macOS 15; rounds 6f and 6g). Whether the constants alone give that time is what round 6h measures
 #[cube(launch, launch_unchecked)]
 fn conv_gemm4_kernel<F: Float, N: Size>(
     a: &Tensor<F>,                  // [1, Co, K]
