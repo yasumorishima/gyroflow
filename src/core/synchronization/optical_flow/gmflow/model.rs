@@ -58,8 +58,8 @@ pub struct Ops {
     /// The transformer's linear layers by kernels::gemm too
     pub gemm_linear: bool,
     /// Split-window attention by kernels::window_attention (no window layout or roll in memory, the softmax in one
-    /// launch), the transformer's LayerNorms with their residual adds by kernels::layer_norm and the flow head's last
-    /// convolution (2 outputs) by kernels::conv_small
+    /// launch), the transformer's LayerNorms with their residual adds by kernels::layer_norm, the factored GRU's gates by
+    /// kernels::gru_gate and the flow head's last convolution (2 outputs) by kernels::conv_small
     pub fused: bool,
     /// The im2col convolutions with own_gemm (Co >= 32) and the GRU's by kernels::conv_gemm: the columns gathered in the
     /// matmul instead of made in memory
@@ -765,7 +765,7 @@ impl BasicUpdateBlock {
     fn forward(&self, net: Tensor<4>, inp: Tensor<4>, corr: Tensor<4>, flow: Tensor<4>, ops: Ops, factored: Option<(&GruFactored, &GruConstants)>) -> (Tensor<4>, Tensor<4>) {
         let motion = self.motion(flow, corr, ops);
         let net = match factored {
-            Some((g, c)) => g.step(c, net, motion, ops.conv_gemm(), ops.implicit),
+            Some((g, c)) => g.step(c, net, motion, ops.conv_gemm(), ops.implicit, ops.fused),
             None => self.gru(net, Tensor::cat(vec![inp, motion], 1), ops),
         };
         let delta = conv_fwd(&self.flow_head.conv2, relu(conv_fwd(&self.flow_head.conv1, net.clone(), ops)), ops);
@@ -891,10 +891,27 @@ impl GruFactored {
     }
 
     /// SepConvGRU(h0, [inp, motion]), the same as `BasicUpdateBlock::gru` up to the order of the sums
-    pub fn step(&self, c: &GruConstants, h0: Tensor<4>, motion: Tensor<4>, gemm: Gemm, implicit: bool) -> Tensor<4> {
+    pub fn step(&self, c: &GruConstants, h0: Tensor<4>, motion: Tensor<4>, gemm: Gemm, implicit: bool, fused: bool) -> Tensor<4> {
         let [n, ch, hh, ww] = h0.dims();
         let flat = |t: Tensor<4>| t.reshape([n, ch, hh * ww]);
         let map = |t: Tensor<3>| t.reshape([n, ch, hh, ww]);
+        if fused {
+            // The same sums, the gates by kernels::gru_gate: r * h, then the blend with tanh(q), for each half
+            use kernels::QFrom;
+            let h0f = flat(h0);
+            let m1 = mmc(self.zrq1_m.clone(), motion.clone(), true, gemm, implicit); // [N, 384, L]
+            let zr = [(c.zr1.clone(), 0), (m1, 0)];
+            let rh = kernels::gru_gate(&zr, None, h0f.clone());
+            let q = mmc(self.q1_h.clone(), map(rh), true, gemm, implicit);
+            // q + c.q1 + m1 from channel 256
+            let h1 = kernels::gru_gate(&zr, Some(((q, 0), Some(c.q1.clone()), [(QFrom::Extra, 0), (QFrom::Zr(1), 256)])), h0f);
+            let m2 = mmc(self.zrq2_m.clone(), motion, false, gemm, implicit);
+            let zr = [(mmc(self.zr2_h.clone(), map(h1.clone()), false, gemm, implicit), 0), (c.zrq2.clone(), 0), (m2, 0)];
+            let rh = kernels::gru_gate(&zr, None, h1.clone());
+            let q = mmc(self.q2_h.clone(), map(rh), false, gemm, implicit);
+            // q + c.zrq2 and m2 from channel 256
+            return map(kernels::gru_gate(&zr, Some(((q, 0), None, [(QFrom::Zr(1), 256), (QFrom::Zr(2), 256)])), h1));
+        }
         let one_minus = |z: Tensor<3>| z.neg().add_scalar(1.0);
         // Horizontal
         let m1 = mmc(self.zrq1_m.clone(), motion.clone(), true, gemm, implicit); // [N, 384, L]

@@ -1335,6 +1335,113 @@ fn launch_layer_norm(x: CubeTensor, gamma: CubeTensor, beta: CubeTensor, res: Op
     out
 }
 
+/// Channel ch of slot `slot`'s tensor [N, Ct, L] at batch b, position p (a term of gru_gate_kernel's sums)
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn gate_term<F: Float>(t0: &Tensor<F>, t1: &Tensor<F>, t2: &Tensor<F>, t3: &Tensor<F>, b: usize, ch: usize, p: usize, l_n: usize, #[comptime] slot: usize) -> F {
+    if comptime!(slot == 0) {
+        t0[(b * t0.shape(1) + ch) * l_n + p]
+    } else {
+        if comptime!(slot == 1) {
+            t1[(b * t1.shape(1) + ch) * l_n + p]
+        } else {
+            if comptime!(slot == 2) {
+                t2[(b * t2.shape(1) + ch) * l_n + p]
+            } else {
+                t3[(b * t3.shape(1) + ch) * l_n + p]
+            }
+        }
+    }
+}
+
+/// The gates of a step of the factored GRU (model.rs GruFactored::step) from their summed pre-activations, in one launch
+/// each instead of burn's narrow, add, sigmoid (exp(-log(exp(-x) + 1)), 6 ops), tanh and blend kernels. The sums read
+/// channels of 4 tensor slots [N, Ct, L] from given offsets, in order ((a + b) + c) as model.rs adds them; h [N, C, L].
+/// z/r: slots 0, 1 (and 2 with z_three) from zo0..zo2. Reset (update false): sigmoid(r) * h, r C channels after z.
+/// Update: (1 - z) * h + z * tanh(q), q from the slots qs0..qs2 at qo0..qo2. The sigmoid as 1 / (1 + exp(-x)), the
+/// function burn's computes. 6 tensors: 7 storage bindings with cubecl's metadata, under WebGPU's default 8 per stage
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn gru_gate_kernel<F: Float>(
+    t0: &Tensor<F>,      // [N, Ct, L]
+    t1: &Tensor<F>,
+    t2: &Tensor<F>,
+    t3: &Tensor<F>,
+    h: &Tensor<F>,       // [N, C, L]
+    out: &mut Tensor<F>, // [N, C, L]
+    #[comptime] z_three: bool,
+    #[comptime] zo0: usize,
+    #[comptime] zo1: usize,
+    #[comptime] zo2: usize,
+    #[comptime] qs0: usize,
+    #[comptime] qo0: usize,
+    #[comptime] qs1: usize,
+    #[comptime] qo1: usize,
+    #[comptime] qs2: usize,
+    #[comptime] qo2: usize,
+    #[comptime] update: bool,
+    #[define(F)] _dtype: ElemType,
+) {
+    let idx = ABSOLUTE_POS as usize;
+    let (n_n, c_n, l_n) = (h.shape(0), h.shape(1), h.shape(2));
+    if idx >= n_n * c_n * l_n {
+        terminate!();
+    }
+    let p = idx % l_n;
+    let ch = (idx / l_n) % c_n;
+    let b = idx / (c_n * l_n);
+    let one = F::new(1.0_f32);
+    let zero = F::new(0.0_f32);
+    // z at its channel, r C channels further
+    let gate = if update { ch } else { c_n + ch };
+    let mut s = gate_term::<F>(t0, t1, t2, t3, b, zo0 + gate, p, l_n, 0usize) + gate_term::<F>(t0, t1, t2, t3, b, zo1 + gate, p, l_n, 1usize);
+    if z_three {
+        s += gate_term::<F>(t0, t1, t2, t3, b, zo2 + gate, p, l_n, 2usize);
+    }
+    let g = one / (one + F::exp(zero - s));
+    let hv = h[idx];
+    if update {
+        let t = gate_term::<F>(t0, t1, t2, t3, b, qo0 + ch, p, l_n, qs0) + gate_term::<F>(t0, t1, t2, t3, b, qo1 + ch, p, l_n, qs1) + gate_term::<F>(t0, t1, t2, t3, b, qo2 + ch, p, l_n, qs2);
+        out[idx] = (one - g) * hv + g * F::tanh(t);
+    } else {
+        out[idx] = g * hv;
+    }
+}
+
+/// The comptime layout of a gru_gate_kernel launch: z/r offsets of slots 0..2, the (slot, offset) of the 3 q terms
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GateLayout {
+    z_three: bool,
+    zo: [usize; 3],
+    q: [(usize, usize); 3],
+    update: bool,
+}
+
+fn launch_gru_gate(t: [CubeTensor; 4], h: CubeTensor, layout: GateLayout) -> CubeTensor {
+    let t = t.map(into_contiguous);
+    let h = into_contiguous(h);
+    let s = h.meta.shape().clone();
+    assert!(s.num_dims() == 3, "gru_gate: h {s:?}");
+    let (n, c, l) = (s[0], s[1], s[2]);
+    // Every term read: the batch and positions of h, and the channels it is read at
+    let fits = |slot: usize, off: usize, width: usize| { let ts = t[slot].meta.shape(); ts.num_dims() == 3 && ts[0] == n && ts[2] == l && off + width <= ts[1] };
+    let zn = if layout.z_three { 3 } else { 2 };
+    for (slot, &off) in layout.zo.iter().enumerate().take(zn) {
+        assert!(fits(slot, off, 2 * c), "gru_gate: z/r slot {slot} {:?} from channel {off} for h {s:?}", t[slot].meta.shape());
+    }
+    if layout.update {
+        for &(slot, off) in &layout.q {
+            assert!(slot < 4 && fits(slot, off, c), "gru_gate: q slot {slot} from channel {off} for h {s:?}");
+        }
+    }
+    let dtype = h.dtype;
+    let (out, count, dim) = output_for(&h, s, n * c * l);
+    let [t0, t1, t2, t3] = t;
+    let (zo, q) = (layout.zo, layout.q);
+    gru_gate_kernel::launch(&out.client, count, dim, t0.into_tensor_arg(), t1.into_tensor_arg(), t2.into_tensor_arg(), t3.into_tensor_arg(), h.into_tensor_arg(), out.clone().into_tensor_arg(), layout.z_three, zo[0], zo[1], zo[2], q[0].0, q[0].1, q[1].0, q[1].1, q[2].0, q[2].1, layout.update, dtype_to_storage_type(dtype));
+    out
+}
+
 /// A convolution with few output channels (the flow head's last, 256 -> 2, 3x3): one thread per output position computing
 /// all its output channels, so each input value of the position is read once (im2col + matmul made a 106 MB column
 /// buffer each refinement step for 0.1 GFLOP). Stride 1, symmetric zero padding; the bias added last, as after a matmul
@@ -1562,6 +1669,9 @@ pub trait GmflowKernels: burn::backend::Backend {
     fn window_attention(q: FloatTensor<Self>, k: FloatTensor<Self>, v: FloatTensor<Self>, h: usize, w: usize, splits: usize, shift: bool) -> FloatTensor<Self>;
     #[fusion(dtype = x, shape = x)]
     fn layer_norm(x: FloatTensor<Self>, gamma: FloatTensor<Self>, beta: FloatTensor<Self>, res: FloatTensor<Self>, has_res: bool) -> FloatTensor<Self>;
+    #[fusion(dtype = h, shape = h)]
+    #[allow(clippy::too_many_arguments)]
+    fn gru_gate(t0: FloatTensor<Self>, t1: FloatTensor<Self>, t2: FloatTensor<Self>, t3: FloatTensor<Self>, h: FloatTensor<Self>, z_three: bool, zo0: usize, zo1: usize, zo2: usize, qs0: usize, qo0: usize, qs1: usize, qo1: usize, qs2: usize, qo2: usize, update: bool) -> FloatTensor<Self>;
     #[fusion(dtype = x, shape = conv_small_shape(x, weight, *ph, *pw))]
     fn conv_small(x: FloatTensor<Self>, weight: FloatTensor<Self>, bias: FloatTensor<Self>, ph: usize, pw: usize) -> FloatTensor<Self>;
     #[fusion(meta = preprocess_meta)]
@@ -1602,6 +1712,11 @@ impl GmflowKernels for CubeBackend {
     }
     fn layer_norm(x: FloatTensor<Self>, gamma: FloatTensor<Self>, beta: FloatTensor<Self>, res: FloatTensor<Self>, has_res: bool) -> FloatTensor<Self> {
         launch_layer_norm(x, gamma, beta, has_res.then_some(res))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn gru_gate(t0: FloatTensor<Self>, t1: FloatTensor<Self>, t2: FloatTensor<Self>, t3: FloatTensor<Self>, h: FloatTensor<Self>, z_three: bool, zo0: usize, zo1: usize, zo2: usize, qs0: usize, qo0: usize, qs1: usize, qo1: usize, qs2: usize, qo2: usize, update: bool) -> FloatTensor<Self> {
+        let layout = GateLayout { z_three, zo: [zo0, zo1, zo2], q: [(qs0, qo0), (qs1, qo1), (qs2, qo2)], update };
+        launch_gru_gate([t0, t1, t2, t3], h, layout)
     }
     fn conv_small(x: FloatTensor<Self>, weight: FloatTensor<Self>, bias: FloatTensor<Self>, ph: usize, pw: usize) -> FloatTensor<Self> {
         launch_conv_small(x, weight, bias, ph, pw)
@@ -1718,6 +1833,47 @@ pub fn layer_norm(x: BurnTensor<3>, gamma: BurnTensor<1>, beta: BurnTensor<1>, r
     let res = match res { Some(r) => r.reshape([b * l, c]).into_dispatch(), None => x.clone().into_dispatch() };
     let out: BurnTensor<2> = BurnTensor::from_dispatch(Dispatch::layer_norm(x.into_dispatch(), gamma.into_dispatch(), beta.into_dispatch(), res, has_res));
     out.reshape([b, l, c])
+}
+
+/// Where a q term of gru_gate is read: the tensor of one of the z/r terms (by index), or the extra tensor
+#[derive(Clone, Copy, Debug)]
+pub enum QFrom {
+    Zr(usize),
+    Extra,
+}
+
+/// A gate of the factored GRU (gru_gate_kernel). zr: the 2 or 3 terms (t [N, Ct, L], first channel) whose sum holds the
+/// pre-activations of z (C channels from the offset) and r (the C after them), C the channels of h [N, C, L]. Without q:
+/// sigmoid(r) * h. With q = ((q0, offset), extra, [(from, offset); 2]): (1 - z) * h + z * tanh(q0 + a + b), a and b
+/// read from a z/r term's tensor or the extra one, C channels from their offsets. At most 4 tensors in all
+pub fn gru_gate(zr: &[(BurnTensor<3>, usize)], q: Option<((BurnTensor<3>, usize), Option<BurnTensor<3>>, [(QFrom, usize); 2])>, h: BurnTensor<3>) -> BurnTensor<3> {
+    assert!(zr.len() == 2 || zr.len() == 3, "gru_gate: {} z/r terms", zr.len());
+    let zn = zr.len();
+    let mut slots: Vec<BurnTensor<3>> = zr.iter().map(|(t, _)| t.clone()).collect();
+    let zo = [zr[0].1, zr[1].1, if zn == 3 { zr[2].1 } else { 0 }];
+    let update = q.is_some();
+    let mut qs = [(0usize, 0usize); 3];
+    if let Some(((q0, o0), extra, rest)) = q {
+        slots.push(q0);
+        qs[0] = (zn, o0);
+        let extra_slot = extra.map(|e| { slots.push(e); slots.len() - 1 });
+        for (i, (from, off)) in rest.into_iter().enumerate() {
+            let slot = match from {
+                QFrom::Zr(k) => { assert!(k < zn, "gru_gate: q from z/r term {k} of {zn}"); k }
+                QFrom::Extra => extra_slot.expect("gru_gate: a q term from the extra tensor, which is not given"),
+            };
+            qs[i + 1] = (slot, off);
+        }
+    }
+    assert!(slots.len() <= 4, "gru_gate: {} tensors (at most 4)", slots.len());
+    while slots.len() < 4 {
+        slots.push(zr[0].0.clone());
+    }
+    let [t0, t1, t2, t3]: [BurnTensor<3>; 4] = slots.try_into().unwrap_or_else(|_| unreachable!());
+    BurnTensor::from_dispatch(Dispatch::gru_gate(
+        t0.into_dispatch(), t1.into_dispatch(), t2.into_dispatch(), t3.into_dispatch(), h.into_dispatch(),
+        zn == 3, zo[0], zo[1], zo[2], qs[0].0, qs[0].1, qs[1].0, qs[1].1, qs[2].0, qs[2].1, update,
+    ))
 }
 
 /// A stride-1 convolution with few output channels (conv_small_kernel): x [N, C, H, W], weight [CO, C, KH, KW], bias [CO]

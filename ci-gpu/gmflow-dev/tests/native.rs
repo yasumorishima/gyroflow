@@ -347,6 +347,37 @@ fn kernels_match_plain() {
         let got = kernels::layer_norm(x, gamma, beta, Some(res.clone()));
         check(&format!("layer norm + residual {rows}x{ch}"), got.unsqueeze_dim::<4>(0), (res + want).unsqueeze_dim::<4>(0));
     }
+    // The factored GRU's gates by gru_gate_kernel against the plain operations of GruFactored::step (burn's sigmoid and
+    // tanh), in the layouts of its two halves: 2 z/r terms and q from an extra tensor and a z/r term's (horizontal), 3
+    // z/r terms and q from two of theirs (vertical). Pre-activations of sd 3 so that the sigmoid and tanh saturate, the
+    // GRU's 128 channels, a position count not a multiple of the cube
+    {
+        use burn::tensor::activation::{ sigmoid, tanh };
+        use kernels::QFrom;
+        let l = (H / 8) * (W / 8) + 3;
+        let r3 = |ch: usize, sd: f64| Tensor::<3>::random([2, ch, l], Distribution::Normal(0.0, sd), &device);
+        let (za, zb, zc, h, qa) = (r3(256, 3.0), r3(384, 3.0), r3(384, 3.0), r3(128, 1.0), r3(128, 3.0));
+        for three in [false, true] {
+            let (terms, zr, q_plain, q_terms) = if three {
+                let zr = za.clone() + zb.clone().narrow(1, 0, 256) + zc.clone().narrow(1, 0, 256);
+                let q = qa.clone() + zb.clone().narrow(1, 256, 128) + zc.clone().narrow(1, 256, 128);
+                (vec![(za.clone(), 0), (zb.clone(), 0), (zc.clone(), 0)], zr, q, ((qa.clone(), 0), None, [(QFrom::Zr(1), 256), (QFrom::Zr(2), 256)]))
+            } else {
+                // The extra tensor first, as the horizontal half's c.q1
+                let zr = za.clone() + zb.clone().narrow(1, 0, 256);
+                let q = qa.clone() + zc.clone().narrow(1, 256, 128) + zb.clone().narrow(1, 256, 128);
+                (vec![(za.clone(), 0), (zb.clone(), 0)], zr, q, ((qa.clone(), 0), Some(zc.clone()), [(QFrom::Extra, 256), (QFrom::Zr(1), 256)]))
+            };
+            let z = sigmoid(zr.clone().narrow(1, 0, 128));
+            let r = sigmoid(zr.narrow(1, 128, 128));
+            let want_reset = r * h.clone();
+            let want_update = z.clone().neg().add_scalar(1.0) * h.clone() + z * tanh(q_plain);
+            let got = kernels::gru_gate(&terms, None, h.clone());
+            check(&format!("gru reset, {} terms", terms.len()), got.unsqueeze_dim::<4>(0), want_reset.unsqueeze_dim::<4>(0));
+            let got = kernels::gru_gate(&terms, Some(q_terms), h.clone());
+            check(&format!("gru update, {} terms", terms.len()), got.unsqueeze_dim::<4>(0), want_update.unsqueeze_dim::<4>(0));
+        }
+    }
     // Convolutions of the shapes of the model as im2col + matmul, against burn
     for (cin, cout, kh, kw, stride, ph, pw, hh, ww) in [(3usize, 64usize, 7usize, 7usize, 2usize, 3usize, 3usize, H, W), (64, 64, 3, 3, 1, 1, 1, H / 2, W / 2), (64, 96, 3, 3, 2, 1, 1, H / 2, W / 2), (256, 192, 3, 3, 1, 1, 1, h, w), (384, 128, 1, 5, 1, 0, 2, h, w), (384, 128, 5, 1, 1, 2, 0, h, w)] {
         let x = rnd([2, cin, hh, ww], 1.0);
