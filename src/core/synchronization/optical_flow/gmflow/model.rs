@@ -35,7 +35,7 @@ use burn::tensor::module::conv2d;
 use burn::tensor::ops::{ ConvOptions, GridSampleOptions, GridSamplePaddingMode, InterpolateMode, PadMode };
 use burn::tensor::{ Device, Tensor, TensorData };
 
-use super::kernels;
+use super::{ coop, kernels };
 
 pub const FEATURE_CHANNELS: usize = 128;
 pub const REFINE_ITERATIONS: usize = 6;
@@ -63,9 +63,36 @@ pub struct Ops {
     /// The im2col convolutions with own_gemm (Co >= 32) and the GRU's by kernels::conv_gemm: the columns gathered in the
     /// matmul instead of made in memory
     pub implicit: bool,
+    /// Every matmul and convolution of the model (the 1x1 ones included; not the attention's, nor the flow head's last
+    /// with `fused`) on the matrix units through WGSL cooperative matrices (coop.rs), before all the flags above: for
+    /// devices whose kernels are WGSL and which offer them (Apple GPUs through Metal)
+    pub coop: bool,
 }
 
-/// A convolution of this model: 1x1 ones and the plain path through burn, the others as im2col + matmul if asked
+/// Which matmul runs a matmul of the model, and the convolutions built on one
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gemm {
+    Burn,
+    /// kernels::gemm (and kernels::conv_gemm for the gathered columns)
+    Own,
+    /// coop::gemm and coop::conv_gemm
+    Coop,
+}
+
+impl Ops {
+    /// The matmul of the convolutions and of the GRU
+    pub fn conv_gemm(&self) -> Gemm {
+        if self.coop { Gemm::Coop } else if self.own_gemm { Gemm::Own } else { Gemm::Burn }
+    }
+
+    /// The matmul of the transformer's linear layers
+    pub fn linear_gemm(&self) -> Gemm {
+        if self.coop { Gemm::Coop } else if self.gemm_linear { Gemm::Own } else { Gemm::Burn }
+    }
+}
+
+/// A convolution of this model: 1x1 ones and the plain path through burn, the others as im2col + matmul if asked; all
+/// of them (but the flow head's last with `fused`) by coop.rs with `coop`
 fn conv_fwd(conv: &Conv2d, x: Tensor<4>, ops: Ops) -> Tensor<4> {
     let [kh, kw] = conv.kernel_size;
     // Few output channels (the flow head's last, 256 -> 2): a direct kernel rather than columns 9 times the input for a
@@ -77,6 +104,17 @@ fn conv_fwd(conv: &Conv2d, x: Tensor<4>, ops: Ops) -> Tensor<4> {
                     return kernels::conv_small(x, conv.weight.val(), bias.val(), t, l);
                 }
             }
+        }
+    }
+    if ops.coop && conv.stride[0] == conv.stride[1] && conv.dilation == [1, 1] && conv.groups == 1 {
+        // The 1x1 ones are made without padding (Valid)
+        let padding = match conv.padding {
+            PaddingConfig2d::Explicit(t, l, b, r) if t == b && l == r => Some([t, l]),
+            PaddingConfig2d::Valid => Some([0, 0]),
+            _ => None,
+        };
+        if let Some(padding) = padding {
+            return coop::conv2d(x, conv.weight.val(), conv.bias.as_ref().map(|b| b.val()), conv.stride[0], padding, coop::wgsl::COOP_DEFAULT);
         }
     }
     if !ops.conv_im2col || (kh == 1 && kw == 1) || conv.stride[0] != conv.stride[1] { return conv.forward(x); }
@@ -182,6 +220,11 @@ impl CnnEncoder {
         }
         let x = conv_fwd(&self.conv2, x, ops);
         let w = self.trident_conv.weight.val();
+        if ops.coop {
+            let quarter = coop::conv2d(x.clone(), w.clone(), None, 1, [1, 1], coop::wgsl::COOP_DEFAULT);
+            let eighth = coop::conv2d(x, w, None, 2, [1, 1], coop::wgsl::COOP_DEFAULT);
+            return (quarter, eighth);
+        }
         if ops.conv_im2col && ops.own_gemm && ops.implicit {
             let quarter = kernels::conv2d_implicit(x.clone(), w.clone(), None, 1, [1, 1]);
             let eighth = kernels::conv2d_implicit(x, w, None, 2, [1, 1]);
@@ -235,12 +278,12 @@ impl TransformerLayer {
     }
 
     /// source, target: [B, H*W, C]
-    fn forward(&self, source: Tensor<3>, target: Tensor<3>, win: &Windows, with_shift: bool, own: bool, fused: bool) -> Tensor<3> {
-        let q = lin(&self.q_proj, source.clone(), own);
-        let k = lin(&self.k_proj, target.clone(), own);
-        let v = lin(&self.v_proj, target, own);
+    fn forward(&self, source: Tensor<3>, target: Tensor<3>, win: &Windows, with_shift: bool, gemm: Gemm, fused: bool) -> Tensor<3> {
+        let q = lin(&self.q_proj, source.clone(), gemm);
+        let k = lin(&self.k_proj, target.clone(), gemm);
+        let v = lin(&self.v_proj, target, gemm);
         let message = split_window_attention(q, k, v, win, with_shift, fused);
-        let message = self.norm1.forward(lin(&self.merge, message, own));
+        let message = self.norm1.forward(lin(&self.merge, message, gemm));
         let message = match (&self.mlp, &self.norm2) {
             (Some(mlp), Some(norm2)) => {
                 let x = Tensor::cat(vec![source.clone(), message], 2);
@@ -249,7 +292,7 @@ impl TransformerLayer {
                 let [nb, l, _] = x.dims();
                 let per_image = l * mlp.fc1.weight.val().dims()[1] * 4;
                 let chunk = (IM2COL_MAX_BYTES / per_image).max(1);
-                let ffn = |x: Tensor<3>| norm2.forward(lin(&mlp.fc2, gelu(lin(&mlp.fc1, x, own)), own));
+                let ffn = |x: Tensor<3>| norm2.forward(lin(&mlp.fc2, gelu(lin(&mlp.fc1, x, gemm)), gemm));
                 if nb <= chunk {
                     ffn(x)
                 } else {
@@ -262,15 +305,28 @@ impl TransformerLayer {
     }
 }
 
-/// A linear layer on [B, L, C]: burn's, or kernels::gemm on the B * L rows at once (as burn folds them)
-fn lin(l: &Linear, x: Tensor<3>, own: bool) -> Tensor<3> {
-    if !own {
+/// Coop stays Coop, anything else is burn's: for the matmuls that kernels::gemm never ran (the propagation, the global
+/// correlation), so that the configurations without coop run them as before
+fn coop_or_burn(gemm: Gemm) -> Gemm {
+    if gemm == Gemm::Coop { Gemm::Coop } else { Gemm::Burn }
+}
+
+/// a [B, M, K] @ b [B, K, N]: burn's matmul, or coop::gemm with Coop (Own: burn's, kernels::gemm is not used here)
+fn bmm(a: Tensor<3>, b: Tensor<3>, gemm: Gemm) -> Tensor<3> {
+    if gemm == Gemm::Coop { coop::gemm(a, b, coop::wgsl::COOP_DEFAULT) } else { a.matmul(b) }
+}
+
+/// A linear layer on [B, L, C]: burn's, or kernels::gemm or coop::gemm on the B * L rows at once (as burn folds them)
+fn lin(l: &Linear, x: Tensor<3>, gemm: Gemm) -> Tensor<3> {
+    if gemm == Gemm::Burn {
         return l.forward(x);
     }
     let [b, n, k] = x.dims();
     let w = l.weight.val(); // [d_input, d_output]
     let d_out = w.dims()[1];
-    let out = kernels::gemm(x.reshape([1, b * n, k]), w.unsqueeze_dim::<3>(0), None).reshape([b, n, d_out]);
+    let (x, w) = (x.reshape([1, b * n, k]), w.unsqueeze_dim::<3>(0));
+    let out = if gemm == Gemm::Coop { coop::gemm(x, w, coop::wgsl::COOP_DEFAULT) } else { kernels::gemm(x, w, None) };
+    let out = out.reshape([b, n, d_out]);
     match &l.bias {
         Some(bias) => out + bias.val().reshape([1, 1, d_out]),
         None => out,
@@ -294,7 +350,7 @@ impl FeatureTransformer {
     }
 
     /// feature0, feature1: [B, C, H, W] (position added) -> the same, after self- and cross-attention
-    pub fn forward(&self, feature0: Tensor<4>, feature1: Tensor<4>, win: &Windows, own: bool, fused: bool) -> (Tensor<4>, Tensor<4>) {
+    pub fn forward(&self, feature0: Tensor<4>, feature1: Tensor<4>, win: &Windows, gemm: Gemm, fused: bool) -> (Tensor<4>, Tensor<4>) {
         let [b, c, h, w] = feature0.dims();
         let tokens = |f: Tensor<4>| f.reshape([b, c, h * w]).swap_dims(1, 2);
         let (f0, f1) = (tokens(feature0), tokens(feature1));
@@ -303,8 +359,8 @@ impl FeatureTransformer {
         for (i, layer) in self.layers.iter().enumerate() {
             let with_shift = i % 2 == 1;
             let concat1 = swap_halves(concat0.clone());
-            let s = layer.self_attn.forward(concat0.clone(), concat0, win, with_shift, own, fused);
-            concat0 = layer.cross_attn_ffn.forward(s, concat1, win, with_shift, own, fused);
+            let s = layer.self_attn.forward(concat0.clone(), concat0, win, with_shift, gemm, fused);
+            concat0 = layer.cross_attn_ffn.forward(s, concat1, win, with_shift, gemm, fused);
         }
         let back = |t: Tensor<3>| t.swap_dims(1, 2).reshape([b, c, h, w]);
         (back(concat0.clone().narrow(0, 0, b)), back(concat0.narrow(0, b, b)))
@@ -442,12 +498,12 @@ fn offsets(r: usize) -> Vec<(i32, i32)> {
 
 /// global_correlation_softmax: [B, C, H, W] x 2 -> flow [B, 2, H, W]; bidirectional: [2B, 2, H, W], the flow 1 -> 0 from
 /// the transposed correlation
-pub fn global_correlation_softmax(f0: Tensor<4>, f1: Tensor<4>, bidirectional: bool) -> Tensor<4> {
+pub fn global_correlation_softmax(f0: Tensor<4>, f1: Tensor<4>, bidirectional: bool, gemm: Gemm) -> Tensor<4> {
     let [b, c, h, w] = f0.dims();
     let device = f0.device();
     let f0 = f0.reshape([b, c, h * w]).swap_dims(1, 2); // [B, HW, C]
     let f1 = f1.reshape([b, c, h * w]); // [B, C, HW]
-    let corr = f0.matmul(f1).div_scalar((c as f32).sqrt());
+    let corr = bmm(f0, f1, gemm).div_scalar((c as f32).sqrt());
     let (corr, b) = if bidirectional { (Tensor::cat(vec![corr.clone(), corr.swap_dims(1, 2)], 0), 2 * b) } else { (corr, b) };
     let grid = coords(h, w, &device); // [1, 2, H, W]
     let grid_t = grid.clone().reshape([1, 2, h * w]).swap_dims(1, 2).repeat_dim(0, b); // [B, HW, 2]
@@ -546,24 +602,27 @@ impl SelfAttnPropagation {
     }
 
     /// Global: feature0 [B, C, H, W], flow [B, 2, H, W] -> flow. The key is k_proj of the projected query, as unimatch
-    /// computes it (its own note: an accident of the training code, kept)
-    fn global(&self, feature0: Tensor<4>, flow: Tensor<4>) -> Tensor<4> {
+    /// computes it (its own note: an accident of the training code, kept). `gemm`: the projections and the scores by
+    /// coop.rs with Coop, burn's otherwise (the matmul of the probabilities and the flow, 2 columns, burn's always)
+    fn global(&self, feature0: Tensor<4>, flow: Tensor<4>, gemm: Gemm) -> Tensor<4> {
         let [b, c, h, w] = feature0.dims();
-        let q = self.q_proj.forward(feature0.reshape([b, c, h * w]).swap_dims(1, 2));
-        let k = self.k_proj.forward(q.clone());
+        let g = coop_or_burn(gemm);
+        let q = lin(&self.q_proj, feature0.reshape([b, c, h * w]).swap_dims(1, 2), g);
+        let k = lin(&self.k_proj, q.clone(), g);
         let v = flow.reshape([b, 2, h * w]).swap_dims(1, 2);
-        let prob = softmax(q.matmul(k.swap_dims(1, 2)).div_scalar((c as f32).sqrt()), 2);
+        let prob = softmax(bmm(q, k.swap_dims(1, 2), g).div_scalar((c as f32).sqrt()), 2);
         prob.matmul(v).swap_dims(1, 2).reshape([b, 2, h, w])
     }
 
     /// Local window of radius r. The window comes from F.unfold with zero padding: a neighbour outside the map has a key of
     /// zeros (score 0, still in the softmax) and a flow of zeros
-    fn local(&self, feature0: Tensor<4>, flow: Tensor<4>, r: usize, with_kernels: bool) -> Tensor<4> {
+    fn local(&self, feature0: Tensor<4>, flow: Tensor<4>, r: usize, with_kernels: bool, gemm: Gemm) -> Tensor<4> {
         let [b, c, h, w] = feature0.dims();
+        let g = coop_or_burn(gemm);
         let tokens = feature0.reshape([b, c, h * w]).swap_dims(1, 2);
         let as_map = |t: Tensor<3>| t.swap_dims(1, 2).reshape([b, c, h, w]);
-        let q = as_map(self.q_proj.forward(tokens.clone()));
-        let k = as_map(self.k_proj.forward(tokens));
+        let q = as_map(lin(&self.q_proj, tokens.clone(), g));
+        let k = as_map(lin(&self.k_proj, tokens, g));
         if with_kernels {
             assert_eq!(r, kernels::PROP_RADIUS);
             return kernels::local_propagation(q, k, flow);
@@ -682,7 +741,7 @@ impl BasicUpdateBlock {
     fn forward(&self, net: Tensor<4>, inp: Tensor<4>, corr: Tensor<4>, flow: Tensor<4>, ops: Ops, factored: Option<(&GruFactored, &GruConstants)>) -> (Tensor<4>, Tensor<4>) {
         let motion = self.motion(flow, corr, ops);
         let net = match factored {
-            Some((g, c)) => g.step(c, net, motion, ops.own_gemm, ops.implicit),
+            Some((g, c)) => g.step(c, net, motion, ops.conv_gemm(), ops.implicit),
             None => self.gru(net, Tensor::cat(vec![inp, motion], 1), ops),
         };
         let delta = conv_fwd(&self.flow_head.conv2, relu(conv_fwd(&self.flow_head.conv1, net.clone(), ops)), ops);
@@ -747,9 +806,13 @@ impl BasicUpdateBlock {
     }
 }
 
-/// w [1, Co, K] @ cols [N, K, L], by burn or by kernels::gemm
-fn mm(w: Tensor<3>, cols: Tensor<3>, own_gemm: bool) -> Tensor<3> {
-    if own_gemm { kernels::gemm(w, cols, None) } else { w.matmul(cols) }
+/// w [1, Co, K] @ cols [N, K, L], by burn, kernels::gemm or coop::gemm
+fn mm(w: Tensor<3>, cols: Tensor<3>, gemm: Gemm) -> Tensor<3> {
+    match gemm {
+        Gemm::Burn => w.matmul(cols),
+        Gemm::Own => kernels::gemm(w, cols, None),
+        Gemm::Coop => coop::gemm(w, cols, coop::wgsl::COOP_DEFAULT),
+    }
 }
 
 /// Columns of x [N, C, H, W] for a 1x5 (horizontal) or 5x1 (vertical) convolution with "same" padding: [N, C*5, H*W]
@@ -758,14 +821,22 @@ fn gru_cols(x: Tensor<4>, horizontal: bool) -> Tensor<3> {
     kernels::im2col(x, kh, kw, 1, ph, pw)
 }
 
-/// w [1, Co, C*5] @ the 1x5 (horizontal) or 5x1 columns of x: by kernels::conv_gemm (columns gathered in the matmul)
-/// with `implicit` and own_gemm
-fn mmc(w: Tensor<3>, x: Tensor<4>, horizontal: bool, own: bool, implicit: bool) -> Tensor<3> {
-    if implicit && own {
-        let (kh, kw, ph, pw) = if horizontal { (1, 5, 0, 2) } else { (5, 1, 2, 0) };
+/// Whether the GRU's convolutions gather their columns in the matmul (mmc) rather than read them from im2col
+fn gathers(gemm: Gemm, implicit: bool) -> bool {
+    gemm == Gemm::Coop || (implicit && gemm == Gemm::Own)
+}
+
+/// w [1, Co, C*5] @ the 1x5 (horizontal) or 5x1 columns of x: the columns gathered in the matmul by coop::conv_gemm,
+/// or by kernels::conv_gemm with `implicit` and kernels::gemm
+fn mmc(w: Tensor<3>, x: Tensor<4>, horizontal: bool, gemm: Gemm, implicit: bool) -> Tensor<3> {
+    let (kh, kw, ph, pw) = if horizontal { (1, 5, 0, 2) } else { (5, 1, 2, 0) };
+    if gemm == Gemm::Coop {
+        return coop::conv_gemm(w, x, kh, kw, 1, ph, pw, coop::wgsl::COOP_DEFAULT);
+    }
+    if gathers(gemm, implicit) {
         return kernels::conv_gemm(w, x, kh, kw, 1, ph, pw);
     }
-    mm(w, gru_cols(x, horizontal), own)
+    mm(w, gru_cols(x, horizontal), gemm)
 }
 
 /// What the GRU of every refinement step shares: h0 and inp are the same in all six (unimatch computes them again each
@@ -777,44 +848,44 @@ pub struct GruConstants {
 }
 
 impl GruFactored {
-    pub fn constants(&self, h0: Tensor<4>, inp: Tensor<4>, own: bool, implicit: bool) -> GruConstants {
-        if implicit && own {
+    pub fn constants(&self, h0: Tensor<4>, inp: Tensor<4>, gemm: Gemm, implicit: bool) -> GruConstants {
+        if gathers(gemm, implicit) {
             return GruConstants {
-                zr1: mmc(self.zr1_h.clone(), h0, true, own, implicit) + mmc(self.zr1_i.clone(), inp.clone(), true, own, implicit) + self.zr1_b.clone(),
-                q1: mmc(self.q1_i.clone(), inp.clone(), true, own, implicit) + self.q1_b.clone(),
-                zrq2: mmc(self.zrq2_i.clone(), inp, false, own, implicit) + self.zrq2_b.clone(),
+                zr1: mmc(self.zr1_h.clone(), h0, true, gemm, implicit) + mmc(self.zr1_i.clone(), inp.clone(), true, gemm, implicit) + self.zr1_b.clone(),
+                q1: mmc(self.q1_i.clone(), inp.clone(), true, gemm, implicit) + self.q1_b.clone(),
+                zrq2: mmc(self.zrq2_i.clone(), inp, false, gemm, implicit) + self.zrq2_b.clone(),
             };
         }
         let ci1 = gru_cols(inp.clone(), true);
         let ci2 = gru_cols(inp, false);
         let ch1 = gru_cols(h0, true);
         GruConstants {
-            zr1: mm(self.zr1_h.clone(), ch1, own) + mm(self.zr1_i.clone(), ci1.clone(), own) + self.zr1_b.clone(),
-            q1: mm(self.q1_i.clone(), ci1, own) + self.q1_b.clone(),
-            zrq2: mm(self.zrq2_i.clone(), ci2, own) + self.zrq2_b.clone(),
+            zr1: mm(self.zr1_h.clone(), ch1, gemm) + mm(self.zr1_i.clone(), ci1.clone(), gemm) + self.zr1_b.clone(),
+            q1: mm(self.q1_i.clone(), ci1, gemm) + self.q1_b.clone(),
+            zrq2: mm(self.zrq2_i.clone(), ci2, gemm) + self.zrq2_b.clone(),
         }
     }
 
     /// SepConvGRU(h0, [inp, motion]), the same as `BasicUpdateBlock::gru` up to the order of the sums
-    pub fn step(&self, c: &GruConstants, h0: Tensor<4>, motion: Tensor<4>, own: bool, implicit: bool) -> Tensor<4> {
+    pub fn step(&self, c: &GruConstants, h0: Tensor<4>, motion: Tensor<4>, gemm: Gemm, implicit: bool) -> Tensor<4> {
         let [n, ch, hh, ww] = h0.dims();
         let flat = |t: Tensor<4>| t.reshape([n, ch, hh * ww]);
         let map = |t: Tensor<3>| t.reshape([n, ch, hh, ww]);
         let one_minus = |z: Tensor<3>| z.neg().add_scalar(1.0);
         // Horizontal
-        let m1 = mmc(self.zrq1_m.clone(), motion.clone(), true, own, implicit); // [N, 384, L]
+        let m1 = mmc(self.zrq1_m.clone(), motion.clone(), true, gemm, implicit); // [N, 384, L]
         let zr = c.zr1.clone() + m1.clone().narrow(1, 0, 256);
         let z = sigmoid(zr.clone().narrow(1, 0, 128));
         let r = sigmoid(zr.narrow(1, 128, 128));
         let h0f = flat(h0.clone());
-        let q = tanh(mmc(self.q1_h.clone(), map(r * h0f.clone()), true, own, implicit) + c.q1.clone() + m1.narrow(1, 256, 128));
+        let q = tanh(mmc(self.q1_h.clone(), map(r * h0f.clone()), true, gemm, implicit) + c.q1.clone() + m1.narrow(1, 256, 128));
         let h1 = one_minus(z.clone()) * h0f + z * q;
         // Vertical
-        let m2 = mmc(self.zrq2_m.clone(), motion, false, own, implicit);
-        let zr = mmc(self.zr2_h.clone(), map(h1.clone()), false, own, implicit) + c.zrq2.clone().narrow(1, 0, 256) + m2.clone().narrow(1, 0, 256);
+        let m2 = mmc(self.zrq2_m.clone(), motion, false, gemm, implicit);
+        let zr = mmc(self.zr2_h.clone(), map(h1.clone()), false, gemm, implicit) + c.zrq2.clone().narrow(1, 0, 256) + m2.clone().narrow(1, 0, 256);
         let z = sigmoid(zr.clone().narrow(1, 0, 128));
         let r = sigmoid(zr.narrow(1, 128, 128));
-        let q = tanh(mmc(self.q2_h.clone(), map(r * h1.clone()), false, own, implicit) + c.zrq2.clone().narrow(1, 256, 128) + m2.narrow(1, 256, 128));
+        let q = tanh(mmc(self.q2_h.clone(), map(r * h1.clone()), false, gemm, implicit) + c.zrq2.clone().narrow(1, 256, 128) + m2.narrow(1, 256, 128));
         map(one_minus(z.clone()) * h1 + z * q)
     }
 }
@@ -896,7 +967,7 @@ impl Statics {
             quarter: Windows::new(h / 4, w / 4, 8, device),
             mean: c3([0.485, 0.456, 0.406]),
             std: c3([0.229, 0.224, 0.225]),
-            ops: Ops { kernels: true, conv_im2col: false, gru_factored: false, own_gemm: false, gemm_linear: false, fused: false, implicit: false },
+            ops: Ops { kernels: true, conv_im2col: false, gru_factored: false, own_gemm: false, gemm_linear: false, fused: false, implicit: false, coop: false },
         }
     }
 }
@@ -980,13 +1051,13 @@ impl Gmflow {
         let (f0, f1) = (a.eighth.clone() + pos.clone(), b.eighth.clone() + pos);
         put(&mut trace, "pos_f0_0", &f0);
         put(&mut trace, "pos_f1_0", &f1);
-        let (f0, f1) = self.transformer.forward(f0, f1, &st.eighth, ops.gemm_linear, ops.fused);
+        let (f0, f1) = self.transformer.forward(f0, f1, &st.eighth, ops.linear_gemm(), ops.fused);
         put(&mut trace, "transformer_f0_0", &f0);
         put(&mut trace, "transformer_f1_0", &f1);
-        let flow = global_correlation_softmax(f0.clone(), f1.clone(), bidirectional);
+        let flow = global_correlation_softmax(f0.clone(), f1.clone(), bidirectional, ops.linear_gemm());
         put(&mut trace, "global_corr_flow0", &flow);
         let feature0 = if bidirectional { Tensor::cat(vec![f0, f1], 0) } else { f0 };
-        let flow = self.feature_flow_attn.global(feature0, flow);
+        let flow = self.feature_flow_attn.global(feature0, flow, ops.linear_gemm());
         put(&mut trace, "propagated0", &flow);
 
         // 1/4: the flow doubled in size, feature 1 warped by it, local matching of what remains, local propagation
@@ -1003,25 +1074,26 @@ impl Gmflow {
         let (f0, f1) = (f0_ori.clone() + pos.clone(), f1w + pos);
         put(&mut trace, "pos_f0_1", &f0);
         put(&mut trace, "pos_f1_1", &f1);
-        let (f0, f1) = self.transformer.forward(f0, f1, &st.quarter, ops.gemm_linear, ops.fused);
+        let (f0, f1) = self.transformer.forward(f0, f1, &st.quarter, ops.linear_gemm(), ops.fused);
         put(&mut trace, "transformer_f0_1", &f0);
         put(&mut trace, "transformer_f1_1", &f1);
         let flow_pred = if ops.kernels { kernels::local_corr_softmax(f0.clone(), f1) } else { local_correlation_softmax(f0.clone(), f1, LOCAL_RADIUS) };
         put(&mut trace, "local_corr_flow0", &flow_pred);
         let flow = flow + flow_pred;
-        let mut flow = self.feature_flow_attn.local(f0.clone(), flow, 1, ops.kernels);
+        let mut flow = self.feature_flow_attn.local(f0.clone(), flow, 1, ops.kernels, ops.linear_gemm());
         put(&mut trace, "propagated1", &flow);
 
         // Refinement: the context comes from feature 0 of the transformer and is the same in every iteration (unimatch
         // computes it again each time), the correlation from the CNN features
-        let proj = self.refine_proj.forward(f0);
+        // A 1x1 convolution: burn's but with `coop`
+        let proj = conv_fwd(&self.refine_proj, f0, ops);
         put(&mut trace, "refine_proj0", &proj);
         let net0 = tanh(proj.clone().narrow(1, 0, 128));
         let inp = relu(proj.narrow(1, 128, 128));
         let mut net = net0.clone();
         let factored = ops.gru_factored.then(|| {
             let g = self.refine.factor_gru();
-            let c = g.constants(net0.clone(), inp.clone(), ops.own_gemm, ops.implicit);
+            let c = g.constants(net0.clone(), inp.clone(), ops.conv_gemm(), ops.implicit);
             (g, c)
         });
         for i in 0..REFINE_ITERATIONS {

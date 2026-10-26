@@ -10,7 +10,7 @@
 use burn::tensor::module::conv2d;
 use burn::tensor::ops::ConvOptions;
 use burn::tensor::{ Distribution, Tensor };
-use gmflow_coop::wgsl::{ self, CoopB, CoopShape, CoopTile, COOP_DEFAULT };
+use gmflow_coop::coop::wgsl::{ self, CoopB, CoopShape, CoopTile, COOP_DEFAULT };
 use gmflow_coop::{ coop, device, diff, kernels };
 use std::time::Instant;
 

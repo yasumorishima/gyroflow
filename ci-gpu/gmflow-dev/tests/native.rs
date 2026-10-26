@@ -34,10 +34,11 @@ const GEMM4_TILES: [kernels::Gemm4Tile; 5] = [
     kernels::Gemm4Tile { pm: 8, pn: 8, kstep: 8 },
 ];
 
-/// The configurations measured: (label, ops)
+/// The configurations measured: (label, ops). The cooperative-matrix one only on a device that offers them (device()
+/// says, so it must have been called first)
 fn configs() -> Vec<(&'static str, model::Ops)> {
-    let o = |kernels, conv_im2col, gru_factored, own_gemm, gemm_linear, fused, implicit| model::Ops { kernels, conv_im2col, gru_factored, own_gemm, gemm_linear, fused, implicit };
-    vec![
+    let o = |kernels, conv_im2col, gru_factored, own_gemm, gemm_linear, fused, implicit| model::Ops { kernels, conv_im2col, gru_factored, own_gemm, gemm_linear, fused, implicit, coop: false };
+    let mut all = vec![
         ("plain", o(false, false, false, false, false, false, false)),
         ("kernels", o(true, false, false, false, false, false, false)),
         ("kernels+gru", o(true, false, true, false, false, false, false)),
@@ -48,7 +49,11 @@ fn configs() -> Vec<(&'static str, model::Ops)> {
         ("kernels+im2col+gru+gemm+linear", o(true, true, true, true, true, false, false)),
         ("kernels+im2col+gru+gemm+linear+fused", o(true, true, true, true, true, true, false)),
         ("kernels+im2col+gru+gemm+linear+fused+implicit", o(true, true, true, true, true, true, true)),
-    ]
+    ];
+    if coop_offered() {
+        all.push(("kernels+im2col+gru+gemm+linear+fused+implicit+coop", model::Ops { coop: true, ..o(true, true, true, true, true, true, true) }));
+    }
+    all
 }
 
 fn env_path(name: &str) -> PathBuf {
@@ -139,8 +144,14 @@ fn matches_pytorch() {
     let im2col = std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true);
     let mut bad = Vec::new();
     let mut kernels_pair0: Option<Vec<f32>> = None;
-    for (what, kernels_on) in [("kernels", true), ("plain ops", false)] {
-        st.ops = model::Ops { kernels: kernels_on, conv_im2col: im2col, gru_factored: true, own_gemm: im2col && kernels_on, gemm_linear: im2col && kernels_on, fused: kernels_on, implicit: im2col && kernels_on };
+    // With cooperative matrices (production where the device has them), the kernels without them (production elsewhere)
+    // and the plain ops; the first only on a device that has them
+    let mut variants = vec![("kernels", true, false), ("plain ops", false, false)];
+    if im2col && coop_offered() {
+        variants.insert(0, ("kernels+coop", true, true));
+    }
+    for (what, kernels_on, coop) in variants {
+        st.ops = model::Ops { kernels: kernels_on, conv_im2col: im2col, gru_factored: true, own_gemm: im2col && kernels_on, gemm_linear: im2col && kernels_on, fused: kernels_on, implicit: im2col && kernels_on, coop };
         for k in 0..3 {
             let fa = model.features(inp(k, 0), &st);
             let fb = model.features(inp(k, 1), &st);
@@ -149,7 +160,8 @@ fn matches_pytorch() {
             let fwd = to_vec(both.clone().narrow(0, 0, 1));
             let bwd = to_vec(both.narrow(0, 1, 1));
             let secs = started.elapsed().as_secs_f64();
-            if kernels_on && k == 0 { kernels_pair0 = Some([fwd.clone(), bwd.clone()].concat()); }
+            // The first variant with the kernels: the one the traced passes below run (coop where the device has it)
+            if kernels_on && k == 0 && kernels_pair0.is_none() { kernels_pair0 = Some([fwd.clone(), bwd.clone()].concat()); }
             for (dir, got, file) in [("a -> b", fwd, format!("pair{k}_torch.f32")), ("b -> a", bwd, format!("pair{k}_bwd_torch.f32"))] {
                 let (max, mean, _) = diff(&got, &read_f32(&env_path("GMFLOW_REF_DIR").join(&file)));
                 println!("bidirectional ({what}) pair {k} {dir}: max |burn - torch| {max:.2e} px, mean {mean:.2e} px ({secs:.3} s for both, without the CNN)");
@@ -157,7 +169,7 @@ fn matches_pytorch() {
             }
         }
     }
-    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col, gemm_linear: im2col, fused: true, implicit: im2col };
+    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col, gemm_linear: im2col, fused: true, implicit: im2col, coop: im2col && coop_offered() };
     // Where a wrong bidirectional pass departs (it failed now and then with the same wrong flow on MSL and WGSL, the plain
     // ops too), run after every gated pass: traced passes keep every stage alive, which changes what burn fuses and does in
     // place. Pair 0 with the kernels: the first item of a traced bidirectional pass against a traced one-way pass of the
@@ -898,7 +910,7 @@ fn bidirectional_repeat() {
     let model = load(&device);
     let mut st = Statics::new(H, W, &device);
     let im2col = std::env::var("GMFLOW_IM2COL").map(|v| v == "1").unwrap_or(true);
-    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col, gemm_linear: im2col, fused: true, implicit: im2col };
+    st.ops = model::Ops { kernels: true, conv_im2col: im2col, gru_factored: true, own_gemm: im2col, gemm_linear: im2col, fused: true, implicit: im2col, coop: im2col && coop_offered() };
     let inp = |k: usize, i: usize| tensor4(&dir.join(format!("pair{k}_in{i}.f32")), [1, 3, H, W], &device);
     let mut bad = Vec::new();
     for k in 0..3 {

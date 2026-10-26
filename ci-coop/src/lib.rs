@@ -1,11 +1,11 @@
-// Work branch only (never part of #1143): a probe of the matrix units of Apple GPUs from WGSL (coop.rs), next to the
-// matmul of the model's kernels (kernels.rs, the same file gmflow.rs builds), on the macOS runners. Its own crate and
+// Work branch only (never part of #1143): a probe of the matrix units of Apple GPUs from WGSL (coop.rs, the file gmflow.rs
+// builds), next to the matmul of the model's kernels (kernels.rs, likewise), on the macOS runners. Its own crate and
 // workflow (gmflow-coop.yml), so that trying it does not start the whole gmflow native run.
 
 #[path = "../../src/core/synchronization/optical_flow/gmflow/kernels.rs"]
 pub mod kernels;
+#[path = "../../src/core/synchronization/optical_flow/gmflow/coop.rs"]
 pub mod coop;
-pub mod wgsl;
 
 use burn::tensor::{ Device, DeviceKind };
 

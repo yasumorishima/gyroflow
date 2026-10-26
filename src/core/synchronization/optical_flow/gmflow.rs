@@ -9,11 +9,13 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use parking_lot::RwLock;
 
-// gmflow (unimatch), written by hand in burn: model.rs, with the CubeCL kernels of kernels.rs
+// gmflow (unimatch), written by hand in burn: model.rs, with the CubeCL kernels of kernels.rs and the WGSL ones of coop.rs
 #[cfg(feature = "use-burn")]
 mod model;
 #[cfg(feature = "use-burn")]
 mod kernels;
+#[cfg(feature = "use-burn")]
+mod coop;
 
 #[cfg(feature = "use-burn")]
 mod inference {
@@ -61,6 +63,9 @@ mod inference {
     // the rest of the process, with the reason logged once
     static GPU_FAILED: Mutex<Option<String>> = Mutex::new(None);
     static RUNNER: Mutex<Option<std::sync::Arc<Runner>>> = Mutex::new(None);
+    // Whether the device GPU holds has cooperative matrices for coop.rs: WGSL kernels and the feature enabled (set by
+    // init with the device it returns)
+    static COOP_DEVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// The model on the device with the constants of the input size
     pub struct Runner {
@@ -128,7 +133,11 @@ mod inference {
         if info.backend != wgpu_backend() {
             return Err(format!("{}: {} is a {:?} adapter", label, info.name, info.backend));
         }
-        let name = format!("wgpu: {} ({:?}, {:?}, {} kernels)", info.name, info.device_type, info.backend, kernels);
+        // Cooperative matrices (coop.rs) where the kernels are WGSL and the device has them enabled (cubecl asks for every
+        // feature of the adapter); in the name for the log
+        let coop = kernels == "WGSL" && setup.device.features().contains(burn::tensor::wgpu::wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
+        let kernels = if coop { format!("{} kernels, cooperative matrices", kernels) } else { format!("{} kernels", kernels) };
+        let name = format!("wgpu: {} ({:?}, {:?}, {})", info.name, info.device_type, info.backend, kernels);
         // What the adapter can do, not the device: cubecl raises the device's binding size to u64::MAX where Vulkan has
         // 64-bit indexing, so only the adapter's limit says what a buffer can be
         let limits = setup.adapter.limits();
@@ -136,6 +145,8 @@ mod inference {
         if room < LARGEST_BUFFER {
             return Err(format!("{}: {} holds at most {} MiB in one buffer, gmflow needs {} MiB", label, info.name, room >> 20, LARGEST_BUFFER >> 20));
         }
+        // Of the device returned, which select keeps (the first that init returns)
+        COOP_DEVICE.store(coop, std::sync::atomic::Ordering::Relaxed);
         Ok((device, name))
     }
 
@@ -282,8 +293,16 @@ mod inference {
         // needs the sizes as compile-time constants there (kernels::conv_gemm4_kernel: naga binds cubecl's metadata in
         // device memory on Metal)
         let implicit = gemm && cfg!(target_vendor = "apple") && on_apple_gpu();
-        statics.ops = Ops { conv_im2col: own, own_gemm: gemm, gemm_linear: gemm, fused: own, implicit, ..OPS };
+        // Every matmul and convolution on the matrix units through WGSL cooperative matrices (coop.rs) where the device
+        // offers them, measured on the Apple GPU of the macOS CI only (the convolutions run once each 121 -> 70 ms): macOS
+        // (not iOS, which CI only compiles), and checked against burn on the device first
+        let coop = implicit && cfg!(target_os = "macos") && coop_offered() && match coop_works(device) {
+            Ok(()) => true,
+            Err(why) => { log::warn!("gmflow: cooperative matrices not used: {}", why); false }
+        };
+        statics.ops = Ops { conv_im2col: own, own_gemm: gemm, gemm_linear: gemm, fused: own, implicit, coop, ..OPS };
         log::info!("gmflow: convolutions {}", match (own, gemm, implicit) {
+            _ if coop => "and linear layers by cooperative-matrix kernels (coop.rs; the 2 outputs of the flow head by kernels::conv_small)",
             (true, true, true) => "by implicit GEMM kernels (the GRU's too; 1x1 by burn, the 2 outputs of the flow head by kernels::conv_small), linear layers by kernels::gemm",
             (true, true, false) => "as im2col + kernels::gemm, linear layers by kernels::gemm too",
             (true, false, _) => "as im2col + matmul",
@@ -300,10 +319,47 @@ mod inference {
         gpu().map(|(_, name)| name.starts_with("wgpu: Apple")).unwrap_or(false)
     }
 
+    // The GPU's kernels are WGSL and it has cooperative matrices (init)
+    fn coop_offered() -> bool {
+        gpu().is_ok() && COOP_DEVICE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // coop.rs against burn on this device before the model uses it: a matmul with an operand shared by a batch of 2 and a
+    // convolution of 2 images, at sizes that are not multiples of its tile (every edge). Measured on the macOS CI GPU
+    // only, so a GPU whose simdgroups or layouts differ falls back to the kernels the model ran without it rather than
+    // to wrong flow; a kernel that fails to compile comes back as an error of the read, caught here too
+    fn coop_works(device: &Device) -> Result<(), String> {
+        use super::coop;
+        use burn::tensor::module::conv2d;
+        use burn::tensor::ops::ConvOptions;
+        let values = |n: usize, scale: f32| -> Vec<f32> { (0..n).map(|i| ((i * 7919 % 101) as f32 / 50.0 - 1.0) * scale).collect() };
+        let check = |what: &str, got: Vec<f32>, want: Vec<f32>| -> Result<(), String> {
+            let largest = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let worst = got.iter().zip(&want).fold(0f32, |m, (g, w)| { let d = (g - w).abs(); if d.is_finite() { m.max(d) } else { f32::INFINITY } });
+            if got.len() != want.len() || !(worst <= 1e-3 * largest) {
+                return Err(format!("{what}: max |coop - burn| {worst:e}, outputs up to {largest:e}"));
+            }
+            Ok(())
+        };
+        let run = || -> Result<(), String> {
+            let a = Tensor::<3>::from_data(TensorData::new(values(2 * 72 * 40, 1.0), [2, 72, 40]), device);
+            let b = Tensor::<3>::from_data(TensorData::new(values(40 * 136, 0.5), [1, 40, 136]), device);
+            let got = coop::gemm(a.clone(), b.clone(), coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            let want = a.matmul(b).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            check("matmul [2,72,40] @ [1,40,136]", got, want)?;
+            let x = Tensor::<4>::from_data(TensorData::new(values(2 * 5 * 13 * 17, 1.0), [2, 5, 13, 17]), device);
+            let w = Tensor::<4>::from_data(TensorData::new(values(9 * 5 * 3 * 3, 0.5), [9, 5, 3, 3]), device);
+            let got = coop::conv2d(x.clone(), w.clone(), None, 1, [1, 1], coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            let want = conv2d(x, w, None, ConvOptions::new([1, 1], [1, 1], [1, 1], 1)).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            check("3x3 convolution 5 -> 9 of [2,5,13,17]", got, want)
+        };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|_| Err("panicked".to_string()))
+    }
+
     // Which implementations run: see model.rs, Ops. The convolutions are chosen per GPU (im2col_is_faster), and so are the
     // fused window attention and flow head convolution: on GPUs without f32 matrix units (WGSL on the macOS CI GPU: 2.25 ->
     // 1.82 s a pass); with them burn's matmuls use the units
-    const OPS: Ops = Ops { kernels: true, conv_im2col: false, gru_factored: true, own_gemm: false, gemm_linear: false, fused: false, implicit: false };
+    const OPS: Ops = Ops { kernels: true, conv_im2col: false, gru_factored: true, own_gemm: false, gemm_linear: false, fused: false, implicit: false, coop: false };
 
     // burn convolves with implicit GEMM on matrix units only where the device has them for exactly the types of the
     // tensors (f32 inputs, or tf32 that burn stages f32 to, with an f32 accumulator); otherwise its 3x3 convolutions are
@@ -339,6 +395,7 @@ mod inference {
     #[cfg(test)]
     pub fn convolutions() -> &'static str {
         match &*RUNNER.lock() {
+            Some(r) if r.statics.ops.coop => "cooperative matrices (coop.rs)",
             Some(r) if r.statics.ops.implicit => "implicit GEMM + kernels::gemm",
             Some(r) if r.statics.ops.own_gemm => "im2col + kernels::gemm",
             Some(r) if r.statics.ops.conv_im2col => "im2col + matmul",

@@ -2,6 +2,8 @@
 pub mod model;
 #[path = "../../../src/core/synchronization/optical_flow/gmflow/kernels.rs"]
 pub mod kernels;
+#[path = "../../../src/core/synchronization/optical_flow/gmflow/coop.rs"]
+pub mod coop;
 pub mod bench;
 pub mod interp_diag;
 
@@ -33,9 +35,25 @@ pub fn device() -> (Device, String) {
     #[allow(unreachable_code)]
     {
         let (device, setup) = Device::wgpu_options().graphics_api(GRAPHICS_API).device_kind(DeviceKind::DefaultDevice).init_with_setup().expect("a GPU");
+        // Cooperative matrices (coop.rs) where the kernels are WGSL and the device, an Apple GPU, has them, as gmflow.rs
+        // decides (it also checks them against burn first)
+        let coop = cfg!(target_os = "macos")
+            && setup.adapter.get_info().name.starts_with("Apple")
+            && setup.device.features().contains(burn::tensor::wgpu::wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
+        COOP.store(coop, std::sync::atomic::Ordering::Relaxed);
         let kernels = if cfg!(target_vendor = "apple") { "WGSL" } else { "SPIR-V" };
-        (device, describe(&setup, kernels))
+        let name = describe(&setup, kernels);
+        let name = if coop { name.replace("WGSL kernels)", "WGSL kernels, cooperative matrices)") } else { name };
+        (device, name)
     }
+}
+
+static COOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the device device() made last runs the cooperative-matrix kernels (coop.rs): WGSL kernels on a device that
+/// has them (never with the msl feature)
+pub fn coop_offered() -> bool {
+    COOP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn read_f32(path: &Path) -> Vec<f32> {

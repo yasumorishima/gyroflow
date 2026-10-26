@@ -6,7 +6,7 @@ name: gmflow coop
 on:
   push:
     branches: ['wip/gmflow-native']
-    paths: ['ci-coop/**', '.github/workflows/gmflow-coop.yml']
+    paths: ['ci-coop/**', '.github/workflows/gmflow-coop.yml', 'src/core/synchronization/optical_flow/gmflow/coop.rs']
   workflow_dispatch:
     inputs:
       memo:
