@@ -85,7 +85,8 @@ jobs:
         include:
           - { name: lavapipe, os: ubuntu-24.04 }
           - { name: metal-wgsl, os: macos-14 }
-          - { name: metal-msl, os: macos-15 }
+          # macOS 15: the runner image whose Metal ran burn's native MSL before gmflow dropped it (Cargo.toml)
+          - { name: metal-wgsl-15, os: macos-15 }
     name: test-${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
@@ -127,8 +128,8 @@ jobs:
           GYROFLOW_GMFLOW_DEVICE: ${{ runner.os == 'Linux' && 'any' || '' }}
           GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
           GMFLOW_WARM_RUNS: ${{ runner.os == 'Linux' && '1' || '10' }}
-          # Production on the macOS 14 GPU (WGSL kernels, no native MSL before macOS 15): cooperative matrices
-          GMFLOW_EXPECT_CONVOLUTIONS: ${{ matrix.name == 'metal-wgsl' && 'cooperative matrices (coop.rs)' || '' }}
+          # Production on the macOS GPUs (WGSL kernels): cooperative matrices
+          GMFLOW_EXPECT_CONVOLUTIONS: ${{ runner.os == 'macOS' && 'cooperative matrices (coop.rs)' || '' }}
         run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_matches_pytorch
       - name: Known shift, through the GPU preprocessing, three frame sizes
         working-directory: src/core

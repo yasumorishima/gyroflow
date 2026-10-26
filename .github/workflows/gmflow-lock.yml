@@ -1,0 +1,36 @@
+# Work branch only (never part of #1143): Cargo.lock after a change of features in src/core/Cargo.toml, with nothing
+# built: cargo metadata resolves the workspace and rewrites the lock where the resolution changed (no --locked), the
+# smallest change. The lock comes back as an artifact, with its diff in the log.
+name: gmflow lock
+
+on:
+  push:
+    branches: ['wip/gmflow-native']
+    paths: ['.github/workflows/gmflow-lock.yml']
+  workflow_dispatch:
+    inputs:
+      memo:
+        description: why this run
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  lock:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && cargo --version
+      - name: Resolve the workspace and rewrite the lock
+        run: |
+          cargo metadata --format-version 1 > /dev/null
+          git diff --stat -- Cargo.lock
+          git diff -- Cargo.lock | head -n 400
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cargo-lock
+          retention-days: 7
+          path: Cargo.lock

@@ -44,8 +44,8 @@ mod inference {
     const MODEL_FILENAME: &str = "gmflow-scale2-regrefine6.bpk";
 
     // gmflow runs on the GPU only: Vulkan on Windows, Linux and Android, Metal on macOS and iOS (the graphics API is
-    // pinned, there is no fallback to another one). On Metal, burn compiles its kernels to native MSL where the device and
-    // the Metal compiler allow it (cooperative matrices for the matmuls and convolutions), and to WGSL elsewhere.
+    // pinned, there is no fallback to another one). On Metal, burn compiles its kernels to WGSL (Cargo.toml: no native MSL),
+    // and the matmuls and convolutions use the GPU's matrix units through coop.rs where wgpu offers them.
     #[cfg(target_vendor = "apple")]
     const GRAPHICS_API: WgpuBackend = WgpuBackend::Metal;
     #[cfg(not(target_vendor = "apple"))]
@@ -107,23 +107,12 @@ mod inference {
         Err(format!("no usable {:?} GPU ({})", GRAPHICS_API, errors.join("; ")))
     }
 
-    // A missing adapter comes back as an error; a panic inside the wgpu stack (a broken driver) is caught too. On Apple
-    // systems Metal is asked for with native MSL first; where the device or the Metal compiler can't run it (iOS, macOS
-    // before 15, GPUs before Apple7), the automatic choice, which is Metal with WGSL kernels.
+    // A missing adapter comes back as an error; a panic inside the wgpu stack (a broken driver) is caught too. The kernels:
+    // WGSL on Metal (burn built without native MSL), SPIR-V on Vulkan
     fn init(kind: DeviceKind) -> Result<(Device, String), String> {
         let label = format!("{:?}", kind);
-        let attempt = |pin: bool, kind: DeviceKind| std::panic::catch_unwind(|| {
-            let options = Device::wgpu_options().device_kind(kind);
-            if pin { options.graphics_api(GRAPHICS_API).init_with_setup() } else { options.init_with_setup() }
-        });
-        let (started, kernels) = match attempt(true, kind.clone()) {
-            Ok(Ok(found)) => (Ok(Ok(found)), if cfg!(target_vendor = "apple") { "MSL" } else { "SPIR-V" }),
-            first if cfg!(target_vendor = "apple") => {
-                if let Ok(Err(e)) = &first { log::info!("gmflow: {}: no native MSL ({}), WGSL kernels", label, e); }
-                (attempt(false, kind), "WGSL")
-            }
-            first => (first, "SPIR-V"),
-        };
+        let started = std::panic::catch_unwind(|| Device::wgpu_options().device_kind(kind).graphics_api(GRAPHICS_API).init_with_setup());
+        let kernels = if cfg!(target_vendor = "apple") { "WGSL" } else { "SPIR-V" };
         let (device, setup) = match started {
             Ok(Ok(found)) => found,
             Ok(Err(e)) => return Err(format!("{}: {}", label, e)),
@@ -378,7 +367,8 @@ mod inference {
     // burn convolves with implicit GEMM on matrix units only where the device has them for exactly the types of the
     // tensors (f32 inputs, or tf32 that burn stages f32 to, with an f32 accumulator); otherwise its 3x3 convolutions are
     // direct convolutions, much slower than im2col + matmul (WGSL on the macOS CI GPU: 3.8 s a pass against 6.0 s).
-    // With them (native MSL) burn's own are faster (1.22 s against 1.38 s). Decided from the device's features rather
+    // With them burn's own are faster (native MSL on the macOS 15 CI GPU, which gmflow no longer builds: 1.22 s against
+    // 1.38 s; Vulkan drivers with f32 cooperative matrices). Decided from the device's features rather
     // than by timing a convolution at load, which picked the slower way at times (autotune and compilation inside the
     // timed runs). Vulkan drivers that list matrix units for f16 only get im2col, as their f32 convolutions are direct
     fn im2col_is_faster(device: &Device) -> bool {
