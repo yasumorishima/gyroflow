@@ -351,8 +351,22 @@ mod inference {
             let w = Tensor::<4>::from_data(TensorData::new(values(9 * 5 * 3 * 3, 0.5), [9, 5, 3, 3]), device);
             let got = coop::conv2d(x.clone(), w.clone(), None, 1, [1, 1], coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
             let want = conv2d(x, w, None, ConvOptions::new([1, 1], [1, 1], [1, 1], 1)).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
-            check("3x3 convolution 5 -> 9 of [2,5,13,17]", got, want)
+            check("3x3 convolution 5 -> 9 of [2,5,13,17]", got, want)?;
+            // The other texts the model compiles: whole tiles (no edges, no k guards: most of the model's sizes) and the
+            // 1x1 convolutions (the weight shared by a batch of 2)
+            let a = Tensor::<3>::from_data(TensorData::new(values(64 * 32, 1.0), [1, 64, 32]), device);
+            let b = Tensor::<3>::from_data(TensorData::new(values(32 * 128, 0.5), [1, 32, 128]), device);
+            let got = coop::gemm(a.clone(), b.clone(), coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            let want = a.matmul(b).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            check("matmul [1,64,32] @ [1,32,128]", got, want)?;
+            let x = Tensor::<4>::from_data(TensorData::new(values(2 * 6 * 8 * 16, 1.0), [2, 6, 8, 16]), device);
+            let w = Tensor::<4>::from_data(TensorData::new(values(70 * 6, 0.5), [70, 6, 1, 1]), device);
+            let got = coop::conv2d(x.clone(), w.clone(), None, 1, [0, 0], coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            let want = conv2d(x, w, None, ConvOptions::new([1, 1], [0, 0], [1, 1], 1)).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            check("1x1 convolution 6 -> 70 of [2,6,8,16]", got, want)
         };
+        // What this cannot catch: a wgpu error raised where cubecl records the launch (binding, dispatch) panics on cubecl's
+        // own thread, not here; the kernels avoid the one met so far (read-only and read-write views of one buffer)
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|_| Err("panicked".to_string()))
     }
 
@@ -883,6 +897,10 @@ mod tests {
         let started = std::time::Instant::now();
         for _ in 0..runs { inference::forward(in0.clone(), in1.clone()).expect("gmflow did not run"); }
         println!("warm: {:.3} s per pass on {}, convolutions {} (mean of {runs})", started.elapsed().as_secs_f64() / runs as f64, inference::device_name(), inference::convolutions());
+        // What the workflow expects production to have picked on this runner (cooperative matrices on the macOS 14 one)
+        if let Some(want) = std::env::var("GMFLOW_EXPECT_CONVOLUTIONS").ok().filter(|v| !v.is_empty()) {
+            assert_eq!(inference::convolutions(), want, "the convolutions production picked");
+        }
     }
 
     // The whole model with no buffer over 128 MiB, which is all that Vulkan guarantees and what many Android GPUs have,

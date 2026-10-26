@@ -17,3 +17,4 @@ round 4b: fused kernels on by default
 round 4c: gemm4 as the default gemm
 round 5: implicit gemm (Ops.implicit, off in production)
 implicit GEMM convolutions on Apple
+round 7: cooperative matrices (Ops.coop) where WGSL has them
