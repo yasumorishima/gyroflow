@@ -24,13 +24,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable && cargo --version
-      - name: Resolve the workspace and rewrite the lock
+      - name: Resolve the workspace and src/core (its own lock, which the core workflow builds with) and rewrite the locks
         run: |
           cargo metadata --format-version 1 > /dev/null
-          git diff --stat -- Cargo.lock
-          git diff -- Cargo.lock | head -n 400
+          (cd src/core && cargo metadata --format-version 1 > /dev/null)
+          git diff --stat -- Cargo.lock src/core/Cargo.lock
+          git diff -- Cargo.lock src/core/Cargo.lock | head -n 400
+          git hash-object Cargo.lock src/core/Cargo.lock
       - uses: actions/upload-artifact@v4
         with:
           name: cargo-lock
           retention-days: 7
-          path: Cargo.lock
+          path: |
+            Cargo.lock
+            src/core/Cargo.lock
