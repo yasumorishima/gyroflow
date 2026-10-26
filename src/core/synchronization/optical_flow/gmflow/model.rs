@@ -58,7 +58,8 @@ pub struct Ops {
     /// The transformer's linear layers by kernels::gemm too
     pub gemm_linear: bool,
     /// Split-window attention by kernels::window_attention (no window layout or roll in memory, the softmax in one
-    /// launch) and the flow head's last convolution (2 outputs) by kernels::conv_small
+    /// launch), the transformer's LayerNorms with their residual adds by kernels::layer_norm and the flow head's last
+    /// convolution (2 outputs) by kernels::conv_small
     pub fused: bool,
     /// The im2col convolutions with own_gemm (Co >= 32) and the GRU's by kernels::conv_gemm: the columns gathered in the
     /// matmul instead of made in memory
@@ -283,25 +284,44 @@ impl TransformerLayer {
         let k = lin(&self.k_proj, target.clone(), gemm);
         let v = lin(&self.v_proj, target, gemm);
         let message = split_window_attention(q, k, v, win, with_shift, fused, gemm == Gemm::Coop);
-        let message = self.norm1.forward(lin(&self.merge, message, gemm));
-        let message = match (&self.mlp, &self.norm2) {
+        let message = lin(&self.merge, message, gemm);
+        // source + the last norm's output, the add made by the norm with `fused`
+        match (&self.mlp, &self.norm2) {
             (Some(mlp), Some(norm2)) => {
+                let message = norm(&self.norm1, message, None, fused);
                 let x = Tensor::cat(vec![source.clone(), message], 2);
                 // The hidden layer [B, L, 1024] of a bidirectional pass at 1/4 is 189 MB: a few images at a time, so that
                 // no buffer is over IM2COL_MAX_BYTES (each token is on its own here)
                 let [nb, l, _] = x.dims();
                 let per_image = l * mlp.fc1.weight.val().dims()[1] * 4;
                 let chunk = (IM2COL_MAX_BYTES / per_image).max(1);
-                let ffn = |x: Tensor<3>| norm2.forward(lin(&mlp.fc2, gelu(lin(&mlp.fc1, x, gemm)), gemm));
+                let ffn = |x: Tensor<3>, source: Tensor<3>| norm(norm2, lin(&mlp.fc2, gelu(lin(&mlp.fc1, x, gemm)), gemm), Some(source), fused);
                 if nb <= chunk {
-                    ffn(x)
+                    ffn(x, source)
                 } else {
-                    Tensor::cat((0..nb).step_by(chunk).map(|s| ffn(x.clone().narrow(0, s, chunk.min(nb - s)))).collect(), 0)
+                    Tensor::cat((0..nb).step_by(chunk).map(|s| {
+                        let n = chunk.min(nb - s);
+                        ffn(x.clone().narrow(0, s, n), source.clone().narrow(0, s, n))
+                    }).collect(), 0)
                 }
             }
-            _ => message,
-        };
-        source + message
+            _ => norm(&self.norm1, message, Some(source), fused),
+        }
+    }
+}
+
+/// A LayerNorm of the transformer, plus a residual if given: kernels::layer_norm with `fused` (one launch; the model's
+/// LayerNorms have the default epsilon, kernels::LN_EPS), burn's LayerNorm and an add otherwise (the reference)
+fn norm(n: &LayerNorm, x: Tensor<3>, residual: Option<Tensor<3>>, fused: bool) -> Tensor<3> {
+    if fused {
+        let gamma = n.gamma.val();
+        let beta = match &n.beta { Some(b) => b.val(), None => gamma.zeros_like() };
+        return kernels::layer_norm(x, gamma, beta, residual);
+    }
+    let y = n.forward(x);
+    match residual {
+        Some(r) => r + y,
+        None => y,
     }
 }
 

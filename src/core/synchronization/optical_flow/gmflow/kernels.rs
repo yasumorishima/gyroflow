@@ -1217,6 +1217,124 @@ fn launch_window_attention(q: CubeTensor, k: CubeTensor, v: CubeTensor, h: usize
     out
 }
 
+/// The lanes of a row in layer_norm_kernel, and the threads of its cubes (4 rows each)
+pub const LN_LANES: usize = 32;
+const LN_THREADS: usize = 128;
+/// The epsilon of nn.LayerNorm and of burn's LayerNormConfig by default, which the model's LayerNorms use (burn keeps a
+/// LayerNorm's own private)
+pub const LN_EPS: f32 = 1e-5;
+
+/// LayerNorm over the last dimension of x [R, C] as burn's layer_norm computes it (gamma * (x - mean) / sqrt(var + eps)
+/// plus beta, the variance biased), plus res [R, C] with has_res: one launch for what burn runs as two reductions and an
+/// elementwise kernel (and the residual add after them). 32 threads per row (coalesced reads), 4 rows per cube, the values
+/// of a thread kept in registers between the passes; the sums by a tree in shared memory in a fixed order (no plane
+/// operations, which lavapipe and WGSL on Metal may not have)
+#[cube(launch)]
+fn layer_norm_kernel<F: Float>(
+    x: &Tensor<F>,       // [R, C]
+    gamma: &Tensor<F>,   // [C]
+    beta: &Tensor<F>,    // [C]
+    res: &Tensor<F>,     // [R, C], read only with has_res
+    out: &mut Tensor<F>, // [R, C]
+    #[comptime] c: usize,
+    #[comptime] has_res: bool,
+    #[define(F)] _dtype: ElemType,
+) {
+    let rows = x.shape(0);
+    let t = UNIT_POS_X as usize;
+    let lane = t % comptime!(LN_LANES);
+    let seg = t - lane;
+    // Every thread of a cube reaches every barrier: the rows past the end only skip their loads and stores
+    let row = ABSOLUTE_POS as usize / comptime!(LN_LANES);
+    let live = row < rows;
+    let base = row * c;
+    let per = comptime!(c.div_ceil(LN_LANES));
+    let zero = F::new(0.0_f32);
+    let c_f = F::cast_from(x.shape(1) as u32);
+    let mut red = Shared::<[F]>::new_slice(comptime!(LN_THREADS));
+    let mut v = Array::<F>::new(per);
+    let mut sum = zero;
+    #[unroll]
+    for e in 0..per {
+        let j = lane + e * comptime!(LN_LANES);
+        let mut a = zero;
+        if live && j < c {
+            a = x[base + j];
+        }
+        v[e] = a;
+        sum += a;
+    }
+    red[t] = sum;
+    sync_cube();
+    let mut half = 16usize;
+    for _ in 0..5usize {
+        if lane < half {
+            red[t] = red[t] + red[t + half];
+        }
+        sync_cube();
+        half = half / 2usize;
+    }
+    let mean = red[seg] / c_f;
+    sync_cube();
+    let mut sq = zero;
+    #[unroll]
+    for e in 0..per {
+        let j = lane + e * comptime!(LN_LANES);
+        if j < c {
+            let dv = v[e] - mean;
+            sq += dv * dv;
+        }
+    }
+    red[t] = sq;
+    sync_cube();
+    let mut half = 16usize;
+    for _ in 0..5usize {
+        if lane < half {
+            red[t] = red[t] + red[t + half];
+        }
+        sync_cube();
+        half = half / 2usize;
+    }
+    let inv = F::new(1.0_f32) / F::sqrt(red[seg] / c_f + F::new(comptime!(LN_EPS)));
+    #[unroll]
+    for e in 0..per {
+        let j = lane + e * comptime!(LN_LANES);
+        if live && j < c {
+            let mut y = (v[e] - mean) * inv * gamma[j] + beta[j];
+            if has_res {
+                y += res[base + j];
+            }
+            out[base + j] = y;
+        }
+    }
+}
+
+fn launch_layer_norm(x: CubeTensor, gamma: CubeTensor, beta: CubeTensor, res: Option<CubeTensor>) -> CubeTensor {
+    let (x, gamma, beta) = (into_contiguous(x), into_contiguous(gamma), into_contiguous(beta));
+    let s = x.meta.shape().clone();
+    assert!(s.num_dims() == 2 && s[1] > 0, "layer_norm: x {s:?}");
+    let (rows, c) = (s[0], s[1]);
+    assert!(gamma.meta.shape().num_elements() == c && beta.meta.shape().num_elements() == c, "layer_norm: gamma {:?}, beta {:?} for {c} channels", gamma.meta.shape(), beta.meta.shape());
+    // The tree of layer_norm_kernel sums 32 lanes in 5 steps
+    assert!(LN_LANES == 32 && LN_THREADS % LN_LANES == 0, "layer_norm_kernel: lanes");
+    let has_res = res.is_some();
+    let res = match res {
+        Some(r) => {
+            let r = into_contiguous(r);
+            assert!(r.meta.shape() == &s, "layer_norm: residual {:?} for x {s:?}", r.meta.shape());
+            r
+        }
+        None => x.clone(),
+    };
+    let dtype = x.dtype;
+    let buffer = x.client.empty(s.num_elements() * dtype.size());
+    let out = CubeTensor::new_contiguous(x.client.clone(), x.device.clone(), s, buffer, dtype);
+    let dim = CubeDim::new_2d(LN_THREADS as u32, 1);
+    let count = calculate_cube_count_elemwise(&x.client, rows * LN_LANES, dim);
+    layer_norm_kernel::launch(&out.client, count, dim, x.into_tensor_arg(), gamma.into_tensor_arg(), beta.into_tensor_arg(), res.into_tensor_arg(), out.clone().into_tensor_arg(), c, has_res, dtype_to_storage_type(dtype));
+    out
+}
+
 /// A convolution with few output channels (the flow head's last, 256 -> 2, 3x3): one thread per output position computing
 /// all its output channels, so each input value of the position is read once (im2col + matmul made a 106 MB column
 /// buffer each refinement step for 0.1 GFLOP). Stride 1, symmetric zero padding; the bias added last, as after a matmul
@@ -1442,6 +1560,8 @@ pub trait GmflowKernels: burn::backend::Backend {
     fn conv_gemm(w: FloatTensor<Self>, x: FloatTensor<Self>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> FloatTensor<Self>;
     #[fusion(dtype = q, shape = q)]
     fn window_attention(q: FloatTensor<Self>, k: FloatTensor<Self>, v: FloatTensor<Self>, h: usize, w: usize, splits: usize, shift: bool) -> FloatTensor<Self>;
+    #[fusion(dtype = x, shape = x)]
+    fn layer_norm(x: FloatTensor<Self>, gamma: FloatTensor<Self>, beta: FloatTensor<Self>, res: FloatTensor<Self>, has_res: bool) -> FloatTensor<Self>;
     #[fusion(dtype = x, shape = conv_small_shape(x, weight, *ph, *pw))]
     fn conv_small(x: FloatTensor<Self>, weight: FloatTensor<Self>, bias: FloatTensor<Self>, ph: usize, pw: usize) -> FloatTensor<Self>;
     #[fusion(meta = preprocess_meta)]
@@ -1479,6 +1599,9 @@ impl GmflowKernels for CubeBackend {
     }
     fn window_attention(q: FloatTensor<Self>, k: FloatTensor<Self>, v: FloatTensor<Self>, h: usize, w: usize, splits: usize, shift: bool) -> FloatTensor<Self> {
         launch_window_attention(q, k, v, h, w, splits, shift)
+    }
+    fn layer_norm(x: FloatTensor<Self>, gamma: FloatTensor<Self>, beta: FloatTensor<Self>, res: FloatTensor<Self>, has_res: bool) -> FloatTensor<Self> {
+        launch_layer_norm(x, gamma, beta, has_res.then_some(res))
     }
     fn conv_small(x: FloatTensor<Self>, weight: FloatTensor<Self>, bias: FloatTensor<Self>, ph: usize, pw: usize) -> FloatTensor<Self> {
         launch_conv_small(x, weight, bias, ph, pw)
@@ -1579,6 +1702,22 @@ pub fn conv2d_implicit(x: BurnTensor<4>, weight: BurnTensor<4>, bias: Option<Bur
 /// masked softmax, probabilities @ v): q, k, v [B, H*W, C] of an H x W map in splits x splits windows -> [B, H*W, C]
 pub fn window_attention(q: BurnTensor<3>, k: BurnTensor<3>, v: BurnTensor<3>, h: usize, w: usize, splits: usize, shift: bool) -> BurnTensor<3> {
     BurnTensor::from_dispatch(Dispatch::window_attention(q.into_dispatch(), k.into_dispatch(), v.into_dispatch(), h, w, splits, shift))
+}
+
+/// LayerNorm over the last dimension of x [B, L, C] with gamma and beta [C] and the model's epsilon (LN_EPS), plus
+/// res [B, L, C] if given, in one launch (layer_norm_kernel): what burn's LayerNorm::forward (and an add) computes
+pub fn layer_norm(x: BurnTensor<3>, gamma: BurnTensor<1>, beta: BurnTensor<1>, res: Option<BurnTensor<3>>) -> BurnTensor<3> {
+    let [b, l, c] = x.dims();
+    // The values of a row are kept in registers (C / 32 a thread)
+    assert!(c > 0 && c <= 1024, "layer_norm: {c} channels");
+    if let Some(r) = &res {
+        assert_eq!(r.dims(), [b, l, c], "layer_norm: residual");
+    }
+    let has_res = res.is_some();
+    let x = x.reshape([b * l, c]);
+    let res = match res { Some(r) => r.reshape([b * l, c]).into_dispatch(), None => x.clone().into_dispatch() };
+    let out: BurnTensor<2> = BurnTensor::from_dispatch(Dispatch::layer_norm(x.into_dispatch(), gamma.into_dispatch(), beta.into_dispatch(), res, has_res));
+    out.reshape([b, l, c])
 }
 
 /// A stride-1 convolution with few output channels (conv_small_kernel): x [N, C, H, W], weight [CO, C, KH, KW], bias [CO]

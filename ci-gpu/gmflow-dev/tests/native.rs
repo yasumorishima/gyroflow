@@ -331,6 +331,22 @@ fn kernels_match_plain() {
             }
         }
     }
+    // The transformer's LayerNorms (+ residual) by layer_norm_kernel, against burn's LayerNorm with its default epsilon
+    // (the model's) and an add: 128 channels at both sizes and batches of the model, and 37 channels in 7 rows (lanes
+    // and rows past the end of the cubes)
+    for (rows, ch) in [(2 * (H / 4) * (W / 4), c), (4 * (H / 8) * (W / 8), c), (7, 37)] {
+        let r3 = |sd: f64| Tensor::<3>::random([1, rows, ch], Distribution::Normal(0.0, sd), &device);
+        let (x, res) = (r3(2.0).add_scalar(0.5), r3(1.0));
+        let mut ln = burn::nn::LayerNormConfig::new(ch).init(&device);
+        ln.gamma = burn::module::Param::from_tensor(Tensor::<1>::random([ch], Distribution::Normal(1.0, 0.2), &device));
+        ln.beta = Some(burn::module::Param::from_tensor(Tensor::<1>::random([ch], Distribution::Normal(0.0, 0.2), &device)));
+        let (gamma, beta) = (ln.gamma.val(), ln.beta.as_ref().map(|b| b.val()).unwrap());
+        let want = ln.forward(x.clone());
+        let got = kernels::layer_norm(x.clone(), gamma.clone(), beta.clone(), None);
+        check(&format!("layer norm {rows}x{ch}"), got.unsqueeze_dim::<4>(0), want.clone().unsqueeze_dim::<4>(0));
+        let got = kernels::layer_norm(x, gamma, beta, Some(res.clone()));
+        check(&format!("layer norm + residual {rows}x{ch}"), got.unsqueeze_dim::<4>(0), (res + want).unsqueeze_dim::<4>(0));
+    }
     // Convolutions of the shapes of the model as im2col + matmul, against burn
     for (cin, cout, kh, kw, stride, ph, pw, hh, ww) in [(3usize, 64usize, 7usize, 7usize, 2usize, 3usize, 3usize, H, W), (64, 64, 3, 3, 1, 1, 1, H / 2, W / 2), (64, 96, 3, 3, 2, 1, 1, H / 2, W / 2), (256, 192, 3, 3, 1, 1, 1, h, w), (384, 128, 1, 5, 1, 0, 2, h, w), (384, 128, 5, 1, 1, 2, 0, h, w)] {
         let x = rnd([2, cin, hh, ww], 1.0);
