@@ -352,7 +352,16 @@ mod inference {
             let w = Tensor::<4>::from_data(TensorData::new(values(70 * 6, 0.5), [70, 6, 1, 1]), device);
             let got = coop::conv2d(x.clone(), w.clone(), None, 1, [0, 0], coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
             let want = conv2d(x, w, None, ConvOptions::new([1, 1], [0, 0], [1, 1], 1)).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
-            check("1x1 convolution 6 -> 70 of [2,6,8,16]", got, want)
+            check("1x1 convolution 6 -> 70 of [2,6,8,16]", got, want)?;
+            // Split-window attention (the gathered rows and the scattered output): shifted, windows of 60 positions (an
+            // edge in every dimension of both matmuls), against the kernels' own
+            // q, k and v from different offsets of the pattern (one sequence scaled would make q k^T symmetric, and a
+            // transposed scores matrix would pass)
+            let tokens = |skip: usize, scale: f32| Tensor::<3>::from_data(TensorData::new(values(2 * 12 * 20 * 36 + skip, scale).split_off(skip), [2, 12 * 20, 36]), device);
+            let (q, k, v) = (tokens(0, 1.0), tokens(13, 0.7), tokens(29, 0.5));
+            let got = coop::window_attention(q.clone(), k.clone(), v.clone(), 12, 20, 2, true, coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            let want = super::kernels::window_attention(q, k, v, 12, 20, 2, true).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            check("shifted window attention of [2,240,36] in 2x2 windows", got, want)
         };
         // What this cannot catch: a wgpu error raised where cubecl records the launch (binding, dispatch) panics on cubecl's
         // own thread, not here; the kernels avoid the one met so far (read-only and read-write views of one buffer)

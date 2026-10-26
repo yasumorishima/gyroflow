@@ -130,13 +130,17 @@ pub mod wgsl {
         }
         // One window layout for a, b and c, whose sizes match it
         if let Some(win) = shape.win() {
+            // Before win.len(), which divides by splits
+            if win.splits == 0 || win.h % win.splits != 0 || win.w % win.splits != 0 {
+                return Some(format!("windows {win:?}: the map does not split into them"));
+            }
             let same = |o: Option<Win>| o.is_none() || o == Some(win);
             let b_ok = match shape.b {
                 CoopB::WindowT { win: bw } => bw == win && shape.n == win.len(),
                 CoopB::WindowRows { win: bw } => bw == win && shape.k == win.len(),
                 _ => true,
             };
-            if !same(shape.a_win) || !same(shape.c_win) || !b_ok || win.splits == 0 || win.h % win.splits != 0 || win.w % win.splits != 0 {
+            if !same(shape.a_win) || !same(shape.c_win) || !b_ok {
                 return Some(format!("windows {win:?} do not fit {shape:?}"));
             }
             if (shape.a_win.is_some() || shape.c_win.is_some()) && shape.m != win.len() {

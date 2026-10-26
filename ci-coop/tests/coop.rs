@@ -62,6 +62,8 @@ fn coop_source() {
     let conv = |c, h, w, kh, kw, stride, ph, pw| CoopB::Conv { c, h, w, kh, kw, stride, ph, pw };
     let w4 = Win { h: 80, w: 144, splits: 8, shift: true };
     let w8 = Win { h: 40, w: 72, splits: 2, shift: false };
+    // Scalar loads (L = 15, C = 37: no vec4 in either matmul), shifted
+    let ws = Win { h: 6, w: 10, splits: 2, shift: true };
     let shapes = [
         ("conv 256->192 3x3 @1/4, no edges", CoopShape { a_win: None, c_win: None, m: 192, n: 11520, k: 2304, stride_a: 0, b: conv(256, 80, 144, 3, 3, 1, 1, 1) }),
         ("matrix, vec4 a and b, no edges", CoopShape { a_win: None, c_win: None, m: 128, n: 256, k: 96, stride_a: 0, b: CoopB::Matrix { stride: 96 * 256 } }),
@@ -74,6 +76,8 @@ fn coop_source() {
         ("window probabilities @ v @1/4, shifted (scattered rows)", CoopShape { m: 180, n: 128, k: 180, stride_a: 180 * 180, b: CoopB::WindowRows { win: w4 }, a_win: None, c_win: Some(w4) }),
         ("window scores @1/8", CoopShape { m: 720, n: 720, k: 128, stride_a: 0, b: CoopB::WindowT { win: w8 }, a_win: Some(w8), c_win: None }),
         ("window probabilities @ v @1/8", CoopShape { m: 720, n: 128, k: 720, stride_a: 720 * 720, b: CoopB::WindowRows { win: w8 }, a_win: None, c_win: Some(w8) }),
+        ("window scores, scalar loads", CoopShape { m: 15, n: 15, k: 37, stride_a: 0, b: CoopB::WindowT { win: ws }, a_win: Some(ws), c_win: None }),
+        ("window probabilities @ v, scalar loads", CoopShape { m: 15, n: 37, k: 15, stride_a: 15 * 15, b: CoopB::WindowRows { win: ws }, a_win: None, c_win: Some(ws) }),
     ];
     for (i, (label, shape)) in shapes.iter().enumerate() {
         for (tl, tile) in TILES {
