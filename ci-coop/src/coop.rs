@@ -47,6 +47,13 @@ impl CubeKernel for CoopKernel {
 /// kernel that fails to compile marks only its output, not inputs other launches share
 fn launch(a: &CubeTensor, b: &CubeTensor, shape: CoopShape, batch: usize, tile: CoopTile) -> CubeTensor {
     assert_eq!(a.dtype, DType::F32, "coop: f32 only");
+    // Every index of the kernel is a u32
+    let b_elems = match shape.b {
+        CoopB::Matrix { stride } => stride.max(shape.k * shape.n),
+        CoopB::Conv { c, h, w, .. } => c * h * w,
+    };
+    let largest = batch * (shape.m * shape.n).max(shape.stride_a.max(shape.m * shape.k)).max(b_elems);
+    assert!(largest < 1 << 32, "coop: {batch} x {shape:?} needs indices over u32");
     let source = wgsl::source(shape, tile);
     let out_shape = Shape::new([batch, shape.m, shape.n]);
     let buffer = a.client.empty(out_shape.num_elements() * a.dtype.size());

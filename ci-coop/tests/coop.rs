@@ -53,7 +53,9 @@ fn model_convs() -> Vec<ConvCase> {
     ]
 }
 
-/// naga (wgpu 30's) parses and validates the WGSL of each path; the first is printed with its MSL
+/// naga (wgpu 30's) parses and validates the WGSL of each path; the first is printed with its MSL. Not a proof that
+/// the barriers are in uniform control flow: naga 30 does not check barriers against its uniformity analysis (the edge
+/// branch is uniform by construction, its condition from the workgroup id only)
 #[test]
 #[ignore]
 fn coop_source() {
@@ -63,7 +65,8 @@ fn coop_source() {
         ("matrix, vec4 a and b, no edges", CoopShape { m: 128, n: 256, k: 96, stride_a: 0, b: CoopB::Matrix { stride: 96 * 256 } }),
         ("matrix, scalar a and b, every edge", CoopShape { m: 100, n: 70, k: 37, stride_a: 100 * 37, b: CoopB::Matrix { stride: 0 } }),
         ("matrix, vec4 a, scalar b, edges in n", CoopShape { m: 64, n: 130, k: 24, stride_a: 0, b: CoopB::Matrix { stride: 24 * 130 } }),
-        ("conv 3->64 7x7 s2, edges in k and m", CoopShape { m: 64, n: 160 * 288, k: 147, stride_a: 0, b: conv(3, 320, 576, 7, 7, 2, 3, 3) }),
+        ("conv 3->64 7x7 s2, edge in k only", CoopShape { m: 64, n: 160 * 288, k: 147, stride_a: 0, b: conv(3, 320, 576, 7, 7, 2, 3, 3) }),
+        ("conv 256->126 3x3, edge in m", CoopShape { m: 126, n: 11520, k: 2304, stride_a: 0, b: conv(256, 80, 144, 3, 3, 1, 1, 1) }),
         ("conv 37->45 3x3 on 37x53, every edge", CoopShape { m: 45, n: 37 * 53, k: 333, stride_a: 0, b: conv(37, 37, 53, 3, 3, 1, 1, 1) }),
     ];
     for (i, (label, shape)) in shapes.iter().enumerate() {
@@ -137,6 +140,7 @@ fn coop_gemm() {
     check("[1,100,37] @ [1,37,70] (every edge)", rnd([1, 100, 37]), rnd([1, 37, 70]));
     check("[2,65,24] @ [1,24,130] (edges, scalar b)", rnd([2, 65, 24]), rnd([1, 24, 130]));
     check("[3,129,31] @ [3,31,67] (edges, batch 3)", rnd([3, 129, 31]), rnd([3, 31, 67]));
+    check("[1,100,36] @ [1,36,132] (edges, vec4 b)", rnd([1, 100, 36]), rnd([1, 36, 132]));
     check("[1,192,2304] @ [1,2304,1024]", rnd([1, 192, 2304]), rnd([1, 2304, 1024]));
 
     let first = |t: Tensor<3>| t.slice([0..1, 0..1, 0..1]).reshape([1]);
@@ -181,6 +185,13 @@ fn coop_conv() {
         println!("COOP check {label:40} max |coop - burn conv2d| {max:.2e}, mean {mean:.2e} (outputs up to {scale:.2e})");
         assert!(max <= 1e-3 * scale, "{label}: max {max:.2e} against outputs up to {scale:.2e}");
         if n != 1 {
+            // The odd one under every tiling too: the gathered columns on 256 threads, the edges of each
+            for (tl, tile) in TILES {
+                let got = coop::conv2d(x.clone(), wt.clone(), Some(bias.clone()), stride, [ph, pw], tile).into_data().to_vec::<f32>().expect("f32");
+                let (max, mean, scale) = diff(&got, &want);
+                println!("COOP check {label:40} {tl:22} max |coop - burn conv2d| {max:.2e}, mean {mean:.2e} (outputs up to {scale:.2e})");
+                assert!(max <= 1e-3 * scale, "{label}, {tl}: max {max:.2e} against outputs up to {scale:.2e}");
+            }
             continue;
         }
         // Against what production runs for it today on the WGSL path: burn for the 1x1 ones, conv2d_implicit (the

@@ -302,11 +302,13 @@ pub fn source(shape: CoopShape, tile: CoopTile) -> String {
     if !edge {
         store_direct(w, "    ");
     } else {
-        // Inside c whole or not: the same answer for every thread of the workgroup
+        // Inside c whole or not: the same answer for every thread of the workgroup. Joined by `&`, not `&&`, which naga
+        // lowers to a local variable and so to a branch its uniformity analysis takes as non-uniform (naga does not
+        // check barriers against that analysis, so validation would not show it)
         let mut inside = Vec::new();
-        if !full_m { inside.push(format!("m0 + {wm}u <= {m}u")); }
-        if !full_n { inside.push(format!("n0 + {wn}u <= {n}u")); }
-        emit!("    if {} {{", inside.join(" && "));
+        if !full_m { inside.push(format!("(m0 + {wm}u <= {m}u)")); }
+        if !full_n { inside.push(format!("(n0 + {wn}u <= {n}u)")); }
+        emit!("    if {} {{", inside.join(" & "));
         store_direct(w, "        ");
         // Over an edge: each fragment into this simdgroup's 8 x 8 of workgroup memory, then its 32 threads copy the 64
         // values (2 each) that are inside c. Every simdgroup stores the same number of fragments, so the barriers are
