@@ -12,6 +12,7 @@ use burn::tensor::{ DType, Shape, Tensor as BurnTensor };
 use burn_cubecl::{ CubeBackend, kernel::into_contiguous, tensor::CubeTensor };
 use cubecl::ir::{ UIntKind, metadata::Info };
 use cubecl::prelude::*;
+// BufferIOAttr comes with the prelude (cubecl_runtime::kernel::*)
 use cubecl::server::KernelArguments;
 
 /// One compiled kernel per source: the id covers the whole text, which is what the compilation caches are keyed by
@@ -66,10 +67,12 @@ fn launch_coop_gemm(a: CubeTensor, b: CubeTensor, tile: CoopTile) -> CubeTensor 
     let buffer = a.client.empty(shape.num_elements() * dtype.size());
     let out = CubeTensor::new_contiguous(a.client.clone(), a.device.clone(), shape, buffer, dtype);
     let count = CubeCount::Static((sizes.n / tile.cols()) as u32, (sizes.m / tile.rows()) as u32, batch as u32);
+    // a and b declared read only, so that a tiling that fails to compile marks only its output, not the inputs the
+    // test shares with the other tilings
     let args = KernelArguments::new()
-        .with_buffer(a.handle.clone().binding())
-        .with_buffer(b.handle.clone().binding())
-        .with_buffer(out.handle.clone().binding());
+        .with_buffer_io(a.handle.clone().binding(), BufferIOAttr::ReadOnly)
+        .with_buffer_io(b.handle.clone().binding(), BufferIOAttr::ReadOnly)
+        .with_buffer_io(out.handle.clone().binding(), BufferIOAttr::WriteOnly);
     out.client.launch(Box::new(CoopGemmKernel { source, threads: tile.threads() as u32 }), count, args);
     out
 }

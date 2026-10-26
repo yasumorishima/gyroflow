@@ -55,7 +55,8 @@ pub fn unsupported(shape: CoopShape, tile: CoopTile) -> Option<String> {
         if (tile.rows() * tile.bk / 4) % t != 0 || (tile.bk * tile.cols() / 4) % t != 0 {
             return Some(format!("the tiles of {tile:?} do not split evenly over {t} threads"));
         }
-        if 4 * (tile.rows() * (tile.bk + 4) + tile.bk * (tile.cols() + 4)) > 32 << 10 {
+        // The two tiles and the 64 zeros
+        if 4 * (tile.rows() * (tile.bk + 4) + tile.bk * (tile.cols() + 4) + 64) > 32 << 10 {
             return Some(format!("{tile:?} needs more than 32 KiB of workgroup memory"));
         }
     }
@@ -76,12 +77,16 @@ pub fn source(shape: CoopShape, tile: CoopTile) -> String {
     macro_rules! emit { ($($arg:tt)*) => { writeln!(w, $($arg)*).unwrap() } }
     emit!("enable wgpu_cooperative_matrix;");
     emit!("");
+    // a and b read_write although only read: the layout comes from the shader (a precompiled kernel has no
+    // representation to take it from), and cubecl places tensors in shared pages, so a, b and c can be slices of one
+    // wgpu buffer, which wgpu refuses to bind both read-only and read-write (cubecl declares its own kernels' bindings
+    // all read-write for that reason, backend/wgsl.rs)
     if bk == 0 {
-        emit!("@group(0) @binding(0) var<storage, read> a: array<f32>;");
-        emit!("@group(0) @binding(1) var<storage, read> b: array<f32>;");
+        emit!("@group(0) @binding(0) var<storage, read_write> a: array<f32>;");
+        emit!("@group(0) @binding(1) var<storage, read_write> b: array<f32>;");
     } else {
-        emit!("@group(0) @binding(0) var<storage, read> a: array<vec4<f32>>;");
-        emit!("@group(0) @binding(1) var<storage, read> b: array<vec4<f32>>;");
+        emit!("@group(0) @binding(0) var<storage, read_write> a: array<vec4<f32>>;");
+        emit!("@group(0) @binding(1) var<storage, read_write> b: array<vec4<f32>>;");
     }
     emit!("@group(0) @binding(2) var<storage, read_write> c: array<f32>;");
     emit!("");
@@ -96,7 +101,9 @@ pub fn source(shape: CoopShape, tile: CoopTile) -> String {
     emit!("");
     emit!("@compute @workgroup_size({t}, 1, 1)");
     emit!("fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {{");
-    emit!("    if li < 64u {{ zeros[li] = 0.0; }}");
+    // Workgroup memory starts uninitialised (cubecl turns wgpu's zeroing off): every one of the 64, whatever the
+    // number of threads
+    emit!("    for (var z = li; z < 64u; z += {t}u) {{ zeros[z] = 0.0; }}");
     emit!("    workgroupBarrier();");
     // Apple GPUs run 32 threads per simdgroup, numbered in order of the thread index
     emit!("    let sg = li / 32u;");
