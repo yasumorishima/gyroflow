@@ -321,8 +321,13 @@ fn kernels_match_plain() {
             let (q, k, v) = (r3([bn, hh * ww, c]), r3([bn, hh * ww, c]), r3([bn, hh * ww, c]));
             for shift in [false, true] {
                 let got = kernels::window_attention(q.clone(), k.clone(), v.clone(), hh, ww, splits, shift);
-                let want = model::split_window_attention(q.clone(), k.clone(), v.clone(), &win, shift, false);
-                check(&format!("window attention {hh}x{ww}/{splits} b{bn} shift {shift}"), got.unsqueeze_dim::<4>(0), want.unsqueeze_dim::<4>(0));
+                let want = model::split_window_attention(q.clone(), k.clone(), v.clone(), &win, shift, false, false);
+                check(&format!("window attention {hh}x{ww}/{splits} b{bn} shift {shift}"), got.unsqueeze_dim::<4>(0), want.clone().unsqueeze_dim::<4>(0));
+                // The same with its matmuls on cooperative matrices (coop.rs), where the device has them
+                if coop_offered() {
+                    let got = gmflow_dev::coop::window_attention(q.clone(), k.clone(), v.clone(), hh, ww, splits, shift, gmflow_dev::coop::wgsl::COOP_DEFAULT);
+                    check(&format!("window attention {hh}x{ww}/{splits} b{bn} shift {shift}, coop"), got.unsqueeze_dim::<4>(0), want.unsqueeze_dim::<4>(0));
+                }
             }
         }
     }
@@ -707,8 +712,11 @@ fn matmul_ceiling() {
         let win = model::Windows::new(hh, ww, 8, &device);
         let (aq, ak, av) = (rnd3([2, hh * ww, 128]), rnd3([2, hh * ww, 128]), rnd3([2, hh * ww, 128]));
         let fl = 2.0 * 2.0 * (128 * 180 * 180 * 128) as f64;
-        time("window attention @1/4 x2, shifted, whole: plain ops", fl, &|| first(model::split_window_attention(aq.clone(), ak.clone(), av.clone(), &win, true, false)));
+        time("window attention @1/4 x2, shifted, whole: plain ops", fl, &|| first(model::split_window_attention(aq.clone(), ak.clone(), av.clone(), &win, true, false, false)));
         time("window attention @1/4 x2, shifted, whole: kernels", fl, &|| first(kernels::window_attention(aq.clone(), ak.clone(), av.clone(), hh, ww, 8, true)));
+        if coop_offered() {
+            time("window attention @1/4 x2, shifted, whole: coop", fl, &|| first(gmflow_dev::coop::window_attention(aq.clone(), ak.clone(), av.clone(), hh, ww, 8, true, gmflow_dev::coop::wgsl::COOP_DEFAULT)));
+        }
     }
     let s = rnd2([2048, 2048]);
     time("square 2048^3", 2.0 * 2048f64.powi(3), &|| first2(s.clone().matmul(s.clone())));

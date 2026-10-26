@@ -10,7 +10,7 @@
 use burn::tensor::module::conv2d;
 use burn::tensor::ops::ConvOptions;
 use burn::tensor::{ Distribution, Tensor };
-use gmflow_coop::coop::wgsl::{ self, CoopB, CoopShape, CoopTile, COOP_DEFAULT };
+use gmflow_coop::coop::wgsl::{ self, CoopB, CoopShape, CoopTile, Win, COOP_DEFAULT };
 use gmflow_coop::{ coop, device, diff, kernels };
 use std::time::Instant;
 
@@ -60,14 +60,20 @@ fn model_convs() -> Vec<ConvCase> {
 #[ignore]
 fn coop_source() {
     let conv = |c, h, w, kh, kw, stride, ph, pw| CoopB::Conv { c, h, w, kh, kw, stride, ph, pw };
+    let w4 = Win { h: 80, w: 144, splits: 8, shift: true };
+    let w8 = Win { h: 40, w: 72, splits: 2, shift: false };
     let shapes = [
-        ("conv 256->192 3x3 @1/4, no edges", CoopShape { m: 192, n: 11520, k: 2304, stride_a: 0, b: conv(256, 80, 144, 3, 3, 1, 1, 1) }),
-        ("matrix, vec4 a and b, no edges", CoopShape { m: 128, n: 256, k: 96, stride_a: 0, b: CoopB::Matrix { stride: 96 * 256 } }),
-        ("matrix, scalar a and b, every edge", CoopShape { m: 100, n: 70, k: 37, stride_a: 100 * 37, b: CoopB::Matrix { stride: 0 } }),
-        ("matrix, vec4 a, scalar b, edges in n", CoopShape { m: 64, n: 130, k: 24, stride_a: 0, b: CoopB::Matrix { stride: 24 * 130 } }),
-        ("conv 3->64 7x7 s2, edge in k only", CoopShape { m: 64, n: 160 * 288, k: 147, stride_a: 0, b: conv(3, 320, 576, 7, 7, 2, 3, 3) }),
-        ("conv 256->126 3x3, edge in m", CoopShape { m: 126, n: 11520, k: 2304, stride_a: 0, b: conv(256, 80, 144, 3, 3, 1, 1, 1) }),
-        ("conv 37->45 3x3 on 37x53, every edge", CoopShape { m: 45, n: 37 * 53, k: 333, stride_a: 0, b: conv(37, 37, 53, 3, 3, 1, 1, 1) }),
+        ("conv 256->192 3x3 @1/4, no edges", CoopShape { a_win: None, c_win: None, m: 192, n: 11520, k: 2304, stride_a: 0, b: conv(256, 80, 144, 3, 3, 1, 1, 1) }),
+        ("matrix, vec4 a and b, no edges", CoopShape { a_win: None, c_win: None, m: 128, n: 256, k: 96, stride_a: 0, b: CoopB::Matrix { stride: 96 * 256 } }),
+        ("matrix, scalar a and b, every edge", CoopShape { a_win: None, c_win: None, m: 100, n: 70, k: 37, stride_a: 100 * 37, b: CoopB::Matrix { stride: 0 } }),
+        ("matrix, vec4 a, scalar b, edges in n", CoopShape { a_win: None, c_win: None, m: 64, n: 130, k: 24, stride_a: 0, b: CoopB::Matrix { stride: 24 * 130 } }),
+        ("conv 3->64 7x7 s2, edge in k only", CoopShape { a_win: None, c_win: None, m: 64, n: 160 * 288, k: 147, stride_a: 0, b: conv(3, 320, 576, 7, 7, 2, 3, 3) }),
+        ("conv 256->126 3x3, edge in m", CoopShape { a_win: None, c_win: None, m: 126, n: 11520, k: 2304, stride_a: 0, b: conv(256, 80, 144, 3, 3, 1, 1, 1) }),
+        ("conv 37->45 3x3 on 37x53, every edge", CoopShape { a_win: None, c_win: None, m: 45, n: 37 * 53, k: 333, stride_a: 0, b: conv(37, 37, 53, 3, 3, 1, 1, 1) }),
+        ("window scores @1/4, shifted (edges)", CoopShape { m: 180, n: 180, k: 128, stride_a: 0, b: CoopB::WindowT { win: w4 }, a_win: Some(w4), c_win: None }),
+        ("window probabilities @ v @1/4, shifted (scattered rows)", CoopShape { m: 180, n: 128, k: 180, stride_a: 180 * 180, b: CoopB::WindowRows { win: w4 }, a_win: None, c_win: Some(w4) }),
+        ("window scores @1/8", CoopShape { m: 720, n: 720, k: 128, stride_a: 0, b: CoopB::WindowT { win: w8 }, a_win: Some(w8), c_win: None }),
+        ("window probabilities @ v @1/8", CoopShape { m: 720, n: 128, k: 720, stride_a: 720 * 720, b: CoopB::WindowRows { win: w8 }, a_win: None, c_win: Some(w8) }),
     ];
     for (i, (label, shape)) in shapes.iter().enumerate() {
         for (tl, tile) in TILES {
@@ -208,4 +214,35 @@ fn coop_conv() {
         totals.1 += coop_secs;
     }
     println!("COOP the model's convolutions once each: production {:.2} ms, coop {:.2} ms", totals.0 * 1e3, totals.1 * 1e3);
+}
+
+/// Split-window attention with its two matmuls on cooperative matrices against kernels::window_attention (itself checked
+/// against the plain operations by gmflow-dev's kernels_match_plain), at both sizes of the model, shifted and not, at the
+/// one-way and bidirectional batches, then timed
+#[test]
+#[ignore]
+fn coop_attention() {
+    let Some(device) = coop_device() else { return };
+    let r3 = |s: [usize; 3]| Tensor::<3>::random(s, Distribution::Normal(0.0, 1.0), &device);
+    let c = 128;
+    for (hh, ww, splits) in [(H / 4, W / 4, 8usize), (H / 8, W / 8, 2)] {
+        for bn in [2usize, 4] {
+            let (q, k, v) = (r3([bn, hh * ww, c]), r3([bn, hh * ww, c]), r3([bn, hh * ww, c]));
+            for shift in [false, true] {
+                let want = kernels::window_attention(q.clone(), k.clone(), v.clone(), hh, ww, splits, shift).into_data().to_vec::<f32>().expect("f32");
+                let got = coop::window_attention(q.clone(), k.clone(), v.clone(), hh, ww, splits, shift, COOP_DEFAULT).into_data().to_vec::<f32>().expect("f32");
+                let (max, mean, scale) = diff(&got, &want);
+                println!("COOP check window attention {hh}x{ww}/{splits} b{bn} shift {shift}: max |coop - kernels| {max:.2e}, mean {mean:.2e} (outputs up to {scale:.2e})");
+                assert!(max <= 1e-3 * scale.max(1.0), "{hh}x{ww}/{splits} b{bn} shift {shift}: max {max:.2e}");
+            }
+        }
+    }
+    let first = |t: Tensor<3>| t.slice([0..1, 0..1, 0..1]).reshape([1]);
+    for (hh, ww, splits, bn) in [(H / 4, W / 4, 8usize, 2usize), (H / 4, W / 4, 8, 4), (H / 8, W / 8, 2, 4)] {
+        let (q, k, v) = (r3([bn, hh * ww, c]), r3([bn, hh * ww, c]), r3([bn, hh * ww, c]));
+        let l = (hh / splits) * (ww / splits);
+        let flops = 2.0 * 2.0 * (bn * splits * splits * l * l * c) as f64;
+        time(&device, &format!("window attention {hh}x{ww}/{splits} b{bn} shifted: kernels"), flops, &|| first(kernels::window_attention(q.clone(), k.clone(), v.clone(), hh, ww, splits, true)));
+        time(&device, &format!("window attention {hh}x{ww}/{splits} b{bn} shifted: coop"), flops, &|| first(coop::window_attention(q.clone(), k.clone(), v.clone(), hh, ww, splits, true, COOP_DEFAULT)));
+    }
 }

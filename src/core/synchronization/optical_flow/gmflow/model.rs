@@ -282,7 +282,7 @@ impl TransformerLayer {
         let q = lin(&self.q_proj, source.clone(), gemm);
         let k = lin(&self.k_proj, target.clone(), gemm);
         let v = lin(&self.v_proj, target, gemm);
-        let message = split_window_attention(q, k, v, win, with_shift, fused);
+        let message = split_window_attention(q, k, v, win, with_shift, fused, gemm == Gemm::Coop);
         let message = self.norm1.forward(lin(&self.merge, message, gemm));
         let message = match (&self.mlp, &self.norm2) {
             (Some(mlp), Some(norm2)) => {
@@ -451,7 +451,11 @@ fn from_windows(x: Tensor<3>, b: usize, h: usize, w: usize, k: usize) -> Tensor<
 }
 
 /// unimatch single_head_split_window_attention: q, k, v [B, H*W, C] -> [B, H*W, C]; with `fused`, kernels::window_attention
-pub fn split_window_attention(q: Tensor<3>, k: Tensor<3>, v: Tensor<3>, win: &Windows, with_shift: bool, fused: bool) -> Tensor<3> {
+pub fn split_window_attention(q: Tensor<3>, k: Tensor<3>, v: Tensor<3>, win: &Windows, with_shift: bool, fused: bool, coop: bool) -> Tensor<3> {
+    // fused with coop: the same three launches, the two matmuls on cooperative matrices (coop.rs)
+    if fused && coop {
+        return coop::window_attention(q, k, v, win.h, win.w, win.splits, with_shift, coop::wgsl::COOP_DEFAULT);
+    }
     if fused {
         return kernels::window_attention(q, k, v, win.h, win.w, win.splits, with_shift);
     }

@@ -160,7 +160,7 @@ jobs:
               echo "round $i: FAILED"; failed=$((failed + 1))
               grep -E '^(BISTAGE|AFTER)' seeded_$i.log || true
             fi
-            grep -E '^bidirectional \(kernels\) pair 0' seeded_$i.log || true
+            grep -E '^bidirectional \(kernels(\+coop)?\) pair 0' seeded_$i.log || true
           done
           rm -f cubecl.toml
           echo "failed rounds: $failed of 4"

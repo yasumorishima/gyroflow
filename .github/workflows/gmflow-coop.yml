@@ -57,6 +57,11 @@ jobs:
         run: |
           cargo test --release --test coop -- --ignored --nocapture --exact coop_conv 2>&1 | tee conv.log
           grep -q "test result: ok. 1 passed" conv.log
+      - name: Split-window attention against kernels::window_attention, then timed
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --release --test coop -- --ignored --nocapture --exact coop_attention 2>&1 | tee attention.log
+          grep -q "test result: ok. 1 passed" attention.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:

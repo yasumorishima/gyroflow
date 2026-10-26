@@ -1181,6 +1181,17 @@ fn window_softmax_kernel<F: Float>(
     }
 }
 
+/// The masked softmax of split-window attention over the scores [Bw, L, L] of an h x w map in splits x splits windows,
+/// in place (window_softmax_kernel); also between the two matmuls of coop.rs's window attention
+pub(crate) fn launch_window_softmax(scores: &CubeTensor, h: usize, w: usize, splits: usize, shift: bool) {
+    let s = scores.meta.shape();
+    let l = (h / splits) * (w / splits);
+    assert!(s[1] == l && s[2] == l && s[0] % (splits * splits) == 0, "window_softmax: scores {s:?} for {h}x{w} in {splits}x{splits} windows");
+    assert_eq!(ATTN_SOFTMAX_THREADS, 64, "window_softmax_kernel reduces 64 values");
+    let count = cubecl::CubeCount::Static(l as u32, s[0] as u32, 1);
+    window_softmax_kernel::launch(&scores.client, count, CubeDim::new_2d(ATTN_SOFTMAX_THREADS as u32, 1), scores.clone().into_tensor_arg(), shift, h, w, splits, dtype_to_storage_type(scores.dtype));
+}
+
 fn launch_window_attention(q: CubeTensor, k: CubeTensor, v: CubeTensor, h: usize, w: usize, splits: usize, shift: bool) -> CubeTensor {
     let (q, k, v) = (into_contiguous(q), into_contiguous(k), into_contiguous(v));
     let s = q.meta.shape().clone();
@@ -1198,8 +1209,7 @@ fn launch_window_attention(q: CubeTensor, k: CubeTensor, v: CubeTensor, h: usize
     let scores = CubeTensor::new_contiguous(q.client.clone(), q.device.clone(), scores_shape, buffer, dtype);
     let count = cubecl::CubeCount::Static(l.div_ceil(tile.block) as u32, l.div_ceil(tile.block) as u32, bw as u32);
     window_attn_gemm_kernel::launch(&scores.client, count, dim, q.clone().into_tensor_arg(), k.into_tensor_arg(), scores.clone().into_tensor_arg(), true, shift, h, w, splits, tile.block, tile.kstep, tile.per, dtype_to_storage_type(dtype));
-    let count = cubecl::CubeCount::Static(l as u32, bw as u32, 1);
-    window_softmax_kernel::launch(&scores.client, count, CubeDim::new_2d(ATTN_SOFTMAX_THREADS as u32, 1), scores.clone().into_tensor_arg(), shift, h, w, splits, dtype_to_storage_type(dtype));
+    launch_window_softmax(&scores, h, w, splits, shift);
     let buffer = q.client.empty(s.num_elements() * dtype.size());
     let out = CubeTensor::new_contiguous(q.client.clone(), q.device.clone(), s, buffer, dtype);
     let count = cubecl::CubeCount::Static(c_n.div_ceil(tile.block) as u32, l.div_ceil(tile.block) as u32, bw as u32);
