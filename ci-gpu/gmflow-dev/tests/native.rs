@@ -347,6 +347,24 @@ fn kernels_match_plain() {
         let got = kernels::layer_norm(x, gamma, beta, Some(res.clone()));
         check(&format!("layer norm + residual {rows}x{ch}"), got.unsqueeze_dim::<4>(0), (res + want).unsqueeze_dim::<4>(0));
     }
+    // The CNN's InstanceNorms by instance_norm_kernel, against burn's InstanceNorm (no affine, eps 1e-5 as the model's)
+    // and the activations after it: alone (downsample), with relu, with relu and the residual block's relu(res + y). The
+    // CNN's first (64 channels at 1/2) and a block's at 1/4 (96), 5 channels of 7x37 (a row not a multiple of the cube's
+    // 256 threads) and of 5x7 (fewer pixels than threads); values off zero so that the mean matters, and in the last
+    // shape of sd 1e-3, a variance under eps, so that eps and where it is added matter
+    {
+        use burn::tensor::activation::relu;
+        for (shape, sd) in [([2, 64, H / 2, W / 2], 2.0), ([2, 96, H / 4, W / 4], 2.0), ([1, 5, 7, 37], 2.0), ([1, 5, 5, 7], 2.0), ([1, 5, 7, 37], 1e-3)] {
+            let x = rnd(shape, sd).add_scalar(3.0 * sd);
+            let res = rnd(shape, 1.0);
+            let norm = burn::nn::InstanceNormConfig::new(shape[1]).with_affine(false).with_epsilon(1e-5).init(&device);
+            let y = norm.forward(x.clone());
+            let label = format!("{shape:?} sd {sd}");
+            check(&format!("instance norm {label}"), kernels::instance_norm(x.clone(), false, None), y.clone());
+            check(&format!("instance norm + relu {label}"), kernels::instance_norm(x.clone(), true, None), relu(y.clone()));
+            check(&format!("instance norm + relu + residual {label}"), kernels::instance_norm(x, true, Some(res.clone())), relu(res + relu(y)));
+        }
+    }
     // The factored GRU's gates by gru_gate_kernel against the plain operations of GruFactored::step (burn's sigmoid and
     // tanh), in the layouts of its two halves: 2 z/r terms and q from an extra tensor and a z/r term's (horizontal), 3
     // z/r terms and q from two of theirs (vertical). Pre-activations of sd 3 so that the sigmoid and tanh saturate, the

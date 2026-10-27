@@ -1335,6 +1335,113 @@ fn launch_layer_norm(x: CubeTensor, gamma: CubeTensor, beta: CubeTensor, res: Op
     out
 }
 
+/// The threads of a cube of instance_norm_kernel (one row each)
+const IN_THREADS: usize = 256;
+/// The epsilon of nn.InstanceNorm2d, which the model's InstanceNorms use (model.rs instance_norm)
+pub const IN_EPS: f32 = 1e-5;
+
+/// InstanceNorm without affine parameters over each row of x [R, S] (a channel of an image, S its pixels) as burn's
+/// group_norm computes it ((x - mean) / sqrt(var + eps), the variance biased, of the centred values), then relu with
+/// relu_y, then with has_res max(res + y, 0) (the add and relu that end a residual block): one launch for what burn runs
+/// as two reductions, a subtraction and a division (and the relu and add after them). A cube per row, the sums by a tree
+/// in shared memory in a fixed order (no plane operations); the row read three times (sum, centred squares, output), as
+/// it does not fit in registers
+#[cube(launch)]
+fn instance_norm_kernel<F: Float>(
+    x: &Tensor<F>,       // [R, S]
+    res: &Tensor<F>,     // [R, S], read only with has_res
+    out: &mut Tensor<F>, // [R, S]
+    #[comptime] relu_y: bool,
+    #[comptime] has_res: bool,
+    #[define(F)] _dtype: ElemType,
+) {
+    let (rows, s_n) = (x.shape(0), x.shape(1));
+    let t = UNIT_POS_X as usize;
+    // Every thread of a cube reaches every barrier: a cube past the last row only skips its loads and stores
+    let row = ABSOLUTE_POS as usize / comptime!(IN_THREADS);
+    let live = row < rows;
+    let base = row * s_n;
+    let iters = (s_n + comptime!(IN_THREADS - 1)) / comptime!(IN_THREADS);
+    let zero = F::new(0.0_f32);
+    let s_f = F::cast_from(s_n as u32);
+    let mut red = Shared::<[F]>::new_slice(comptime!(IN_THREADS));
+    let mut sum = zero;
+    for e in 0..iters {
+        let j = t + e * comptime!(IN_THREADS);
+        if live && j < s_n {
+            sum += x[base + j];
+        }
+    }
+    red[t] = sum;
+    sync_cube();
+    let mut half = 128usize;
+    for _ in 0..8usize {
+        if t < half {
+            red[t] = red[t] + red[t + half];
+        }
+        sync_cube();
+        half = half / 2usize;
+    }
+    let mean = red[0] / s_f;
+    sync_cube();
+    let mut sq = zero;
+    for e in 0..iters {
+        let j = t + e * comptime!(IN_THREADS);
+        if live && j < s_n {
+            let dv = x[base + j] - mean;
+            sq += dv * dv;
+        }
+    }
+    red[t] = sq;
+    sync_cube();
+    let mut half = 128usize;
+    for _ in 0..8usize {
+        if t < half {
+            red[t] = red[t] + red[t + half];
+        }
+        sync_cube();
+        half = half / 2usize;
+    }
+    let sd = F::sqrt(red[0] / s_f + F::new(comptime!(IN_EPS)));
+    for e in 0..iters {
+        let j = t + e * comptime!(IN_THREADS);
+        if live && j < s_n {
+            let mut y = (x[base + j] - mean) / sd;
+            if relu_y {
+                y = F::max(y, zero);
+            }
+            if has_res {
+                y = F::max(res[base + j] + y, zero);
+            }
+            out[base + j] = y;
+        }
+    }
+}
+
+fn launch_instance_norm(x: CubeTensor, res: Option<CubeTensor>, relu_y: bool) -> CubeTensor {
+    let x = into_contiguous(x);
+    let s = x.meta.shape().clone();
+    assert!(s.num_dims() == 2 && s[0] > 0 && s[1] > 0, "instance_norm: x {s:?}");
+    // The tree of instance_norm_kernel sums 256 threads in 8 steps
+    assert!(IN_THREADS == 256, "instance_norm_kernel: threads");
+    let has_res = res.is_some();
+    let res = match res {
+        Some(r) => {
+            let r = into_contiguous(r);
+            assert!(r.meta.shape() == &s, "instance_norm: residual {:?} for x {s:?}", r.meta.shape());
+            r
+        }
+        None => x.clone(),
+    };
+    let dtype = x.dtype;
+    let buffer = x.client.empty(s.num_elements() * dtype.size());
+    let out = CubeTensor::new_contiguous(x.client.clone(), x.device.clone(), s.clone(), buffer, dtype);
+    let dim = CubeDim::new_2d(IN_THREADS as u32, 1);
+    let count = calculate_cube_count_elemwise(&x.client, s[0] * IN_THREADS, dim);
+    instance_norm_kernel::launch(&out.client, count, dim, x.into_tensor_arg(), res.into_tensor_arg(), out.clone().into_tensor_arg(), relu_y, has_res, dtype_to_storage_type(dtype));
+    out
+}
+
 /// Channel ch of slot `slot`'s tensor [N, Ct, L] at batch b, position p (a term of gru_gate_kernel's sums)
 #[cube]
 #[allow(clippy::too_many_arguments)]
@@ -1669,6 +1776,8 @@ pub trait GmflowKernels: burn::backend::Backend {
     fn window_attention(q: FloatTensor<Self>, k: FloatTensor<Self>, v: FloatTensor<Self>, h: usize, w: usize, splits: usize, shift: bool) -> FloatTensor<Self>;
     #[fusion(dtype = x, shape = x)]
     fn layer_norm(x: FloatTensor<Self>, gamma: FloatTensor<Self>, beta: FloatTensor<Self>, res: FloatTensor<Self>, has_res: bool) -> FloatTensor<Self>;
+    #[fusion(dtype = x, shape = x)]
+    fn instance_norm(x: FloatTensor<Self>, res: FloatTensor<Self>, relu_y: bool, has_res: bool) -> FloatTensor<Self>;
     #[fusion(dtype = h, shape = h)]
     #[allow(clippy::too_many_arguments)]
     fn gru_gate(t0: FloatTensor<Self>, t1: FloatTensor<Self>, t2: FloatTensor<Self>, t3: FloatTensor<Self>, h: FloatTensor<Self>, z_three: bool, zo0: usize, zo1: usize, zo2: usize, qs0: usize, qo0: usize, qs1: usize, qo1: usize, qs2: usize, qo2: usize, update: bool) -> FloatTensor<Self>;
@@ -1712,6 +1821,9 @@ impl GmflowKernels for CubeBackend {
     }
     fn layer_norm(x: FloatTensor<Self>, gamma: FloatTensor<Self>, beta: FloatTensor<Self>, res: FloatTensor<Self>, has_res: bool) -> FloatTensor<Self> {
         launch_layer_norm(x, gamma, beta, has_res.then_some(res))
+    }
+    fn instance_norm(x: FloatTensor<Self>, res: FloatTensor<Self>, relu_y: bool, has_res: bool) -> FloatTensor<Self> {
+        launch_instance_norm(x, has_res.then_some(res), relu_y)
     }
     #[allow(clippy::too_many_arguments)]
     fn gru_gate(t0: FloatTensor<Self>, t1: FloatTensor<Self>, t2: FloatTensor<Self>, t3: FloatTensor<Self>, h: FloatTensor<Self>, z_three: bool, zo0: usize, zo1: usize, zo2: usize, qs0: usize, qo0: usize, qs1: usize, qo1: usize, qs2: usize, qo2: usize, update: bool) -> FloatTensor<Self> {
@@ -1833,6 +1945,22 @@ pub fn layer_norm(x: BurnTensor<3>, gamma: BurnTensor<1>, beta: BurnTensor<1>, r
     let res = match res { Some(r) => r.reshape([b * l, c]).into_dispatch(), None => x.clone().into_dispatch() };
     let out: BurnTensor<2> = BurnTensor::from_dispatch(Dispatch::layer_norm(x.into_dispatch(), gamma.into_dispatch(), beta.into_dispatch(), res, has_res));
     out.reshape([b, l, c])
+}
+
+/// InstanceNorm without affine parameters of x [N, C, H, W] with the model's epsilon (IN_EPS), then relu with relu_y,
+/// then with res [N, C, H, W] relu(res + y), in one launch (instance_norm_kernel): what burn's InstanceNorm::forward and
+/// the activations after it in the CNN compute
+pub fn instance_norm(x: BurnTensor<4>, relu_y: bool, res: Option<BurnTensor<4>>) -> BurnTensor<4> {
+    let [n, c, h, w] = x.dims();
+    assert!(n * c > 0 && h * w > 0, "instance_norm: x {:?}", [n, c, h, w]);
+    if let Some(r) = &res {
+        assert_eq!(r.dims(), [n, c, h, w], "instance_norm: residual");
+    }
+    let has_res = res.is_some();
+    let x = x.reshape([n * c, h * w]);
+    let res = match res { Some(r) => r.reshape([n * c, h * w]).into_dispatch(), None => x.clone().into_dispatch() };
+    let out: BurnTensor<2> = BurnTensor::from_dispatch(Dispatch::instance_norm(x.into_dispatch(), res, relu_y, has_res));
+    out.reshape([n, c, h, w])
 }
 
 /// Where a q term of gru_gate is read: the tensor of one of the z/r terms (by index), or the extra tensor

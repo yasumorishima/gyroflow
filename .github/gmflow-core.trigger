@@ -23,3 +23,4 @@ round 7b: the lock of src/core too
 round 7c: audit fixes (window guard order, coop_works window attention)
 round 8: fused LayerNorm (+ residual) in the transformer
 round 9: fused GRU gates
+round 10: fused InstanceNorm (+ relu, residual) in the CNN

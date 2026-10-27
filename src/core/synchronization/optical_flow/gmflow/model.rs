@@ -58,8 +58,9 @@ pub struct Ops {
     /// The transformer's linear layers by kernels::gemm too
     pub gemm_linear: bool,
     /// Split-window attention by kernels::window_attention (no window layout or roll in memory, the softmax in one
-    /// launch), the transformer's LayerNorms with their residual adds by kernels::layer_norm, the factored GRU's gates by
-    /// kernels::gru_gate and the flow head's last convolution (2 outputs) by kernels::conv_small
+    /// launch), the transformer's LayerNorms with their residual adds by kernels::layer_norm, the CNN's InstanceNorms with
+    /// their relus and residual adds by kernels::instance_norm, the factored GRU's gates by kernels::gru_gate and the flow
+    /// head's last convolution (2 outputs) by kernels::conv_small
     pub fused: bool,
     /// The im2col convolutions with own_gemm (Co >= 32) and the GRU's by kernels::conv_gemm: the columns gathered in the
     /// matmul instead of made in memory
@@ -141,8 +142,23 @@ fn conv(channels: [usize; 2], kernel: [usize; 2], stride: usize, bias: bool, dev
 }
 
 fn instance_norm(channels: usize, device: &Device) -> InstanceNorm {
-    // The defaults of nn.InstanceNorm2d: no affine parameters, eps 1e-5, statistics of each image
-    InstanceNormConfig::new(channels).with_affine(false).with_epsilon(1e-5).init(device)
+    // The defaults of nn.InstanceNorm2d: no affine parameters, eps 1e-5 (kernels::IN_EPS, which instance_norm_kernel
+    // uses; burn adds it as an f32), statistics of each image
+    InstanceNormConfig::new(channels).with_affine(false).with_epsilon(f64::from(kernels::IN_EPS)).init(device)
+}
+
+/// An InstanceNorm of the CNN, then relu with relu_y, then with res relu(res + y) (the add and relu that end a residual
+/// block): with `fused` in one launch (kernels::instance_norm), else burn's InstanceNorm and the activations
+fn norm_act(n: &InstanceNorm, x: Tensor<4>, relu_y: bool, res: Option<Tensor<4>>, fused: bool) -> Tensor<4> {
+    if fused {
+        return kernels::instance_norm(x, relu_y, res);
+    }
+    let y = n.forward(x);
+    let y = if relu_y { relu(y) } else { y };
+    match res {
+        Some(r) => relu(r + y),
+        None => y,
+    }
 }
 
 // ---------------------------------------------------------------- CNN (unimatch backbone.py)
@@ -170,13 +186,13 @@ impl ResidualBlock {
     }
 
     fn forward(&self, x: Tensor<4>, ops: Ops) -> Tensor<4> {
-        let y = relu(self.norm.forward(conv_fwd(&self.conv1, x.clone(), ops)));
-        let y = relu(self.norm.forward(conv_fwd(&self.conv2, y, ops)));
+        let y = norm_act(&self.norm, conv_fwd(&self.conv1, x.clone(), ops), true, None, ops.fused);
         let x = match &self.downsample {
-            Some(d) => self.norm.forward(conv_fwd(d, x, ops)),
+            Some(d) => norm_act(&self.norm, conv_fwd(d, x, ops), false, None, ops.fused),
             None => x,
         };
-        relu(x + y)
+        // relu(x + relu(norm(conv2(y))))
+        norm_act(&self.norm, conv_fwd(&self.conv2, y, ops), true, Some(x), ops.fused)
     }
 }
 
@@ -215,7 +231,7 @@ impl CnnEncoder {
 
     /// Normalised images [N, 3, H, W] -> features at 1/4 and at 1/8, [N, 128, H/4, W/4] and [N, 128, H/8, W/8]
     pub fn forward(&self, x: Tensor<4>, ops: Ops) -> (Tensor<4>, Tensor<4>) {
-        let mut x = relu(self.norm1.forward(conv_fwd(&self.conv1, x, ops)));
+        let mut x = norm_act(&self.norm1, conv_fwd(&self.conv1, x, ops), true, None, ops.fused);
         for block in self.layer1.iter().chain(&self.layer2).chain(&self.layer3) {
             x = block.forward(x, ops);
         }
