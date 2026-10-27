@@ -68,6 +68,9 @@ mod inference {
     static COOP_DEVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     // How long the load took, in seconds: the weights onto the GPU, and coop_works (for the log and the tests)
     static LOAD_TIMES: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+    // The adapter as init found it (name, backend, driver, PCI ids): with the sources of coop.rs and kernels.rs, what a
+    // passed coop_works is remembered for
+    static ADAPTER: OnceLock<String> = OnceLock::new();
 
     /// The model on the device with the constants of the input size
     pub struct Runner {
@@ -138,6 +141,7 @@ mod inference {
         }
         // Of the device returned, which select keeps (the first that init returns)
         COOP_DEVICE.store(coop, std::sync::atomic::Ordering::Relaxed);
+        let _ = ADAPTER.set(format!("{} | {:?} | {} | {} | {:04x}:{:04x}", info.name, info.backend, info.driver, info.driver_info, info.vendor, info.device));
         Ok((device, name))
     }
 
@@ -288,12 +292,12 @@ mod inference {
         let implicit = gemm && cfg!(target_vendor = "apple") && on_apple_gpu();
         // Every matmul and convolution on the matrix units through WGSL cooperative matrices (coop.rs) where the device
         // offers them, measured on the Apple GPU of the macOS CI only (the convolutions run once each 121 -> 70 ms): macOS
-        // (not iOS, which CI only compiles), and checked against burn on the device first
+        // (not iOS, which CI only compiles), and checked on the device first (coop_works; once per GPU, driver and kernels)
         let checking = Instant::now();
-        let coop = implicit && cfg!(target_os = "macos") && coop_offered() && match coop_works(device) {
-            Ok(()) => true,
+        let coop = implicit && cfg!(target_os = "macos") && coop_offered() && (coop_passed_before() || match coop_works(device) {
+            Ok(()) => { remember_coop_passed(); true }
             Err(why) => { log::warn!("gmflow: cooperative matrices not used: {}", why); false }
-        };
+        });
         let check_secs = checking.elapsed().as_secs_f64();
         log::info!("gmflow: weights loaded in {:.2} s, cooperative matrices checked in {:.2} s", weights_secs, check_secs);
         *LOAD_TIMES.lock() = Some((weights_secs, check_secs));
@@ -316,12 +320,43 @@ mod inference {
         gpu().map(|(_, name)| name.starts_with("wgpu: Apple")).unwrap_or(false)
     }
 
+    // A passed coop_works is kept in the kernel cache's directory with what it held for: the adapter (its driver too) and
+    // the sources of the kernels it checked (coop.rs, and kernels.rs it compares the window attention to). It compiles
+    // kernels the model doesn't run (sizes with edges), 0.8 s of every later start on the macOS CI GPU; a failure is not
+    // kept, so a check that failed once runs again at the next start
+    fn coop_marker() -> Option<(PathBuf, String)> {
+        let adapter = ADAPTER.get()?;
+        let mut hasher = Sha256::new();
+        hasher.update(include_str!("gmflow/coop.rs").as_bytes());
+        hasher.update(include_str!("gmflow/kernels.rs").as_bytes());
+        let sources: String = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+        let path = crate::settings::data_dir().join("ai_models").join("gpu_cache").join("coop_checked");
+        Some((path, format!("{}\n{}\n", adapter, sources)))
+    }
+
+    fn coop_passed_before() -> bool {
+        if cfg!(target_os = "ios") { return false; }
+        let Some((path, want)) = coop_marker() else { return false };
+        let passed = std::fs::read_to_string(&path).map(|got| got == want).unwrap_or(false);
+        if passed { log::info!("gmflow: cooperative matrices passed their check on this GPU before ({:?})", path); }
+        passed
+    }
+
+    fn remember_coop_passed() {
+        if cfg!(target_os = "ios") { return; }
+        let Some((path, text)) = coop_marker() else { return };
+        // Process-unique tmp then rename, as for the weights: two instances never leave a partial file
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        let written = path.parent().map_or(Ok(()), |dir| std::fs::create_dir_all(dir)).and_then(|_| std::fs::write(&tmp, text)).and_then(|_| std::fs::rename(&tmp, &path));
+        if let Err(e) = written { log::debug!("gmflow: could not keep the cooperative matrices check at {:?}: {}", path, e); }
+    }
+
     // The GPU's kernels are WGSL and it has cooperative matrices (init)
     fn coop_offered() -> bool {
         gpu().is_ok() && COOP_DEVICE.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    // coop.rs against burn on this device before the model uses it: a matmul with an operand shared by a batch of 2 and a
+    // coop.rs against references on the CPU (and kernels::window_attention) on this device before the model uses it: a matmul with an operand shared by a batch of 2 and a
     // convolution of 2 images, at sizes that are not multiples of its tile (every edge). Measured on the macOS CI GPU
     // only, so a GPU whose simdgroups or layouts differ falls back to the kernels the model ran without it rather than
     // to wrong flow; a kernel that fails to compile comes back as an error of the read, caught here too
