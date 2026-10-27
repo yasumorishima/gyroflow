@@ -186,7 +186,9 @@ pub mod wgsl {
     /// is not a pass of its own; a multiple of the k step, so that each tile of a comes from one of them. `b_split`: if
     /// not 0, the x of a convolution is two maps of the same size, its first b_split channels in x [N, b_split, H, W]
     /// and the others in x2 [N, C - b_split, H, W] (the binding after the bias and a2): the refinement's convolutions on
-    /// a concatenation of channels, chosen per element of the gathered columns
+    /// a concatenation of channels, chosen per element of the gathered columns. `kv_swap`: if not 0, b's windows (the
+    /// keys and values of window attention) are those of the other half of the batch, kv_swap windows away: the
+    /// transformer's cross-attention, whose target is its input with the two images swapped, not copied so
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
     pub struct Opts {
         pub a_gelu: bool,
@@ -194,13 +196,15 @@ pub mod wgsl {
         pub relu: bool,
         pub a_split: usize,
         pub b_split: usize,
+        pub kv_swap: usize,
     }
 
     pub fn source_with(shape: CoopShape, tile: CoopTile, opts: Opts) -> String {
         if let Some(why) = unsupported(shape, tile) {
             panic!("coop gemm: {why}");
         }
-        let Opts { a_gelu, bias_rows, relu, a_split, b_split } = opts;
+        let Opts { a_gelu, bias_rows, relu, a_split, b_split, kv_swap } = opts;
+        assert!(kv_swap == 0 || matches!(shape.b, CoopB::WindowT { .. } | CoopB::WindowRows { .. }), "coop gemm: kv_swap for windows of b only");
         assert!(!a_gelu || shape.a_win.is_none(), "coop gemm: the GELU of a is for a row-major a only");
         let split = a_split != 0;
         assert!(!split || (a_split % tile.bk == 0 && a_split < shape.k && shape.stride_a == 0 && shape.a_win.is_none() && !a_gelu),
@@ -295,6 +299,12 @@ pub mod wgsl {
         emit!("    let sg_col = (sg % {sgc}u) * {}u;", 8 * fc);
         emit!("    let m0 = wg.y * {wm}u;");
         emit!("    let n0 = wg.x * {wn}u;");
+        // The windows of b: those of the other image with kv_swap (2 kv_swap windows in all)
+        if kv_swap != 0 {
+            emit!("    let bw_kv = select(wg.z + {kv_swap}u, wg.z - {kv_swap}u, wg.z >= {kv_swap}u);");
+        } else if shape.win().is_some() {
+            emit!("    let bw_kv = wg.z;");
+        }
         for i in 0..fr {
             for j in 0..fc {
                 emit!("    var c_{i}_{j} = coopLoadT<coop_mat8x8<f32, C>>(&zeros[0], 8u);");
@@ -320,7 +330,7 @@ pub mod wgsl {
                 emit!("    let p = n0 + bcol;");
                 emit!("    let p_in = p < {n}u;");
                 emit!("    var bt = 0u;");
-                emit!("    if p_in {{ bt = token(wg.z, p) * {k}u; }}");
+                emit!("    if p_in {{ bt = token(bw_kv, p) * {k}u; }}");
             }
             CoopB::Conv { c: cc, h, w: ww, kh, kw, stride, ph, pw } => {
                 let (_, ow) = CoopB::conv_out(cc, h, ww, kh, kw, stride, ph, pw);
@@ -418,7 +428,7 @@ pub mod wgsl {
                     let mut conds = Vec::new();
                     if !full_k { conds.push(format!("k0 + r < {k}u")); }
                     if !full_n { conds.push(format!("n0 + q * 4u < {n}u")); }
-                    let load = format!("v = b[(token(wg.z, k0 + r) * {n}u + n0) / 4u + q];");
+                    let load = format!("v = b[(token(bw_kv, k0 + r) * {n}u + n0) / 4u + q];");
                     emit_guarded(w, "            ", &conds, &load);
                     emit!("            let o = r * {ldb}u + q * 4u;");
                     emit!("            tile_b[o] = v.x; tile_b[o + 1u] = v.y; tile_b[o + 2u] = v.z; tile_b[o + 3u] = v.w;");
@@ -436,7 +446,7 @@ pub mod wgsl {
                     let mut conds = Vec::new();
                     if !full_k { conds.push(format!("k0 + r < {k}u")); }
                     if !full_n { conds.push(format!("n0 + q < {n}u")); }
-                    let load = format!("v = b[token(wg.z, k0 + r) * {n}u + n0 + q];");
+                    let load = format!("v = b[token(bw_kv, k0 + r) * {n}u + n0 + q];");
                     emit_guarded(w, "            ", &conds, &load);
                     emit!("            tile_b[r * {ldb}u + q] = v;");
                     emit!("        }}");
@@ -733,18 +743,21 @@ fn launch_gemm_cat_a(a: CubeTensor, a2: CubeTensor, b: CubeTensor, tile: CoopTil
 /// memory) with its two matmuls on cooperative matrices: q @ k^T / sqrt(C) of each window [Bw, L, L], the masked softmax
 /// of kernels.rs in place, then the probabilities @ v written back to the rows of the positions. q, k, v [B, h*w, C]
 #[allow(clippy::too_many_arguments)]
-fn launch_window_attention(q: CubeTensor, k: CubeTensor, v: CubeTensor, h: usize, w: usize, splits: usize, shift: bool, tile: CoopTile) -> CubeTensor {
+fn launch_window_attention(q: CubeTensor, k: CubeTensor, v: CubeTensor, h: usize, w: usize, splits: usize, shift: bool, kv_swap: bool, tile: CoopTile) -> CubeTensor {
     let (q, k, v) = (into_contiguous(q), into_contiguous(k), into_contiguous(v));
     let s = q.meta.shape().clone();
     assert!(s[1] == h * w && h % splits == 0 && w % splits == 0 && s[2] > 0, "coop window_attention: {s:?} for {h}x{w} in {splits}x{splits} windows");
     assert!(k.meta.shape() == &s && v.meta.shape() == &s, "coop window_attention: q {s:?}, k {:?}, v {:?}", k.meta.shape(), v.meta.shape());
     let win = wgsl::Win { h, w, splits, shift };
     let (c, l, bw) = (s[2], win.len(), s[0] * splits * splits);
+    // k and v of the other image: the windows half the batch away
+    assert!(!kv_swap || s[0] % 2 == 0, "coop window_attention: k and v swapped by halves of a batch of {}", s[0]);
+    let opts = wgsl::Opts { kv_swap: if kv_swap { bw / 2 } else { 0 }, ..Default::default() };
     let scores = CoopShape { m: l, n: l, k: c, stride_a: 0, b: CoopB::WindowT { win }, a_win: Some(win), c_win: None };
-    let scores = launch(&q, &k, scores, bw, tile, None, wgsl::Opts::default(), None, None, None);
+    let scores = launch(&q, &k, scores, bw, tile, None, opts, None, None, None);
     super::kernels::launch_window_softmax(&scores, h, w, splits, shift);
     let apply = CoopShape { m: l, n: c, k: l, stride_a: l * l, b: CoopB::WindowRows { win }, a_win: None, c_win: Some(win) };
-    launch(&scores, &v, apply, bw, tile, Some(s), wgsl::Opts::default(), None, None, None)
+    launch(&scores, &v, apply, bw, tile, Some(s), opts, None, None, None)
 }
 
 fn conv_shape(w: &Shape, x: &Shape, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> Shape {
@@ -801,7 +814,7 @@ pub trait CoopKernels: burn::backend::Backend {
     fn coop_conv(w: FloatTensor<Self>, x: FloatTensor<Self>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self>;
     #[fusion(dtype = q, shape = q)]
     #[allow(clippy::too_many_arguments)]
-    fn coop_window_attention(q: FloatTensor<Self>, k: FloatTensor<Self>, v: FloatTensor<Self>, h: usize, w: usize, splits: usize, shift: bool, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self>;
+    fn coop_window_attention(q: FloatTensor<Self>, k: FloatTensor<Self>, v: FloatTensor<Self>, h: usize, w: usize, splits: usize, shift: bool, kv_swap: bool, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self>;
 }
 
 impl CoopKernels for CubeBackend {
@@ -834,8 +847,9 @@ impl CoopKernels for CubeBackend {
     fn coop_conv(w: FloatTensor<Self>, x: FloatTensor<Self>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self> {
         launch_conv(w, x, kh, kw, stride, ph, pw, CoopTile { bk, sgr, sgc, fr, fc }, wgsl::Opts::default(), None, None)
     }
-    fn coop_window_attention(q: FloatTensor<Self>, k: FloatTensor<Self>, v: FloatTensor<Self>, h: usize, w: usize, splits: usize, shift: bool, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self> {
-        launch_window_attention(q, k, v, h, w, splits, shift, CoopTile { bk, sgr, sgc, fr, fc })
+    #[allow(clippy::too_many_arguments)]
+    fn coop_window_attention(q: FloatTensor<Self>, k: FloatTensor<Self>, v: FloatTensor<Self>, h: usize, w: usize, splits: usize, shift: bool, kv_swap: bool, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self> {
+        launch_window_attention(q, k, v, h, w, splits, shift, kv_swap, CoopTile { bk, sgr, sgc, fr, fc })
     }
 }
 
@@ -844,7 +858,15 @@ impl CoopKernels for CubeBackend {
 #[allow(clippy::too_many_arguments)]
 pub fn window_attention(q: BurnTensor<3>, k: BurnTensor<3>, v: BurnTensor<3>, h: usize, w: usize, splits: usize, shift: bool, tile: CoopTile) -> BurnTensor<3> {
     let CoopTile { bk, sgr, sgc, fr, fc } = tile;
-    BurnTensor::from_dispatch(Dispatch::coop_window_attention(q.into_dispatch(), k.into_dispatch(), v.into_dispatch(), h, w, splits, shift, bk, sgr, sgc, fr, fc))
+    BurnTensor::from_dispatch(Dispatch::coop_window_attention(q.into_dispatch(), k.into_dispatch(), v.into_dispatch(), h, w, splits, shift, false, bk, sgr, sgc, fr, fc))
+}
+
+/// window_attention(q, swap_halves(k), swap_halves(v), ..) without the swaps: the windows of k and v read from the other
+/// half of the batch (wgsl::Opts::kv_swap). The batch even
+#[allow(clippy::too_many_arguments)]
+pub fn window_attention_kv_swapped(q: BurnTensor<3>, k: BurnTensor<3>, v: BurnTensor<3>, h: usize, w: usize, splits: usize, shift: bool, tile: CoopTile) -> BurnTensor<3> {
+    let CoopTile { bk, sgr, sgc, fr, fc } = tile;
+    BurnTensor::from_dispatch(Dispatch::coop_window_attention(q.into_dispatch(), k.into_dispatch(), v.into_dispatch(), h, w, splits, shift, true, bk, sgr, sgc, fr, fc))
 }
 
 /// [batch, m, k] @ [batch, k, n] -> [batch, m, n] (an operand of batch 1 shared), f32, any sizes

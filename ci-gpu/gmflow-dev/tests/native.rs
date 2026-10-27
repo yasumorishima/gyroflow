@@ -330,6 +330,11 @@ fn kernels_match_plain() {
                 if coop_offered() {
                     let got = gmflow_dev::coop::window_attention(q.clone(), k.clone(), v.clone(), hh, ww, splits, shift, gmflow_dev::coop::wgsl::COOP_DEFAULT);
                     check(&format!("window attention {hh}x{ww}/{splits} b{bn} shift {shift}, coop"), got.unsqueeze_dim::<4>(0), want.unsqueeze_dim::<4>(0));
+                    // k and v read from the other half of the batch (the cross-attention), against coop.rs's attention
+                    // on k and v with their halves swapped
+                    let want = gmflow_dev::coop::window_attention(q.clone(), model::swap_halves(k.clone()), model::swap_halves(v.clone()), hh, ww, splits, shift, gmflow_dev::coop::wgsl::COOP_DEFAULT);
+                    let got = gmflow_dev::coop::window_attention_kv_swapped(q.clone(), k.clone(), v.clone(), hh, ww, splits, shift, gmflow_dev::coop::wgsl::COOP_DEFAULT);
+                    check(&format!("window attention {hh}x{ww}/{splits} b{bn} shift {shift}, coop, k v swapped"), got.unsqueeze_dim::<4>(0), want.unsqueeze_dim::<4>(0));
                 }
             }
         }

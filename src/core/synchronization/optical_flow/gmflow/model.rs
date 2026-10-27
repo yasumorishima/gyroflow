@@ -323,12 +323,20 @@ impl TransformerLayer {
         }
     }
 
-    /// source, target: [B, H*W, C]
-    fn forward(&self, source: Tensor<3>, target: Tensor<3>, win: &Windows, with_shift: bool, gemm: Gemm, fused: bool) -> Tensor<3> {
+    /// source, target: [B, H*W, C]. `target_swapped`: the target is swap_halves(target) (only with coop and `fused`):
+    /// k and v are projected from the target as given and the attention reads them from the other half of the batch
+    /// (coop::window_attention_kv_swapped; the projections are per token, so they commute with the swap)
+    #[allow(clippy::too_many_arguments)]
+    fn forward(&self, source: Tensor<3>, target: Tensor<3>, target_swapped: bool, win: &Windows, with_shift: bool, gemm: Gemm, fused: bool) -> Tensor<3> {
         let q = lin(&self.q_proj, source.clone(), gemm);
         let k = lin(&self.k_proj, target.clone(), gemm);
         let v = lin(&self.v_proj, target, gemm);
-        let message = split_window_attention(q, k, v, win, with_shift, fused, gemm == Gemm::Coop);
+        let message = if target_swapped {
+            assert!(gemm == Gemm::Coop && fused, "a swapped target with coop and fused only");
+            coop::window_attention_kv_swapped(q, k, v, win.h, win.w, win.splits, with_shift, coop::wgsl::COOP_DEFAULT)
+        } else {
+            split_window_attention(q, k, v, win, with_shift, fused, gemm == Gemm::Coop)
+        };
         let message = lin(&self.merge, message, gemm);
         // source + the last norm's output, the add made by the norm with `fused`
         match (&self.mlp, &self.norm2) {
@@ -459,9 +467,11 @@ impl FeatureTransformer {
         let mut concat0 = Tensor::cat(vec![f0, f1], 0);
         for (i, layer) in self.layers.iter().enumerate() {
             let with_shift = i % 2 == 1;
-            let concat1 = swap_halves(concat0.clone());
-            let s = layer.self_attn.forward(concat0.clone(), concat0, win, with_shift, gemm, fused);
-            concat0 = layer.cross_attn_ffn.forward(s, concat1, win, with_shift, gemm, fused);
+            // With coop and `fused` the cross-attention reads the keys and values of the other image where they are
+            let swapped_in_kernel = gemm == Gemm::Coop && fused;
+            let concat1 = if swapped_in_kernel { concat0.clone() } else { swap_halves(concat0.clone()) };
+            let s = layer.self_attn.forward(concat0.clone(), concat0, false, win, with_shift, gemm, fused);
+            concat0 = layer.cross_attn_ffn.forward(s, concat1, swapped_in_kernel, win, with_shift, gemm, fused);
         }
         let back = |t: Tensor<3>| t.swap_dims(1, 2).reshape([b, c, h, w]);
         (back(concat0.clone().narrow(0, 0, b)), back(concat0.narrow(0, b, b)))
