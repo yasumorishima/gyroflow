@@ -29,3 +29,4 @@ round 12: coop_works against CPU references (no burn autotune at load)
 round 13: softmax_flow in global matching and propagation; a second start measured
 round 14: a passed coop_works kept per GPU, driver and kernel sources
 round 15: GELU in fc2's loads, conv bias + relu as coop writes, the FFN's cat read by fc1
+round 16: the refinement's cats read in place, cross-attention without swap_halves, coop tiling 64 x 32
