@@ -141,6 +141,16 @@ jobs:
         env:
           GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
         run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_runs_within_128_mib_buffers
+      # The first start of the job compiled and tuned with empty caches (in Gyroflow's data directory); a later start of
+      # Gyroflow finds the autotune results and cubecl's kernels there, and only this second start shows what it waits
+      - name: A second start, the caches of the first kept
+        if: runner.os == 'macOS'
+        working-directory: src/core
+        env:
+          GMFLOW_REF_DIR: ${{ github.workspace }}/ci-gpu/out
+          GMFLOW_WARM_RUNS: '1'
+          GMFLOW_EXPECT_CONVOLUTIONS: 'cooperative matrices (coop.rs)'
+        run: bash ../../ci-gpu/one_test.sh synchronization::optical_flow::gmflow::tests::gmflow_matches_pytorch
 
   check:
     strategy:
