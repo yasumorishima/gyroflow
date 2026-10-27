@@ -164,6 +164,13 @@ jobs:
           done
           rm -f cubecl.toml
           echo "failed rounds: $failed of 4"
+      - name: What compiling one kernel costs, naga and the pipeline apart, in two processes
+        if: matrix.best != '' && runner.os == 'macOS'
+        run: |
+          for i in 1 2; do
+            cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact compile_cost > compile_cost_$i.log 2>&1 || { tail -n 30 compile_cost_$i.log; exit 1; }
+            grep -E '^(device|COMPILE|no cooperative)' compile_cost_$i.log
+          done
       - name: The bidirectional pass 6 times in fresh processes, autotune cache off, its choices logged
         if: matrix.best != ''
         env:

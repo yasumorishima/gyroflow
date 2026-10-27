@@ -1014,3 +1014,69 @@ fn bidirectional_repeat() {
     }
     assert!(bad.is_empty(), "bidirectional: {bad:?}");
 }
+
+/// What one kernel costs to compile on this GPU, apart: naga's parse and validation of the WGSL (create_shader_module),
+/// then the pipeline (naga's MSL and Metal's compiler on Metal). coop.rs writes a WGSL text per shape, so the model's
+/// first pass in a process compiles 41 of them (of 96 kernels, compile_N.log); shapes of the model, each twice in the
+/// process (the second: whether Metal finds the first in a cache), and the workflow runs this in two processes
+#[test]
+#[ignore]
+fn compile_cost() {
+    use burn::tensor::wgpu::wgpu;
+    use burn::tensor::{ Device, DeviceKind };
+    use gmflow_dev::coop::wgsl::{ self, CoopB, CoopShape, COOP_DEFAULT };
+    let (_device, setup) = Device::wgpu_options().graphics_api(GRAPHICS_API).device_kind(DeviceKind::DefaultDevice).init_with_setup().expect("a GPU");
+    let info = setup.adapter.get_info();
+    println!("device: {} ({:?})", info.name, info.backend);
+    let dev = &setup.device;
+    if !dev.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        println!("no cooperative matrices on this device: nothing to measure");
+        return;
+    }
+    let (h8, w8, h4, w4) = (H / 8, W / 8, H / 4, W / 4);
+    let conv = |co: usize, c: usize, h: usize, w: usize, kh: usize, kw: usize, ph: usize, pw: usize| {
+        let (oh, ow) = CoopB::conv_out(c, h, w, kh, kw, 1, ph, pw);
+        CoopShape { m: co, n: oh * ow, k: c * kh * kw, stride_a: 0, b: CoopB::Conv { c, h, w, kh, kw, stride: 1, ph, pw }, a_win: None, c_win: None }
+    };
+    let mat = |m: usize, n: usize, k: usize| CoopShape { m, n, k, stride_a: 0, b: CoopB::Matrix { stride: 0 }, a_win: None, c_win: None };
+    let shapes = [
+        ("conv 3x3 128 -> 128 at 1/4", conv(128, 128, h4, w4, 3, 3, 1, 1)),
+        ("conv 3x3 96 -> 96 at 1/4", conv(96, 96, h4, w4, 3, 3, 1, 1)),
+        ("conv 1x5 384 -> 128 at 1/4", conv(128, 384, h4, w4, 1, 5, 0, 2)),
+        ("conv 5x1 384 -> 128 at 1/4", conv(128, 384, h4, w4, 5, 1, 2, 0)),
+        ("matmul 2880 x 128 x 128", mat(h8 * w8, 128, 128)),
+        ("matmul 11520 x 256 x 128", mat(h4 * w4, 256, 128)),
+        ("matmul 11520 x 128 x 256", mat(h4 * w4, 128, 256)),
+    ];
+    let (mut naga_ms, mut pipe_ms) = ([0f64; 2], [0f64; 2]);
+    for round in 0..2 {
+        for (label, shape) in shapes {
+            if let Some(why) = wgsl::unsupported(shape, COOP_DEFAULT) {
+                println!("{label}: not a coop.rs shape ({why})");
+                continue;
+            }
+            let src = wgsl::source(shape, COOP_DEFAULT);
+            let bytes = src.len();
+            let t0 = Instant::now();
+            // As cubecl creates them: trusted, no runtime checks (bounds are the kernel's own)
+            let module = unsafe {
+                dev.create_shader_module_trusted(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(src.into()) }, wgpu::ShaderRuntimeChecks::unchecked())
+            };
+            let t1 = Instant::now();
+            let _pipeline = dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: None,
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions { zero_initialize_workgroup_memory: false, ..Default::default() },
+                cache: None,
+            });
+            let t2 = Instant::now();
+            let (n, p) = ((t1 - t0).as_secs_f64() * 1e3, (t2 - t1).as_secs_f64() * 1e3);
+            naga_ms[round] += n;
+            pipe_ms[round] += p;
+            println!("COMPILE round {round} {label:28}: {bytes:6} bytes of WGSL, naga {n:7.1} ms, pipeline (MSL + Metal) {p:7.1} ms");
+        }
+    }
+    println!("COMPILE total: round 0 naga {:.1} ms + pipeline {:.1} ms; round 1 (the same texts again) naga {:.1} ms + pipeline {:.1} ms", naga_ms[0], pipe_ms[0], naga_ms[1], pipe_ms[1]);
+}
