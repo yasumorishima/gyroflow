@@ -1134,11 +1134,14 @@ impl Statics {
 }
 
 /// Intermediates of one pass, named as ci-gpu/refs_native.py names those of unimatch, for checking the port stage by stage
-/// or, with `timed`, when each stage was done (the device synced at each point; nothing is kept)
+/// or, with `timed`, when each stage was done (the device synced at each point; nothing is kept); with `echo` as well,
+/// "STAGE-MARK <name>" printed at each point, after the sync: in a log of cubecl's profile (each kernel printed as it is
+/// timed), the kernels of a stage are those just before its mark
 #[derive(Default)]
 pub struct Trace {
     pub tensors: Vec<(String, Tensor<4>)>,
     pub timed: bool,
+    pub echo: bool,
     pub marks: Vec<(String, std::time::Instant)>,
 }
 
@@ -1147,6 +1150,9 @@ fn put(trace: &mut Option<&mut Trace>, name: &str, t: &Tensor<4>) {
     if tr.timed {
         t.device().sync().expect("gmflow: GPU sync");
         tr.marks.push((name.to_owned(), std::time::Instant::now()));
+        if tr.echo {
+            println!("STAGE-MARK {name}");
+        }
     } else {
         tr.tensors.push((name.to_owned(), t.clone()));
     }

@@ -692,6 +692,13 @@ fn profile_passes() {
     for _ in 0..3 { let _ = to_vec(model.forward(inp(0), inp(1), &st)); }
     std::thread::sleep(std::time::Duration::from_secs(3));
     println!("PROFILE-END");
+    // One more pass with the stages marked (synced at each, so it is not one of the timed passes): which stage launches
+    // each kernel (stage_kernels.py)
+    println!("STAGED-START");
+    let mut trace = model::Trace { timed: true, echo: true, ..Default::default() };
+    let _ = to_vec(model.forward_traced(inp(0), inp(1), &st, Some(&mut trace)));
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    println!("STAGED-END");
     // What each CoopKernel_<hash> of the profile computes (profile_summary.py puts it beside the name)
     for (name, what) in gmflow_dev::coop::recorded_names() {
         println!("KERNEL-NAME {name} {what}");
