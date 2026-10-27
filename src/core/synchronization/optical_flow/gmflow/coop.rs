@@ -180,20 +180,27 @@ pub mod wgsl {
     /// [tokens, 1024] tensor; burn's GELU, x (1 + erf(x / sqrt 2)) / 2, erf by its polyfill (Abramowitz and Stegun
     /// 7.1.26, cubecl-core polyfills.rs), which WGSL has no builtin for. `bias_rows`: a bias per row of c added (binding
     /// 3; the output channels of a convolution), `relu`: max(., 0) after it, both as c is written: every block of c then
-    /// goes through workgroup memory, as the blocks over an edge do
+    /// goes through workgroup memory, as the blocks over an edge do. `a_split`: if not 0, a is two matrices side by
+    /// side, its first a_split columns in a [m, a_split] and the others in a2 [m, k - a_split] (the binding after the
+    /// bias, or 3): the FFN's first matmul on the concatenation of its input and the message, so that the concatenation
+    /// is not a pass of its own; a multiple of the k step, so that each tile of a comes from one of them
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
     pub struct Opts {
         pub a_gelu: bool,
         pub bias_rows: bool,
         pub relu: bool,
+        pub a_split: usize,
     }
 
     pub fn source_with(shape: CoopShape, tile: CoopTile, opts: Opts) -> String {
         if let Some(why) = unsupported(shape, tile) {
             panic!("coop gemm: {why}");
         }
-        let Opts { a_gelu, bias_rows, relu } = opts;
+        let Opts { a_gelu, bias_rows, relu, a_split } = opts;
         assert!(!a_gelu || shape.a_win.is_none(), "coop gemm: the GELU of a is for a row-major a only");
+        let split = a_split != 0;
+        assert!(!split || (a_split % tile.bk == 0 && a_split < shape.k && shape.stride_a == 0 && shape.a_win.is_none() && !a_gelu),
+            "coop gemm: a split at {a_split} for {shape:?} and k steps of {}", tile.bk);
         assert!(!(bias_rows || relu) || shape.c_win.is_none(), "coop gemm: no bias or relu with scattered rows of c");
         let CoopShape { m, n, k, stride_a, b, a_win, c_win } = shape;
         // q scaled as it is read (the attention scores / sqrt(C)); Debug of an f32 is a valid WGSL float literal
@@ -221,6 +228,9 @@ pub mod wgsl {
         emit!("@group(0) @binding(2) var<storage, read_write> c: array<f32>;");
         if bias_rows {
             emit!("@group(0) @binding(3) var<storage, read_write> bias: array<f32>;");
+        }
+        if split {
+            emit!("@group(0) @binding({}) var<storage, read_write> a2: {};", if bias_rows { 4 } else { 3 }, ty(va));
         }
         emit!("");
         // The accumulators start from an 8 x 8 block of zeros: loaded, not constructed (what Metal makes of a
@@ -281,7 +291,12 @@ pub mod wgsl {
                 emit!("    var c_{i}_{j} = coopLoadT<coop_mat8x8<f32, C>>(&zeros[0], 8u);");
             }
         }
-        if a_win.is_none() {
+        // The two parts of a split a: rows of a_split and of k - a_split (a batch of 1, stride_a 0)
+        let (k1, k2) = (a_split, k - a_split);
+        if split {
+            emit!("    let a_wg = m0 * {k1}u;");
+            emit!("    let a2_wg = m0 * {k2}u;");
+        } else if a_win.is_none() {
             emit!("    let a_wg = wg.z * {stride_a}u + m0 * {k}u;");
         }
         // The gathered columns: this thread's column of the tile is li % wn at every k step; the top left of its window in
@@ -324,6 +339,8 @@ pub mod wgsl {
                 if !full_k { conds.push(format!("k0 + q * 4u < {k}u")); }
                 let load = if a_win.is_some() {
                     format!("v = a[(token(wg.z, m0 + r) * {k}u + k0) / 4u + q] * {scale};")
+                } else if split {
+                    format!("if k0 < {k1}u {{ v = a[(a_wg + r * {k1}u + k0) / 4u + q]; }} else {{ v = a2[(a2_wg + r * {k2}u + k0 - {k1}u) / 4u + q]; }}")
                 } else if a_gelu {
                     format!("v = gelu4(a[(a_wg + r * {k}u + k0) / 4u + q]);")
                 } else {
@@ -347,6 +364,8 @@ pub mod wgsl {
                 if !full_k { conds.push(format!("k0 + q < {k}u")); }
                 let load = if a_win.is_some() {
                     format!("v = a[token(wg.z, m0 + r) * {k}u + k0 + q] * {scale};")
+                } else if split {
+                    format!("if k0 < {k1}u {{ v = a[a_wg + r * {k1}u + k0 + q]; }} else {{ v = a2[a2_wg + r * {k2}u + k0 - {k1}u + q]; }}")
                 } else if a_gelu {
                     format!("v = gelu(a[a_wg + r * {k}u + k0 + q]);")
                 } else {
@@ -597,7 +616,7 @@ impl CubeKernel for CoopKernel {
 /// `out` then); a and b declared read only to cubecl, so that a kernel that fails to compile marks only its output, not
 /// inputs other launches share
 #[allow(clippy::too_many_arguments)]
-fn launch(a: &CubeTensor, b: &CubeTensor, shape: CoopShape, batch: usize, tile: CoopTile, out: Option<Shape>, opts: wgsl::Opts, bias: Option<&CubeTensor>) -> CubeTensor {
+fn launch(a: &CubeTensor, b: &CubeTensor, shape: CoopShape, batch: usize, tile: CoopTile, out: Option<Shape>, opts: wgsl::Opts, bias: Option<&CubeTensor>, a2: Option<&CubeTensor>) -> CubeTensor {
     assert_eq!(a.dtype, DType::F32, "coop: f32 only");
     // Every index of the kernel is a u32 (the windows': as many tokens as rows of all the windows)
     let b_elems = match shape.b {
@@ -625,6 +644,11 @@ fn launch(a: &CubeTensor, b: &CubeTensor, shape: CoopShape, batch: usize, tile: 
         assert!(bias.meta.shape().num_elements() == shape.m && bias.dtype == DType::F32, "coop: bias {:?} for {} rows", bias.meta.shape(), shape.m);
         args = args.with_buffer_io(bias.handle.clone().binding(), BufferIOAttr::ReadOnly);
     }
+    assert_eq!(opts.a_split != 0, a2.is_some(), "coop: a second part of a exactly with a_split");
+    if let Some(a2) = a2 {
+        assert!(a2.meta.shape().num_elements() == shape.m * (shape.k - opts.a_split) && a2.dtype == DType::F32, "coop: a2 {:?} for {shape:?} split at {}", a2.meta.shape(), opts.a_split);
+        args = args.with_buffer_io(a2.handle.clone().binding(), BufferIOAttr::ReadOnly);
+    }
     out.client.launch(Box::new(CoopKernel { shape, tile, opts }), count, args);
     out
 }
@@ -649,7 +673,18 @@ fn launch_gemm(a: CubeTensor, b: CubeTensor, tile: CoopTile, opts: wgsl::Opts, b
         a_win: None,
         c_win: None,
     };
-    launch(&a, &b, shape, sa[0].max(sb[0]), tile, None, opts, bias.as_ref())
+    launch(&a, &b, shape, sa[0].max(sb[0]), tile, None, opts, bias.as_ref(), None)
+}
+
+/// cat([a, a2], 2) @ b without the concatenation (wgsl::Opts::a_split): a [1, m, k1], a2 [1, m, k2], b [batch, k1 + k2, n]
+fn launch_gemm_cat_a(a: CubeTensor, a2: CubeTensor, b: CubeTensor, tile: CoopTile) -> CubeTensor {
+    let (a, a2, b) = (into_contiguous(a), into_contiguous(a2), into_contiguous(b));
+    let (sa, sa2, sb) = (a.meta.shape().clone(), a2.meta.shape().clone(), b.meta.shape().clone());
+    assert!(sa[0] == 1 && sa2[0] == 1 && sa[1] == sa2[1], "coop gemm_cat_a: a {sa:?} and a2 {sa2:?}");
+    let (m, k1, k, n) = (sa[1], sa[2], sa[2] + sa2[2], sb[2]);
+    assert!(sb[1] == k, "coop gemm_cat_a: b {sb:?} for {k1} + {} columns of a", sa2[2]);
+    let shape = CoopShape { m, n, k, stride_a: 0, b: CoopB::Matrix { stride: if sb[0] == 1 { 0 } else { k * n } }, a_win: None, c_win: None };
+    launch(&a, &b, shape, sb[0], tile, None, wgsl::Opts { a_split: k1, ..Default::default() }, None, Some(&a2))
 }
 
 /// unimatch single_head_split_window_attention, as kernels::window_attention does it (no window layout or roll in
@@ -664,10 +699,10 @@ fn launch_window_attention(q: CubeTensor, k: CubeTensor, v: CubeTensor, h: usize
     let win = wgsl::Win { h, w, splits, shift };
     let (c, l, bw) = (s[2], win.len(), s[0] * splits * splits);
     let scores = CoopShape { m: l, n: l, k: c, stride_a: 0, b: CoopB::WindowT { win }, a_win: Some(win), c_win: None };
-    let scores = launch(&q, &k, scores, bw, tile, None, wgsl::Opts::default(), None);
+    let scores = launch(&q, &k, scores, bw, tile, None, wgsl::Opts::default(), None, None);
     super::kernels::launch_window_softmax(&scores, h, w, splits, shift);
     let apply = CoopShape { m: l, n: c, k: l, stride_a: l * l, b: CoopB::WindowRows { win }, a_win: None, c_win: Some(win) };
-    launch(&scores, &v, apply, bw, tile, Some(s), wgsl::Opts::default(), None)
+    launch(&scores, &v, apply, bw, tile, Some(s), wgsl::Opts::default(), None, None)
 }
 
 fn conv_shape(w: &Shape, x: &Shape, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> Shape {
@@ -684,13 +719,16 @@ fn launch_conv(w: CubeTensor, x: CubeTensor, kh: usize, kw: usize, stride: usize
     assert!(sw[0] == 1 && sw[2] == c * kh * kw, "coop conv: weight {sw:?} for x {sx:?} and a {kh}x{kw} kernel");
     let (oh, ow) = CoopB::conv_out(c, h, wd, kh, kw, stride, ph, pw);
     let shape = CoopShape { m: sw[1], n: oh * ow, k: sw[2], stride_a: 0, b: CoopB::Conv { c, h, w: wd, kh, kw, stride, ph, pw }, a_win: None, c_win: None };
-    launch(&w, &x, shape, sx[0], tile, None, opts, bias.as_ref())
+    launch(&w, &x, shape, sx[0], tile, None, opts, bias.as_ref(), None)
 }
 
 #[backend_extension(Cube, Fusion)]
 pub trait CoopKernels: burn::backend::Backend {
     #[fusion(dtype = a, shape = coop_shape(a, b))]
     fn coop_gemm(a: FloatTensor<Self>, b: FloatTensor<Self>, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self>;
+    #[fusion(dtype = a, shape = coop_shape(a, b))]
+    #[allow(clippy::too_many_arguments)]
+    fn coop_gemm_cat_a(a: FloatTensor<Self>, a2: FloatTensor<Self>, b: FloatTensor<Self>, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self>;
     #[fusion(dtype = a, shape = coop_shape(a, b))]
     fn coop_gemm_gelu_a(a: FloatTensor<Self>, b: FloatTensor<Self>, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self>;
     #[fusion(dtype = a, shape = coop_shape(a, b))]
@@ -710,6 +748,10 @@ pub trait CoopKernels: burn::backend::Backend {
 impl CoopKernels for CubeBackend {
     fn coop_gemm(a: FloatTensor<Self>, b: FloatTensor<Self>, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self> {
         launch_gemm(a, b, CoopTile { bk, sgr, sgc, fr, fc }, wgsl::Opts::default(), None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn coop_gemm_cat_a(a: FloatTensor<Self>, a2: FloatTensor<Self>, b: FloatTensor<Self>, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self> {
+        launch_gemm_cat_a(a, a2, b, CoopTile { bk, sgr, sgc, fr, fc })
     }
     fn coop_gemm_gelu_a(a: FloatTensor<Self>, b: FloatTensor<Self>, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self> {
         launch_gemm(a, b, CoopTile { bk, sgr, sgc, fr, fc }, wgsl::Opts { a_gelu: true, ..Default::default() }, None)
@@ -742,6 +784,13 @@ pub fn window_attention(q: BurnTensor<3>, k: BurnTensor<3>, v: BurnTensor<3>, h:
 pub fn gemm(a: BurnTensor<3>, b: BurnTensor<3>, tile: CoopTile) -> BurnTensor<3> {
     let CoopTile { bk, sgr, sgc, fr, fc } = tile;
     BurnTensor::from_dispatch(Dispatch::coop_gemm(a.into_dispatch(), b.into_dispatch(), bk, sgr, sgc, fr, fc))
+}
+
+/// cat([a, a2], 2) @ b, each tile of a read from the part it lies in (wgsl::Opts::a_split): a [1, m, k1] (k1 a multiple
+/// of the tile's k step), a2 [1, m, k2], b [batch, k1 + k2, n] -> [batch, m, n]
+pub fn gemm_cat_a(a: BurnTensor<3>, a2: BurnTensor<3>, b: BurnTensor<3>, tile: CoopTile) -> BurnTensor<3> {
+    let CoopTile { bk, sgr, sgc, fr, fc } = tile;
+    BurnTensor::from_dispatch(Dispatch::coop_gemm_cat_a(a.into_dispatch(), a2.into_dispatch(), b.into_dispatch(), bk, sgr, sgc, fr, fc))
 }
 
 /// gelu(a) @ b, the GELU taken as a is read (wgsl::source_with): [batch, m, k] @ [batch, k, n] -> [batch, m, n]

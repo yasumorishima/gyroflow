@@ -395,6 +395,17 @@ fn kernels_match_plain() {
             let got = coop::gemm_gelu_a(a, b, coop::wgsl::COOP_DEFAULT);
             check(&format!("coop gemm, gelu of a {rows}x{k}x{n}"), got.unsqueeze_dim::<4>(0), want.unsqueeze_dim::<4>(0));
         }
+        // The FFN's first matmul on its input and the message side by side (coop::gemm_cat_a), against the same matmul of
+        // their concatenation: the 1/4 tokens of 128 + 128 channels into 1024 (vec4 loads), 37 rows of 32 + 12 (vec4,
+        // the last k step partial) and of 16 + 13 (scalar loads, every edge)
+        for (rows, k1, k2, n) in [(2 * (H / 4) * (W / 4), 128usize, 128usize, 1024usize), (37, 32, 12, 70), (37, 16, 13, 70)] {
+            let a = Tensor::<3>::random([1, rows, k1], Distribution::Normal(0.0, 1.0), &device);
+            let a2 = Tensor::<3>::random([1, rows, k2], Distribution::Normal(0.0, 1.0), &device);
+            let b = Tensor::<3>::random([1, k1 + k2, n], Distribution::Normal(0.0, 0.1), &device);
+            let want = coop::gemm(Tensor::cat(vec![a.clone(), a2.clone()], 2), b.clone(), coop::wgsl::COOP_DEFAULT);
+            let got = coop::gemm_cat_a(a, a2, b, coop::wgsl::COOP_DEFAULT);
+            check(&format!("coop gemm, a in two {rows}x({k1}+{k2})x{n}"), got.unsqueeze_dim::<4>(0), want.unsqueeze_dim::<4>(0));
+        }
         // The bias and relu taken as coop.rs writes a convolution (coop::conv2d_act), against coop.rs's convolution without
         // them, then burn's add and relu: the motion encoder's 3x3 (256 -> 192 at 1/4, batch 2) and its 1x1 (81 -> 256, a
         // matmul), and 37 -> 45 on 37 x 53 (every edge) with a relu and no bias

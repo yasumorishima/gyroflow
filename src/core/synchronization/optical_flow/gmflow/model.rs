@@ -321,25 +321,30 @@ impl TransformerLayer {
         match (&self.mlp, &self.norm2) {
             (Some(mlp), Some(norm2)) => {
                 let message = norm(&self.norm1, message, None, fused);
-                let x = Tensor::cat(vec![source.clone(), message], 2);
                 // The hidden layer [B, L, 1024] of a bidirectional pass at 1/4 is 189 MB: a few images at a time, so that
                 // no buffer is over IM2COL_MAX_BYTES (each token is on its own here)
-                let [nb, l, _] = x.dims();
+                let [nb, l, _] = source.dims();
                 let per_image = l * mlp.fc1.weight.val().dims()[1] * 4;
                 let chunk = (IM2COL_MAX_BYTES / per_image).max(1);
-                // With coop and `fused` the GELU is taken as fc2's matmul reads fc1's output (lin_gelu_in), not as a pass of
-                // its own over the [tokens, 1024] tensor
-                let ffn = |x: Tensor<3>, source: Tensor<3>| {
-                    let hidden = lin(&mlp.fc1, x, gemm);
-                    let out = if gemm == Gemm::Coop && fused { lin_gelu_in(&mlp.fc2, hidden) } else { lin(&mlp.fc2, gelu(hidden), gemm) };
+                // With coop and `fused` fc1's matmul reads the source and the message where they are (lin_cat_in), not
+                // their concatenation, and fc2's takes the GELU as it reads fc1's output (lin_gelu_in): neither is a pass
+                // of its own
+                let coop_fused = gemm == Gemm::Coop && fused;
+                let ffn = |source: Tensor<3>, message: Tensor<3>| {
+                    let hidden = if coop_fused {
+                        lin_cat_in(&mlp.fc1, source.clone(), message)
+                    } else {
+                        lin(&mlp.fc1, Tensor::cat(vec![source.clone(), message], 2), gemm)
+                    };
+                    let out = if coop_fused { lin_gelu_in(&mlp.fc2, hidden) } else { lin(&mlp.fc2, gelu(hidden), gemm) };
                     norm(norm2, out, Some(source), fused)
                 };
                 if nb <= chunk {
-                    ffn(x, source)
+                    ffn(source, message)
                 } else {
                     Tensor::cat((0..nb).step_by(chunk).map(|s| {
                         let n = chunk.min(nb - s);
-                        ffn(x.clone().narrow(0, s, n), source.clone().narrow(0, s, n))
+                        ffn(source.clone().narrow(0, s, n), message.clone().narrow(0, s, n))
                     }).collect(), 0)
                 }
             }
@@ -385,6 +390,19 @@ fn lin(l: &Linear, x: Tensor<3>, gemm: Gemm) -> Tensor<3> {
     let (x, w) = (x.reshape([1, b * n, k]), w.unsqueeze_dim::<3>(0));
     let out = if gemm == Gemm::Coop { coop::gemm(x, w, coop::wgsl::COOP_DEFAULT) } else { kernels::gemm(x, w, None) };
     let out = out.reshape([b, n, d_out]);
+    match &l.bias {
+        Some(bias) => out + bias.val().reshape([1, 1, d_out]),
+        None => out,
+    }
+}
+
+/// lin of cat([x1, x2], 2) with coop, without the concatenation (coop::gemm_cat_a): x1 [B, L, C1], x2 [B, L, C2]
+fn lin_cat_in(l: &Linear, x1: Tensor<3>, x2: Tensor<3>) -> Tensor<3> {
+    let [b, n, k1] = x1.dims();
+    let k2 = x2.dims()[2];
+    let w = l.weight.val(); // [d_input, d_output]
+    let d_out = w.dims()[1];
+    let out = coop::gemm_cat_a(x1.reshape([1, b * n, k1]), x2.reshape([1, b * n, k2]), w.unsqueeze_dim::<3>(0), coop::wgsl::COOP_DEFAULT).reshape([b, n, d_out]);
     match &l.bias {
         Some(bias) => out + bias.val().reshape([1, 1, d_out]),
         None => out,
