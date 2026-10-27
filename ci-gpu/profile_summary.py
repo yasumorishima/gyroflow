@@ -34,13 +34,17 @@ print(f"{len(rows) / passes:.0f} launches and {total / passes:.1f} ms of kernel 
       f"({passes} passes, {unmeasured} launches not measured)")
 # Each distinct full name is a pipeline compiled at the first pass (its shape and comptime arguments are in the name)
 print(f"{len({name for _, name in rows})} distinct kernels (full names), "
-      f"{len({re.split(r'[(<{\s]', name, 1)[0] for _, name in rows})} kernel families")
-for label, key in (("by kernel family", lambda n: re.split(r"[(<{\s]", n, 1)[0]), ("by full name", lambda n: n[:160])):
+      f"{len({re.split(r'[(<{\s]', name, maxsplit=1)[0] for _, name in rows})} kernel families")
+# The kind: the family without the hash cubecl appends to its name (CoopKernel_f30810b7 -> CoopKernel), every kernel
+# counted; a hash changes with the kernel's id, so totals by kind are what compares across commits
+kind = lambda n: re.sub(r"_[0-9a-f]{8}$", "", re.split(r"[(<{\s]", n, maxsplit=1)[0])
+for label, key, top in (("by kind", kind, None), ("by kernel family", lambda n: re.split(r"[(<{\s]", n, maxsplit=1)[0], 40),
+                        ("by full name", lambda n: n[:160], 40)):
     agg = defaultdict(lambda: [0, 0.0])
     for ms, name in rows:
         a = agg[key(name)]
         a[0] += 1
         a[1] += ms
-    print(f"--- {label} (top 40)")
-    for name, (n, ms) in sorted(agg.items(), key=lambda kv: -kv[1][1])[:40]:
+    print(f"--- {label}" + (f" (top {top})" if top else " (all)"))
+    for name, (n, ms) in sorted(agg.items(), key=lambda kv: -kv[1][1])[:top]:
         print(f"{ms / passes:9.2f} ms {100 * ms / total:5.1f} % {n / passes:7.1f} launches  {name}")
