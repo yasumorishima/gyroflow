@@ -189,7 +189,8 @@ jobs:
               # Each kernel compiled in this fresh process: what a start of Gyroflow compiles again (no compiled
               # kernels are kept on Metal), autotune results kept or not
               echo '[compilation.logger]'
-              echo 'level = "basic"'
+              # The first run keeps every source (how the 41 coop.rs texts differ), the others only the names
+              if [ "$i" = 1 ]; then echo 'level = "full"'; else echo 'level = "basic"'; fi
               echo 'file = "compile_'"$i"'.log"'
             } > cubecl.toml
             if cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact bidirectional_repeat > repeat_$i.log 2>&1; then
