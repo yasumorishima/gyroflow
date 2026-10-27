@@ -179,6 +179,11 @@ jobs:
               echo '[autotune.logger]'
               echo 'level = "full"'
               echo 'file = "autotune_'"$i"'.log"'
+              # Each kernel compiled in this fresh process: what a start of Gyroflow compiles again (no compiled
+              # kernels are kept on Metal), autotune results kept or not
+              echo '[compilation.logger]'
+              echo 'level = "basic"'
+              echo 'file = "compile_'"$i"'.log"'
             } > cubecl.toml
             if cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact bidirectional_repeat > repeat_$i.log 2>&1; then
               echo "run $i: ok"
@@ -188,6 +193,7 @@ jobs:
             grep REPEAT repeat_$i.log
           done
           rm -f cubecl.toml
+          wc -l compile_*.log || true
           echo "failed runs: $failed of 6"
           test "$failed" = 0
       - name: Matmuls at the shapes of the model against the arithmetic peak
