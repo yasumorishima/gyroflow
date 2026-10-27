@@ -26,6 +26,13 @@ with open(path, encoding="utf-8", errors="replace") as f:
         m = line_re.match(line.strip())
         if m:
             rows.append((float(m.group(1)) * units[m.group(2)], m.group(3)))
+# What a kernel computes, where the test printed it after the profile ("KERNEL-NAME <name> <description>")
+described = {}
+with open(path, encoding="utf-8", errors="replace") as f:
+    for line in f:
+        m = re.match(r"^KERNEL-NAME (\S+) (.+)$", line.strip())
+        if m:
+            described[m.group(1)] = m.group(2)
 if not rows:
     print("no profiled kernels between the markers")
     sys.exit(1)
@@ -47,4 +54,5 @@ for label, key, top in (("by kind", kind, None), ("by kernel family", lambda n: 
         a[1] += ms
     print(f"--- {label}" + (f" (top {top})" if top else " (all)"))
     for name, (n, ms) in sorted(agg.items(), key=lambda kv: -kv[1][1])[:top]:
-        print(f"{ms / passes:9.2f} ms {100 * ms / total:5.1f} % {n / passes:7.1f} launches  {name}")
+        what = f"  [{described[name]}]" if name in described else ""
+        print(f"{ms / passes:9.2f} ms {100 * ms / total:5.1f} % {n / passes:7.1f} launches  {name}{what}")

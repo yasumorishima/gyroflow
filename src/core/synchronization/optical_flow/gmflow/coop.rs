@@ -649,8 +649,26 @@ fn launch(a: &CubeTensor, b: &CubeTensor, shape: CoopShape, batch: usize, tile: 
         assert!(a2.meta.shape().num_elements() == shape.m * (shape.k - opts.a_split) && a2.dtype == DType::F32, "coop: a2 {:?} for {shape:?} split at {}", a2.meta.shape(), opts.a_split);
         args = args.with_buffer_io(a2.handle.clone().binding(), BufferIOAttr::ReadOnly);
     }
-    out.client.launch(Box::new(CoopKernel { shape, tile, opts }), count, args);
+    let kernel = CoopKernel { shape, tile, opts };
+    if let Some(names) = NAMES.lock().unwrap().as_mut() {
+        names.entry(kernel.id().entrypoint_name("CoopKernel")).or_insert_with(|| format!("batch {batch}, {shape:?}, {tile:?}, {opts:?}"));
+    }
+    out.client.launch(Box::new(kernel), count, args);
     out
+}
+
+/// The name cubecl's profiler gives each coop kernel launched (CoopKernel_ and a hash of its id) and what it computes,
+/// while recording (record_names): the profile of a pass names the kernels by the hash alone
+static NAMES: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>> = std::sync::Mutex::new(None);
+
+/// Start (true, emptied) or stop recording the names of the coop kernels launched
+pub fn record_names(on: bool) {
+    *NAMES.lock().unwrap() = on.then(Default::default);
+}
+
+/// The kernels recorded since record_names(true): (profile name, shape, tiling and options)
+pub fn recorded_names() -> Vec<(String, String)> {
+    NAMES.lock().unwrap().as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default()
 }
 
 fn coop_shape(a: &Shape, b: &Shape) -> Shape {

@@ -662,10 +662,16 @@ fn profile_passes() {
     let inp = |i: usize| tensor4(&dir.join(format!("pair1_in{i}.f32")), [1, 3, H, W], &device);
     for _ in 0..2 { let _ = to_vec(model.forward(inp(0), inp(1), &st)); }
     std::thread::sleep(std::time::Duration::from_secs(3));
+    gmflow_dev::coop::record_names(true);
     println!("PROFILE-START {want}");
     for _ in 0..3 { let _ = to_vec(model.forward(inp(0), inp(1), &st)); }
     std::thread::sleep(std::time::Duration::from_secs(3));
     println!("PROFILE-END");
+    // What each CoopKernel_<hash> of the profile computes (profile_summary.py puts it beside the name)
+    for (name, what) in gmflow_dev::coop::recorded_names() {
+        println!("KERNEL-NAME {name} {what}");
+    }
+    gmflow_dev::coop::record_names(false);
 }
 
 /// Where the time of a pass goes, stage by stage (the GPU is waited for at each trace point, so the stages do not overlap
