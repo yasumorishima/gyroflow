@@ -172,18 +172,29 @@ pub mod wgsl {
 
     /// The kernel, entry point `main`, bindings a, b (or x), c in that order
     pub fn source(shape: CoopShape, tile: CoopTile) -> String {
-        source_with(shape, tile, false)
+        source_with(shape, tile, Opts::default())
     }
 
-    /// source(), with `a_gelu` the GELU of a taken as each element of a is read (a row-major matrix only): the FFN's
-    /// second matmul on the first's output, so that the GELU is not a pass of its own over that [tokens, 1024] tensor.
-    /// burn's GELU: x (1 + erf(x / sqrt 2)) / 2, erf by its polyfill (Abramowitz and Stegun 7.1.26, cubecl-core
-    /// polyfills.rs), which WGSL has no builtin for
-    pub fn source_with(shape: CoopShape, tile: CoopTile, a_gelu: bool) -> String {
+    /// What a launch does besides c = a @ b. `a_gelu`: the GELU of a taken as each element of a is read (a row-major
+    /// matrix only): the FFN's second matmul on the first's output, so that the GELU is not a pass of its own over that
+    /// [tokens, 1024] tensor; burn's GELU, x (1 + erf(x / sqrt 2)) / 2, erf by its polyfill (Abramowitz and Stegun
+    /// 7.1.26, cubecl-core polyfills.rs), which WGSL has no builtin for. `bias_rows`: a bias per row of c added (binding
+    /// 3; the output channels of a convolution), `relu`: max(., 0) after it, both as c is written: every block of c then
+    /// goes through workgroup memory, as the blocks over an edge do
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct Opts {
+        pub a_gelu: bool,
+        pub bias_rows: bool,
+        pub relu: bool,
+    }
+
+    pub fn source_with(shape: CoopShape, tile: CoopTile, opts: Opts) -> String {
         if let Some(why) = unsupported(shape, tile) {
             panic!("coop gemm: {why}");
         }
+        let Opts { a_gelu, bias_rows, relu } = opts;
         assert!(!a_gelu || shape.a_win.is_none(), "coop gemm: the GELU of a is for a row-major a only");
+        assert!(!(bias_rows || relu) || shape.c_win.is_none(), "coop gemm: no bias or relu with scattered rows of c");
         let CoopShape { m, n, k, stride_a, b, a_win, c_win } = shape;
         // q scaled as it is read (the attention scores / sqrt(C)); Debug of an f32 is a valid WGSL float literal
         let scale = format!("{:?}", 1.0f32 / (k as f32).sqrt());
@@ -208,6 +219,9 @@ pub mod wgsl {
         emit!("@group(0) @binding(0) var<storage, read_write> a: {};", ty(va));
         emit!("@group(0) @binding(1) var<storage, read_write> b: {};", ty(vb));
         emit!("@group(0) @binding(2) var<storage, read_write> c: array<f32>;");
+        if bias_rows {
+            emit!("@group(0) @binding(3) var<storage, read_write> bias: array<f32>;");
+        }
         emit!("");
         // The accumulators start from an 8 x 8 block of zeros: loaded, not constructed (what Metal makes of a
         // simdgroup_matrix written as `T {{}}` is not specified)
@@ -216,7 +230,8 @@ pub mod wgsl {
         emit!("var<workgroup> tile_a: array<f32, {}>;", wm * lda);
         emit!("var<workgroup> tile_b: array<f32, {}>;", bk * ldb);
         // Scattered rows of c are not one stride apart: always the copy through workgroup memory
-        let edge = c_win.is_some() || !(full_m && full_n);
+        let epi = bias_rows || relu;
+        let edge = epi || c_win.is_some() || !(full_m && full_n);
         if edge {
             emit!("var<workgroup> frag: array<f32, {}>;", 64 * tile.sgr * tile.sgc);
         }
@@ -482,8 +497,8 @@ pub mod wgsl {
             // Inside c whole or not: the same answer for every thread of the workgroup. Joined by `&`, not `&&`, which naga
             // lowers to a local variable and so to a branch its uniformity analysis takes as non-uniform (naga does not
             // check barriers against that analysis, so validation would not show it)
-            if c_win.is_some() {
-                // Rows scattered to their tokens: the copy below for every workgroup
+            if c_win.is_some() || epi {
+                // Rows scattered to their tokens, or a bias or relu to apply: the copy below for every workgroup
                 emit!("    {{");
             } else {
                 let mut inside = Vec::new();
@@ -510,7 +525,10 @@ pub mod wgsl {
                         if c_win.is_some() {
                             emit!("            if m0 + r < {m}u {{ if n0 + q < {n}u {{ c[token(wg.z, m0 + r) * {n}u + n0 + q] = frag[f0 + e]; }} }}");
                         } else {
-                            emit!("            if m0 + r < {m}u {{ if n0 + q < {n}u {{ c[c_wg + r * {n}u + q] = frag[f0 + e]; }} }}");
+                            let mut val = "frag[f0 + e]".to_string();
+                            if bias_rows { val = format!("({val} + bias[m0 + r])"); }
+                            if relu { val = format!("max({val}, 0.0)"); }
+                            emit!("            if m0 + r < {m}u {{ if n0 + q < {n}u {{ c[c_wg + r * {n}u + q] = {val}; }} }}");
                         }
                         emit!("        }}");
                     }
@@ -550,12 +568,12 @@ use cubecl::server::KernelArguments;
 struct CoopKernel {
     shape: CoopShape,
     tile: CoopTile,
-    a_gelu: bool,
+    opts: wgsl::Opts,
 }
 
 impl KernelMetadata for CoopKernel {
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.shape, self.tile, self.a_gelu))
+        KernelId::new::<Self>().info((self.shape, self.tile, self.opts))
     }
 
     fn address_type(&self) -> ElemType {
@@ -571,14 +589,15 @@ impl CubeKernel for CoopKernel {
     }
 
     fn source(&self) -> Option<PrecompiledSource> {
-        Some(PrecompiledSource { source: wgsl::source_with(self.shape, self.tile, self.a_gelu), entrypoint_name: "main".to_string(), lang: "wgsl" })
+        Some(PrecompiledSource { source: wgsl::source_with(self.shape, self.tile, self.opts), entrypoint_name: "main".to_string(), lang: "wgsl" })
     }
 }
 
 /// c = a @ b on `batch` workgroup layers into a new [batch, m, n] (with c_win, the rows scattered to tokens: shaped
 /// `out` then); a and b declared read only to cubecl, so that a kernel that fails to compile marks only its output, not
 /// inputs other launches share
-fn launch(a: &CubeTensor, b: &CubeTensor, shape: CoopShape, batch: usize, tile: CoopTile, out: Option<Shape>, a_gelu: bool) -> CubeTensor {
+#[allow(clippy::too_many_arguments)]
+fn launch(a: &CubeTensor, b: &CubeTensor, shape: CoopShape, batch: usize, tile: CoopTile, out: Option<Shape>, opts: wgsl::Opts, bias: Option<&CubeTensor>) -> CubeTensor {
     assert_eq!(a.dtype, DType::F32, "coop: f32 only");
     // Every index of the kernel is a u32 (the windows': as many tokens as rows of all the windows)
     let b_elems = match shape.b {
@@ -597,11 +616,16 @@ fn launch(a: &CubeTensor, b: &CubeTensor, shape: CoopShape, batch: usize, tile: 
     let buffer = a.client.empty(out_shape.num_elements() * a.dtype.size());
     let out = CubeTensor::new_contiguous(a.client.clone(), a.device.clone(), out_shape, buffer, a.dtype);
     let count = CubeCount::Static(shape.n.div_ceil(tile.cols()) as u32, shape.m.div_ceil(tile.rows()) as u32, batch as u32);
-    let args = KernelArguments::new()
+    assert_eq!(opts.bias_rows, bias.is_some(), "coop: a bias binding exactly with bias_rows");
+    let mut args = KernelArguments::new()
         .with_buffer_io(a.handle.clone().binding(), BufferIOAttr::ReadOnly)
         .with_buffer_io(b.handle.clone().binding(), BufferIOAttr::ReadOnly)
         .with_buffer_io(out.handle.clone().binding(), BufferIOAttr::WriteOnly);
-    out.client.launch(Box::new(CoopKernel { shape, tile, a_gelu }), count, args);
+    if let Some(bias) = bias {
+        assert!(bias.meta.shape().num_elements() == shape.m && bias.dtype == DType::F32, "coop: bias {:?} for {} rows", bias.meta.shape(), shape.m);
+        args = args.with_buffer_io(bias.handle.clone().binding(), BufferIOAttr::ReadOnly);
+    }
+    out.client.launch(Box::new(CoopKernel { shape, tile, opts }), count, args);
     out
 }
 
@@ -609,7 +633,8 @@ fn coop_shape(a: &Shape, b: &Shape) -> Shape {
     Shape::new([a[0].max(b[0]), a[1], b[2]])
 }
 
-fn launch_gemm(a: CubeTensor, b: CubeTensor, tile: CoopTile, a_gelu: bool) -> CubeTensor {
+fn launch_gemm(a: CubeTensor, b: CubeTensor, tile: CoopTile, opts: wgsl::Opts, bias: Option<CubeTensor>) -> CubeTensor {
+    let bias = bias.map(into_contiguous);
     let (a, b) = (into_contiguous(a), into_contiguous(b));
     let (sa, sb) = (a.meta.shape().clone(), b.meta.shape().clone());
     assert!(sa[2] == sb[1], "coop gemm: inner dimensions {} and {}", sa[2], sb[1]);
@@ -624,7 +649,7 @@ fn launch_gemm(a: CubeTensor, b: CubeTensor, tile: CoopTile, a_gelu: bool) -> Cu
         a_win: None,
         c_win: None,
     };
-    launch(&a, &b, shape, sa[0].max(sb[0]), tile, None, a_gelu)
+    launch(&a, &b, shape, sa[0].max(sb[0]), tile, None, opts, bias.as_ref())
 }
 
 /// unimatch single_head_split_window_attention, as kernels::window_attention does it (no window layout or roll in
@@ -639,10 +664,10 @@ fn launch_window_attention(q: CubeTensor, k: CubeTensor, v: CubeTensor, h: usize
     let win = wgsl::Win { h, w, splits, shift };
     let (c, l, bw) = (s[2], win.len(), s[0] * splits * splits);
     let scores = CoopShape { m: l, n: l, k: c, stride_a: 0, b: CoopB::WindowT { win }, a_win: Some(win), c_win: None };
-    let scores = launch(&q, &k, scores, bw, tile, None, false);
+    let scores = launch(&q, &k, scores, bw, tile, None, wgsl::Opts::default(), None);
     super::kernels::launch_window_softmax(&scores, h, w, splits, shift);
     let apply = CoopShape { m: l, n: c, k: l, stride_a: l * l, b: CoopB::WindowRows { win }, a_win: None, c_win: Some(win) };
-    launch(&scores, &v, apply, bw, tile, Some(s), false)
+    launch(&scores, &v, apply, bw, tile, Some(s), wgsl::Opts::default(), None)
 }
 
 fn conv_shape(w: &Shape, x: &Shape, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize) -> Shape {
@@ -651,14 +676,15 @@ fn conv_shape(w: &Shape, x: &Shape, kh: usize, kw: usize, stride: usize, ph: usi
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_conv(w: CubeTensor, x: CubeTensor, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize, tile: CoopTile) -> CubeTensor {
+fn launch_conv(w: CubeTensor, x: CubeTensor, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize, tile: CoopTile, opts: wgsl::Opts, bias: Option<CubeTensor>) -> CubeTensor {
     let (w, x) = (into_contiguous(w), into_contiguous(x));
+    let bias = bias.map(into_contiguous);
     let (sw, sx) = (w.meta.shape().clone(), x.meta.shape().clone());
     let (c, h, wd) = (sx[1], sx[2], sx[3]);
     assert!(sw[0] == 1 && sw[2] == c * kh * kw, "coop conv: weight {sw:?} for x {sx:?} and a {kh}x{kw} kernel");
     let (oh, ow) = CoopB::conv_out(c, h, wd, kh, kw, stride, ph, pw);
     let shape = CoopShape { m: sw[1], n: oh * ow, k: sw[2], stride_a: 0, b: CoopB::Conv { c, h, w: wd, kh, kw, stride, ph, pw }, a_win: None, c_win: None };
-    launch(&w, &x, shape, sx[0], tile, None, false)
+    launch(&w, &x, shape, sx[0], tile, None, opts, bias.as_ref())
 }
 
 #[backend_extension(Cube, Fusion)]
@@ -667,6 +693,12 @@ pub trait CoopKernels: burn::backend::Backend {
     fn coop_gemm(a: FloatTensor<Self>, b: FloatTensor<Self>, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self>;
     #[fusion(dtype = a, shape = coop_shape(a, b))]
     fn coop_gemm_gelu_a(a: FloatTensor<Self>, b: FloatTensor<Self>, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self>;
+    #[fusion(dtype = a, shape = coop_shape(a, b))]
+    #[allow(clippy::too_many_arguments)]
+    fn coop_gemm_epi(a: FloatTensor<Self>, b: FloatTensor<Self>, bias: FloatTensor<Self>, relu: bool, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self>;
+    #[fusion(dtype = x, shape = conv_shape(w, x, *kh, *kw, *stride, *ph, *pw))]
+    #[allow(clippy::too_many_arguments)]
+    fn coop_conv_epi(w: FloatTensor<Self>, x: FloatTensor<Self>, bias: FloatTensor<Self>, relu: bool, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self>;
     #[fusion(dtype = x, shape = conv_shape(w, x, *kh, *kw, *stride, *ph, *pw))]
     #[allow(clippy::too_many_arguments)]
     fn coop_conv(w: FloatTensor<Self>, x: FloatTensor<Self>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self>;
@@ -677,13 +709,21 @@ pub trait CoopKernels: burn::backend::Backend {
 
 impl CoopKernels for CubeBackend {
     fn coop_gemm(a: FloatTensor<Self>, b: FloatTensor<Self>, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self> {
-        launch_gemm(a, b, CoopTile { bk, sgr, sgc, fr, fc }, false)
+        launch_gemm(a, b, CoopTile { bk, sgr, sgc, fr, fc }, wgsl::Opts::default(), None)
     }
     fn coop_gemm_gelu_a(a: FloatTensor<Self>, b: FloatTensor<Self>, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self> {
-        launch_gemm(a, b, CoopTile { bk, sgr, sgc, fr, fc }, true)
+        launch_gemm(a, b, CoopTile { bk, sgr, sgc, fr, fc }, wgsl::Opts { a_gelu: true, ..Default::default() }, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn coop_gemm_epi(a: FloatTensor<Self>, b: FloatTensor<Self>, bias: FloatTensor<Self>, relu: bool, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self> {
+        launch_gemm(a, b, CoopTile { bk, sgr, sgc, fr, fc }, wgsl::Opts { bias_rows: true, relu, ..Default::default() }, Some(bias))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn coop_conv_epi(w: FloatTensor<Self>, x: FloatTensor<Self>, bias: FloatTensor<Self>, relu: bool, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self> {
+        launch_conv(w, x, kh, kw, stride, ph, pw, CoopTile { bk, sgr, sgc, fr, fc }, wgsl::Opts { bias_rows: true, relu, ..Default::default() }, Some(bias))
     }
     fn coop_conv(w: FloatTensor<Self>, x: FloatTensor<Self>, kh: usize, kw: usize, stride: usize, ph: usize, pw: usize, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self> {
-        launch_conv(w, x, kh, kw, stride, ph, pw, CoopTile { bk, sgr, sgc, fr, fc })
+        launch_conv(w, x, kh, kw, stride, ph, pw, CoopTile { bk, sgr, sgc, fr, fc }, wgsl::Opts::default(), None)
     }
     fn coop_window_attention(q: FloatTensor<Self>, k: FloatTensor<Self>, v: FloatTensor<Self>, h: usize, w: usize, splits: usize, shift: bool, bk: usize, sgr: usize, sgc: usize, fr: usize, fc: usize) -> FloatTensor<Self> {
         launch_window_attention(q, k, v, h, w, splits, shift, CoopTile { bk, sgr, sgc, fr, fc })
@@ -721,20 +761,33 @@ pub fn conv_gemm(w: BurnTensor<3>, x: BurnTensor<4>, kh: usize, kw: usize, strid
 /// A 2D convolution (symmetric zero padding, no dilation or groups): x [N, C, H, W], weight [Cout, C, KH, KW] ->
 /// [N, Cout, OH, OW]; 1x1 of stride 1 as a plain matmul of the weight and x, the others gathered
 pub fn conv2d(x: BurnTensor<4>, weight: BurnTensor<4>, bias: Option<BurnTensor<1>>, stride: usize, padding: [usize; 2], tile: CoopTile) -> BurnTensor<4> {
+    conv2d_act(x, weight, bias, stride, padding, false, tile)
+}
+
+/// conv2d, the bias (if any) added and with `relu` max(., 0) taken as the kernel writes its output (wgsl::Opts), not as
+/// a pass of their own
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_act(x: BurnTensor<4>, weight: BurnTensor<4>, bias: Option<BurnTensor<1>>, stride: usize, padding: [usize; 2], relu: bool, tile: CoopTile) -> BurnTensor<4> {
     let [n, c, h, w] = x.dims();
     let [cout, cin, kh, kw] = weight.dims();
     assert_eq!(c, cin, "coop conv2d: channels");
     let (ph, pw) = (padding[0], padding[1]);
     let (oh, ow) = CoopB::conv_out(c, h, w, kh, kw, stride, ph, pw);
     let wm = weight.reshape([1, cout, c * kh * kw]);
-    let out = if kh == 1 && kw == 1 && stride == 1 && ph == 0 && pw == 0 {
-        gemm(wm, x.reshape([n, c, h * w]), tile)
-    } else {
-        conv_gemm(wm, x, kh, kw, stride, ph, pw, tile)
+    let one = kh == 1 && kw == 1 && stride == 1 && ph == 0 && pw == 0;
+    let CoopTile { bk, sgr, sgc, fr, fc } = tile;
+    let out: BurnTensor<3> = match (bias, relu) {
+        (None, false) if one => gemm(wm, x.reshape([n, c, h * w]), tile),
+        (None, false) => conv_gemm(wm, x, kh, kw, stride, ph, pw, tile),
+        (bias, relu) => {
+            // A relu without a bias: a bias of zeros (one kernel text with both)
+            let bias = bias.unwrap_or_else(|| BurnTensor::<1>::zeros([cout], &x.device()));
+            BurnTensor::from_dispatch(if one {
+                Dispatch::coop_gemm_epi(wm.into_dispatch(), x.reshape([n, c, h * w]).into_dispatch(), bias.into_dispatch(), relu, bk, sgr, sgc, fr, fc)
+            } else {
+                Dispatch::coop_conv_epi(wm.into_dispatch(), x.into_dispatch(), bias.into_dispatch(), relu, kh, kw, stride, ph, pw, bk, sgr, sgc, fr, fc)
+            })
+        }
     };
-    let out = out.reshape([n, cout, oh, ow]);
-    match bias {
-        Some(b) => out + b.reshape([1, cout, 1, 1]),
-        None => out,
-    }
+    out.reshape([n, cout, oh, ow])
 }

@@ -132,6 +132,22 @@ fn conv_fwd(conv: &Conv2d, x: Tensor<4>, ops: Ops) -> Tensor<4> {
     }
 }
 
+/// relu(conv_fwd(..)): with coop and `fused` the relu (and the bias) taken as coop.rs writes the convolution's output
+/// (coop::conv2d_act), not as a pass of their own
+fn conv_fwd_relu(conv: &Conv2d, x: Tensor<4>, ops: Ops) -> Tensor<4> {
+    if ops.coop && ops.fused && conv.stride[0] == conv.stride[1] && conv.dilation == [1, 1] && conv.groups == 1 {
+        let padding = match conv.padding {
+            PaddingConfig2d::Explicit(t, l, b, r) if t == b && l == r => Some([t, l]),
+            PaddingConfig2d::Valid => Some([0, 0]),
+            _ => None,
+        };
+        if let Some(padding) = padding {
+            return coop::conv2d_act(x, conv.weight.val(), conv.bias.as_ref().map(|b| b.val()), conv.stride[0], padding, true, coop::wgsl::COOP_DEFAULT);
+        }
+    }
+    relu(conv_fwd(conv, x, ops))
+}
+
 fn conv(channels: [usize; 2], kernel: [usize; 2], stride: usize, bias: bool, device: &Device) -> Conv2d {
     let (ph, pw) = (kernel[0] / 2, kernel[1] / 2);
     Conv2dConfig::new(channels, kernel)
@@ -778,9 +794,9 @@ impl BasicUpdateBlock {
 
     fn motion(&self, flow: Tensor<4>, corr: Tensor<4>, ops: Ops) -> Tensor<4> {
         let e = &self.encoder;
-        let cor = relu(conv_fwd(&e.convc2, relu(conv_fwd(&e.convc1, corr, ops)), ops));
-        let flo = relu(conv_fwd(&e.convf2, relu(conv_fwd(&e.convf1, flow.clone(), ops)), ops));
-        let out = relu(conv_fwd(&e.conv, Tensor::cat(vec![cor, flo], 1), ops));
+        let cor = conv_fwd_relu(&e.convc2, conv_fwd_relu(&e.convc1, corr, ops), ops);
+        let flo = conv_fwd_relu(&e.convf2, conv_fwd_relu(&e.convf1, flow.clone(), ops), ops);
+        let out = conv_fwd_relu(&e.conv, Tensor::cat(vec![cor, flo], 1), ops);
         Tensor::cat(vec![out, flow], 1)
     }
 
@@ -805,12 +821,12 @@ impl BasicUpdateBlock {
             Some((g, c)) => g.step(c, net, motion, ops.conv_gemm(), ops.implicit, ops.fused),
             None => self.gru(net, Tensor::cat(vec![inp, motion], 1), ops),
         };
-        let delta = conv_fwd(&self.flow_head.conv2, relu(conv_fwd(&self.flow_head.conv1, net.clone(), ops)), ops);
+        let delta = conv_fwd(&self.flow_head.conv2, conv_fwd_relu(&self.flow_head.conv1, net.clone(), ops), ops);
         (net, delta)
     }
 
     fn up_mask(&self, net: Tensor<4>, ops: Ops) -> Tensor<4> {
-        conv_fwd(&self.mask.conv2, relu(conv_fwd(&self.mask.conv1, net, ops)), ops)
+        conv_fwd(&self.mask.conv2, conv_fwd_relu(&self.mask.conv1, net, ops), ops)
     }
 }
 

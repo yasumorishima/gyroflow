@@ -392,6 +392,21 @@ fn kernels_match_plain() {
             let got = coop::gemm_gelu_a(a, b, coop::wgsl::COOP_DEFAULT);
             check(&format!("coop gemm, gelu of a {rows}x{k}x{n}"), got.unsqueeze_dim::<4>(0), want.unsqueeze_dim::<4>(0));
         }
+        // The bias and relu taken as coop.rs writes a convolution (coop::conv2d_act), against coop.rs's convolution without
+        // them, then burn's add and relu: the motion encoder's 3x3 (256 -> 192 at 1/4, batch 2) and its 1x1 (81 -> 256, a
+        // matmul), and 37 -> 45 on 37 x 53 (every edge) with a relu and no bias
+        use burn::tensor::activation::relu;
+        let (h4, w4) = (H / 4, W / 4);
+        for (label, nb, ci, co, hh, ww, kk, with_bias) in [("3x3 256->192", 2usize, 256usize, 192usize, h4, w4, 3usize, true), ("1x1 81->256", 2, 81, 256, h4, w4, 1, true), ("3x3 37->45 no bias", 1, 37, 45, 37, 53, 3, false)] {
+            let x = rnd([nb, ci, hh, ww], 1.0);
+            let wt = rnd([co, ci, kk, kk], 0.05);
+            let bias = with_bias.then(|| Tensor::<1>::random([co], Distribution::Normal(0.0, 0.5), &device));
+            let pad = [kk / 2, kk / 2];
+            let plain = coop::conv2d(x.clone(), wt.clone(), None, 1, pad, coop::wgsl::COOP_DEFAULT);
+            let plain = match &bias { Some(b) => plain + b.clone().reshape([1, co, 1, 1]), None => plain };
+            let got = coop::conv2d_act(x, wt, bias, 1, pad, true, coop::wgsl::COOP_DEFAULT);
+            check(&format!("coop conv + bias + relu {label}"), got, relu(plain));
+        }
     }
     // The factored GRU's gates by gru_gate_kernel against the plain operations of GruFactored::step (burn's sigmoid and
     // tanh), in the layouts of its two halves: 2 z/r terms and q from an extra tensor and a z/r term's (horizontal), 3
