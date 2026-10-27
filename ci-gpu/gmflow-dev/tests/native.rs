@@ -856,6 +856,56 @@ fn matmul_ceiling() {
         time(&format!("gemm4 {pm}x{pn}/{kstep} unchecked FFN [1,2L,256]@[1,256,1024]"), 2.0 * (tokens * 256 * 1024) as f64, &|| first(kernels::gemm4_tiled(a3.clone(), fc1_3.clone(), None, tile)));
     }
     kernels::GEMM4_UNCHECKED.store(false, Ordering::Relaxed);
+    // coop.rs's tilings at the shapes of its kernels in the model's pass (CoopKernel in the profile): the transformer's
+    // projections at 1/8 and 1/4 (k 128, 48 launches each), its FFN at 1/4, the motion encoder's 3x3 and the GRU's 1x5.
+    // COOP_DEFAULT (64 x 64) gives the 1/8 projections 180 workgroups, which may not fill the GPU
+    if coop_offered() {
+        use gmflow_dev::coop::{ self, wgsl::CoopTile };
+        let (h4, w4) = (H / 4, W / 4);
+        let (t8, t4) = (2 * (H / 8) * (W / 8), 2 * h4 * w4);
+        let p8 = (rnd3([1, t8, 128]), rnd3([1, 128, 128]));
+        let p4 = (rnd3([1, t4, 128]), rnd3([1, 128, 128]));
+        let f1 = (rnd3([1, t4, 256]), rnd3([1, 256, 1024]));
+        let f2 = (rnd3([1, t4, 1024]), rnd3([1, 1024, 128]));
+        let cw = (rnd3([1, 192, 256 * 9]), rnd4([1, 256, h4, w4]));
+        let gw = (rnd3([1, 384, 128 * 5]), rnd4([1, 128, h4, w4]));
+        let tiles = [
+            CoopTile { bk: 16, sgr: 2, sgc: 2, fr: 4, fc: 4 },
+            CoopTile { bk: 16, sgr: 2, sgc: 2, fr: 2, fc: 2 },
+            CoopTile { bk: 16, sgr: 2, sgc: 2, fr: 4, fc: 2 },
+            CoopTile { bk: 16, sgr: 2, sgc: 2, fr: 2, fc: 4 },
+            CoopTile { bk: 16, sgr: 4, sgc: 1, fr: 2, fc: 4 },
+            CoopTile { bk: 32, sgr: 2, sgc: 2, fr: 4, fc: 4 },
+            CoopTile { bk: 8, sgr: 2, sgc: 2, fr: 4, fc: 4 },
+            CoopTile { bk: 16, sgr: 4, sgc: 2, fr: 2, fc: 4 },
+        ];
+        for tile in tiles {
+            let t = format!("{}x{}/{}", tile.rows(), tile.cols(), tile.bk);
+            let mm = |label: &str, (a, b): &(Tensor<3>, Tensor<3>)| {
+                let [_, m, k] = a.dims();
+                let n = b.dims()[2];
+                if let Some(why) = coop::wgsl::unsupported(coop::wgsl::CoopShape { m, n, k, stride_a: 0, b: coop::wgsl::CoopB::Matrix { stride: 0 }, a_win: None, c_win: None }, tile) {
+                    println!("CEIL coop {t} {label}: {why}");
+                    return;
+                }
+                time(&format!("coop {t} {label} [{m},{k}]@[{k},{n}]"), 2.0 * (m * n * k) as f64, &|| first(coop::gemm(a.clone(), b.clone(), tile)));
+            };
+            mm("proj 1/8", &p8);
+            mm("proj 1/4", &p4);
+            mm("fc1 1/4", &f1);
+            mm("fc2 1/4", &f2);
+            for (label, (w, x), (kh, kw, ph, pw)) in [("conv 256->192 3x3", &cw, (3usize, 3usize, 1usize, 1usize)), ("GRU 1x5 128->384", &gw, (1, 5, 0, 2))] {
+                let co = w.dims()[1];
+                let conv = coop::wgsl::CoopB::Conv { c: x.dims()[1], h: h4, w: w4, kh, kw, stride: 1, ph, pw };
+                if let Some(why) = coop::wgsl::unsupported(coop::wgsl::CoopShape { m: co, n: h4 * w4, k: w.dims()[2], stride_a: 0, b: conv, a_win: None, c_win: None }, tile) {
+                    println!("CEIL coop {t} {label}: {why}");
+                    continue;
+                }
+                let fl = 2.0 * (co * w.dims()[2] * h4 * w4) as f64;
+                time(&format!("coop {t} {label}"), fl, &|| first(coop::conv_gemm(w.clone(), x.clone(), kh, kw, 1, ph, pw, tile)));
+            }
+        }
+    }
     let q = rnd3([2 * 64, 180, 128]);
     let kt = rnd3([2 * 64, 128, 180]);
     time("window attention @1/4 x2: [128,180,128]@[128,128,180]", 2.0 * (128 * 180 * 180 * 128) as f64, &|| first(q.clone().matmul(kt.clone())));
