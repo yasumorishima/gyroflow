@@ -537,8 +537,8 @@ fn offsets(r: usize) -> Vec<(i32, i32)> {
 }
 
 /// global_correlation_softmax: [B, C, H, W] x 2 -> flow [B, 2, H, W]; bidirectional: [2B, 2, H, W], the flow 1 -> 0 from
-/// the transposed correlation
-pub fn global_correlation_softmax(f0: Tensor<4>, f1: Tensor<4>, bidirectional: bool, gemm: Gemm) -> Tensor<4> {
+/// the transposed correlation. With `fused` the softmax and its matmul with the grid in one launch (kernels::softmax_flow)
+pub fn global_correlation_softmax(f0: Tensor<4>, f1: Tensor<4>, bidirectional: bool, gemm: Gemm, fused: bool) -> Tensor<4> {
     let [b, c, h, w] = f0.dims();
     let device = f0.device();
     let f0 = f0.reshape([b, c, h * w]).swap_dims(1, 2); // [B, HW, C]
@@ -546,8 +546,9 @@ pub fn global_correlation_softmax(f0: Tensor<4>, f1: Tensor<4>, bidirectional: b
     let corr = bmm(f0, f1, gemm).div_scalar((c as f32).sqrt());
     let (corr, b) = if bidirectional { (Tensor::cat(vec![corr.clone(), corr.swap_dims(1, 2)], 0), 2 * b) } else { (corr, b) };
     let grid = coords(h, w, &device); // [1, 2, H, W]
-    let grid_t = grid.clone().reshape([1, 2, h * w]).swap_dims(1, 2).repeat_dim(0, b); // [B, HW, 2]
-    let correspondence = softmax(corr, 2).matmul(grid_t).swap_dims(1, 2).reshape([b, 2, h, w]);
+    let grid_t = grid.clone().reshape([1, 2, h * w]).swap_dims(1, 2); // [1, HW, 2]
+    let correspondence = if fused { kernels::softmax_flow(corr, grid_t) } else { softmax(corr, 2).matmul(grid_t.repeat_dim(0, b)) }; // [B, HW, 2]
+    let correspondence = correspondence.swap_dims(1, 2).reshape([b, 2, h, w]);
     correspondence - grid
 }
 
@@ -643,15 +644,17 @@ impl SelfAttnPropagation {
 
     /// Global: feature0 [B, C, H, W], flow [B, 2, H, W] -> flow. The key is k_proj of the projected query, as unimatch
     /// computes it (its own note: an accident of the training code, kept). `gemm`: the projections and the scores by
-    /// coop.rs with Coop, burn's otherwise (the matmul of the probabilities and the flow, 2 columns, burn's always)
-    fn global(&self, feature0: Tensor<4>, flow: Tensor<4>, gemm: Gemm) -> Tensor<4> {
+    /// coop.rs with Coop, burn's otherwise; the softmax and its matmul with the flow (2 columns) in one launch with `fused`
+    /// (kernels::softmax_flow), burn's otherwise
+    fn global(&self, feature0: Tensor<4>, flow: Tensor<4>, gemm: Gemm, fused: bool) -> Tensor<4> {
         let [b, c, h, w] = feature0.dims();
         let g = coop_or_burn(gemm);
         let q = lin(&self.q_proj, feature0.reshape([b, c, h * w]).swap_dims(1, 2), g);
         let k = lin(&self.k_proj, q.clone(), g);
         let v = flow.reshape([b, 2, h * w]).swap_dims(1, 2);
-        let prob = softmax(bmm(q, k.swap_dims(1, 2), g).div_scalar((c as f32).sqrt()), 2);
-        prob.matmul(v).swap_dims(1, 2).reshape([b, 2, h, w])
+        let scores = bmm(q, k.swap_dims(1, 2), g).div_scalar((c as f32).sqrt());
+        let out = if fused { kernels::softmax_flow(scores, v) } else { softmax(scores, 2).matmul(v) };
+        out.swap_dims(1, 2).reshape([b, 2, h, w])
     }
 
     /// Local window of radius r. The window comes from F.unfold with zero padding: a neighbour outside the map has a key of
@@ -1111,10 +1114,10 @@ impl Gmflow {
         let (f0, f1) = self.transformer.forward(f0, f1, &st.eighth, ops.linear_gemm(), ops.fused);
         put(&mut trace, "transformer_f0_0", &f0);
         put(&mut trace, "transformer_f1_0", &f1);
-        let flow = global_correlation_softmax(f0.clone(), f1.clone(), bidirectional, ops.linear_gemm());
+        let flow = global_correlation_softmax(f0.clone(), f1.clone(), bidirectional, ops.linear_gemm(), ops.fused);
         put(&mut trace, "global_corr_flow0", &flow);
         let feature0 = if bidirectional { Tensor::cat(vec![f0, f1], 0) } else { f0 };
-        let flow = self.feature_flow_attn.global(feature0, flow, ops.linear_gemm());
+        let flow = self.feature_flow_attn.global(feature0, flow, ops.linear_gemm(), ops.fused);
         put(&mut trace, "propagated0", &flow);
 
         // 1/4: the flow doubled in size, feature 1 warped by it, local matching of what remains, local propagation

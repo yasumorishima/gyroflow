@@ -1217,6 +1217,106 @@ fn launch_window_attention(q: CubeTensor, k: CubeTensor, v: CubeTensor, h: usize
     out
 }
 
+/// The threads of a cube of softmax_flow_kernel (one cube per row)
+pub const SOFTMAX_FLOW_THREADS: usize = 256;
+
+/// softmax(scores, over the last axis) @ v: scores [B, N, L], v [Bv, L, 2] (Bv 1, shared by the batch, or B) -> [B, N, 2],
+/// what global matching (the softmax of the correlation times the grid of positions) and global propagation (of the
+/// attention scores times the flow) compute with burn's softmax and a matmul of 2 columns, both autotuned at the first
+/// pass. One cube per row: the row maximum, then the sum of exp(s - max) and its products with the 2 values of each key,
+/// each by a tree in shared memory in a fixed order (the same result every run; no plane operations)
+#[cube(launch)]
+fn softmax_flow_kernel<F: Float>(
+    scores: &Tensor<F>,  // [B, N, L]
+    v: &Tensor<F>,       // [Bv, L, 2]
+    out: &mut Tensor<F>, // [B, N, 2]
+    #[define(F)] _dtype: ElemType,
+) {
+    let (n_n, l_n) = (scores.shape(1), scores.shape(2));
+    let bi = CUBE_POS_Y as usize;
+    let row = bi * n_n + CUBE_POS_X as usize;
+    let t = UNIT_POS_X as usize;
+    let threads = comptime!(SOFTMAX_FLOW_THREADS);
+    let base = row * l_n;
+    let mut vb = bi;
+    if v.shape(0) == 1usize {
+        vb = 0usize;
+    }
+    let vbase = vb * l_n * 2usize;
+    let per_thread = (l_n + threads - 1usize) / threads;
+    let mut red = Shared::<[F]>::new_slice(comptime!(3 * SOFTMAX_FLOW_THREADS));
+    let mut m = F::new(-1e30_f32);
+    for e in 0..per_thread {
+        let j = t + e * threads;
+        if j < l_n {
+            m = F::max(m, scores[base + j]);
+        }
+    }
+    red[t] = m;
+    sync_cube();
+    let mut half = 128usize;
+    for _ in 0..8usize {
+        if t < half {
+            red[t] = F::max(red[t], red[t + half]);
+        }
+        sync_cube();
+        half = half / 2usize;
+    }
+    let m = red[0];
+    sync_cube();
+    let zero = F::new(0.0_f32);
+    let mut sum = zero;
+    let mut a0 = zero;
+    let mut a1 = zero;
+    for e in 0..per_thread {
+        let j = t + e * threads;
+        if j < l_n {
+            let ex = F::exp(scores[base + j] - m);
+            sum += ex;
+            a0 += ex * v[vbase + j * 2usize];
+            a1 += ex * v[vbase + j * 2usize + 1usize];
+        }
+    }
+    red[t] = sum;
+    red[t + threads] = a0;
+    red[t + 2usize * threads] = a1;
+    sync_cube();
+    let mut half = 128usize;
+    for _ in 0..8usize {
+        if t < half {
+            red[t] = red[t] + red[t + half];
+            red[t + threads] = red[t + threads] + red[t + threads + half];
+            red[t + 2usize * threads] = red[t + 2usize * threads] + red[t + 2usize * threads + half];
+        }
+        sync_cube();
+        half = half / 2usize;
+    }
+    if t == 0usize {
+        out[row * 2usize] = red[threads] / red[0];
+        out[row * 2usize + 1usize] = red[2usize * threads] / red[0];
+    }
+}
+
+fn softmax_flow_shape(scores: &Shape, _v: &Shape) -> Shape {
+    Shape::new([scores[0], scores[1], 2])
+}
+
+fn launch_softmax_flow(scores: CubeTensor, v: CubeTensor) -> CubeTensor {
+    let (scores, v) = (into_contiguous(scores), into_contiguous(v));
+    let (s, vs) = (scores.meta.shape().clone(), v.meta.shape().clone());
+    assert!(s.num_dims() == 3 && s[0] > 0 && s[1] > 0 && s[2] > 0, "softmax_flow: scores {s:?}");
+    assert!(vs.num_dims() == 3 && (vs[0] == 1 || vs[0] == s[0]) && vs[1] == s[2] && vs[2] == 2, "softmax_flow: v {vs:?} for scores {s:?}");
+    // The tree of softmax_flow_kernel sums 256 threads in 8 steps; rows as cubes in x, the batch in y
+    assert!(SOFTMAX_FLOW_THREADS == 256 && s[1] <= 65535 && s[0] <= 65535, "softmax_flow: {s:?}");
+    let dtype = scores.dtype;
+    let shape = softmax_flow_shape(&s, &vs);
+    let buffer = scores.client.empty(shape.num_elements() * dtype.size());
+    let out = CubeTensor::new_contiguous(scores.client.clone(), scores.device.clone(), shape, buffer, dtype);
+    let count = cubecl::CubeCount::Static(s[1] as u32, s[0] as u32, 1);
+    softmax_flow_kernel::launch(&out.client, count, CubeDim::new_2d(SOFTMAX_FLOW_THREADS as u32, 1), scores.into_tensor_arg(), v.into_tensor_arg(), out.clone().into_tensor_arg(), dtype_to_storage_type(dtype));
+    out
+}
+
 /// The lanes of a row in layer_norm_kernel, and the threads of its cubes (4 rows each)
 pub const LN_LANES: usize = 32;
 const LN_THREADS: usize = 128;
@@ -1778,6 +1878,8 @@ pub trait GmflowKernels: burn::backend::Backend {
     fn layer_norm(x: FloatTensor<Self>, gamma: FloatTensor<Self>, beta: FloatTensor<Self>, res: FloatTensor<Self>, has_res: bool) -> FloatTensor<Self>;
     #[fusion(dtype = x, shape = x)]
     fn instance_norm(x: FloatTensor<Self>, res: FloatTensor<Self>, relu_y: bool, has_res: bool) -> FloatTensor<Self>;
+    #[fusion(dtype = scores, shape = softmax_flow_shape(scores, v))]
+    fn softmax_flow(scores: FloatTensor<Self>, v: FloatTensor<Self>) -> FloatTensor<Self>;
     #[fusion(dtype = h, shape = h)]
     #[allow(clippy::too_many_arguments)]
     fn gru_gate(t0: FloatTensor<Self>, t1: FloatTensor<Self>, t2: FloatTensor<Self>, t3: FloatTensor<Self>, h: FloatTensor<Self>, z_three: bool, zo0: usize, zo1: usize, zo2: usize, qs0: usize, qo0: usize, qs1: usize, qo1: usize, qs2: usize, qo2: usize, update: bool) -> FloatTensor<Self>;
@@ -1824,6 +1926,9 @@ impl GmflowKernels for CubeBackend {
     }
     fn instance_norm(x: FloatTensor<Self>, res: FloatTensor<Self>, relu_y: bool, has_res: bool) -> FloatTensor<Self> {
         launch_instance_norm(x, has_res.then_some(res), relu_y)
+    }
+    fn softmax_flow(scores: FloatTensor<Self>, v: FloatTensor<Self>) -> FloatTensor<Self> {
+        launch_softmax_flow(scores, v)
     }
     #[allow(clippy::too_many_arguments)]
     fn gru_gate(t0: FloatTensor<Self>, t1: FloatTensor<Self>, t2: FloatTensor<Self>, t3: FloatTensor<Self>, h: FloatTensor<Self>, z_three: bool, zo0: usize, zo1: usize, zo2: usize, qs0: usize, qo0: usize, qs1: usize, qo1: usize, qs2: usize, qo2: usize, update: bool) -> FloatTensor<Self> {
@@ -1945,6 +2050,11 @@ pub fn layer_norm(x: BurnTensor<3>, gamma: BurnTensor<1>, beta: BurnTensor<1>, r
     let res = match res { Some(r) => r.reshape([b * l, c]).into_dispatch(), None => x.clone().into_dispatch() };
     let out: BurnTensor<2> = BurnTensor::from_dispatch(Dispatch::layer_norm(x.into_dispatch(), gamma.into_dispatch(), beta.into_dispatch(), res, has_res));
     out.reshape([b, l, c])
+}
+
+/// softmax(scores, 2) @ v: scores [B, N, L], v [1 or B, L, 2] -> [B, N, 2] in one launch (softmax_flow_kernel)
+pub fn softmax_flow(scores: BurnTensor<3>, v: BurnTensor<3>) -> BurnTensor<3> {
+    BurnTensor::from_dispatch(Dispatch::softmax_flow(scores.into_dispatch(), v.into_dispatch()))
 }
 
 /// InstanceNorm without affine parameters of x [N, C, H, W] with the model's epsilon (IN_EPS), then relu with relu_y,

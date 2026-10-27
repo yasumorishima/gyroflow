@@ -365,6 +365,20 @@ fn kernels_match_plain() {
             check(&format!("instance norm + relu + residual {label}"), kernels::instance_norm(x, true, Some(res.clone())), relu(res + relu(y)));
         }
     }
+    // Global matching and global propagation at 1/8 by softmax_flow_kernel (the softmax over the keys and its product with 2
+    // columns in one launch), against burn's softmax and matmul: the bidirectional pass's sizes with the 2 columns shared
+    // by the batch (the grid of positions) and per batch (the flow), scores of sd 3 (a peaked softmax, as the correlation
+    // is); 7 rows of 37 keys (fewer keys than threads) and of 300 (a cube's keys read in two rounds) with a batch of 3
+    {
+        use burn::tensor::activation::softmax;
+        let l8 = (H / 8) * (W / 8);
+        for (bn, n, l, vb, sd) in [(2usize, l8, l8, 1usize, 3.0f64), (2, l8, l8, 2, 3.0), (1, 7, 37, 1, 1.0), (3, 7, 300, 3, 10.0)] {
+            let scores = Tensor::<3>::random([bn, n, l], Distribution::Normal(0.0, sd), &device);
+            let v = Tensor::<3>::random([vb, l, 2], Distribution::Normal(0.0, 20.0), &device);
+            let want = softmax(scores.clone(), 2).matmul(if vb == 1 { v.clone().repeat_dim(0, bn) } else { v.clone() });
+            check(&format!("softmax_flow {bn}x{n}x{l} v{vb} sd{sd}"), kernels::softmax_flow(scores, v).unsqueeze_dim::<4>(0), want.unsqueeze_dim::<4>(0));
+        }
+    }
     // The factored GRU's gates by gru_gate_kernel against the plain operations of GruFactored::step (burn's sigmoid and
     // tanh), in the layouts of its two halves: 2 z/r terms and q from an extra tensor and a z/r term's (horizontal), 3
     // z/r terms and q from two of theirs (vertical). Pre-activations of sd 3 so that the sigmoid and tanh saturate, the
