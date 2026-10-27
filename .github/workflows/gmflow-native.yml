@@ -229,6 +229,9 @@ jobs:
         run: |
           cargo test --release --features "${{ matrix.features }}" --test native -- --ignored --nocapture --exact profile_passes > profile.raw 2>&1 || { tail -n 40 profile.raw; exit 1; }
           python3 ../profile_summary.py profile.raw "PROFILE-START" "PROFILE-END" 3 | tee profile.log
+      - name: The operations in each fused elementwise kernel, with its time
+        if: matrix.best != ''
+        run: if [ -f compile_1.log ]; then python3 ../fused_ops.py compile_1.log profile.log | tee fused_ops.log; fi
       - name: The compiled source of the gemm4 and implicit GEMM kernels, checked and unchecked
         if: matrix.best != ''
         env:
