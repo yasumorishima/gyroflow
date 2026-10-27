@@ -41,8 +41,12 @@ pub mod wgsl {
         }
     }
 
-    /// The tiling the measurements chose (round 7a: 64 x 64, k step 16, 128 threads)
-    pub const COOP_DEFAULT: CoopTile = CoopTile { bk: 16, sgr: 2, sgc: 2, fr: 4, fc: 4 };
+    /// The tiling the measurements chose: 64 x 32, k step 16, 128 threads, its 4 simdgroups one above the other (8 x
+    /// 32 fragments each). At the shapes of the model's kernels on the macOS 15 CI GPU (835ae31, ceiling) it was the
+    /// fastest or within 7 % of it at every one, against the 2 x 2 simdgroups of 4 x 4 fragments (64 x 64) chosen in
+    /// round 7a on the large matmuls: the transformer's projections at 1/8 0.52 -> 0.30 ms, the 3x3 and 1x5
+    /// convolutions 16 and 17 % faster, the FFN's 5 and 8 %, the projections at 1/4 the same
+    pub const COOP_DEFAULT: CoopTile = CoopTile { bk: 16, sgr: 4, sgc: 1, fr: 2, fc: 4 };
 
     /// The windows of split-window attention on an h x w map of tokens [B, h*w, C] (unimatch split_feature, as
     /// kernels::window_token): batch index bw = image * splits^2 + window, position p in the window row-major, the map
