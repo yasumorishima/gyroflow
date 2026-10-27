@@ -278,7 +278,10 @@ fn kernels_match_plain() {
         // random features differing by up to ~10 that is ~1e-4 (measured 1.10e-4 for flows just under integers on
         // lavapipe, after the 1e-4 set before measuring): 1e-3 as for local_correlation_softmax, still far under the
         // errors of order 1 of a wrong tap
-        let rounding_of_positions = label == "local_correlation_softmax" || label.contains("corr_with_flow") || label == "local_correlation_with_flow";
+        // softmax_flow: weighted sums of 2880 values up to ~50 (pixel coordinates in the model), in another order than
+        // burn's softmax then matmul; float32's step at 50 is 3.8e-6, and the sums differ by up to 1.56e-4 (lavapipe and
+        // macOS 15 at a2b7087, where the random inputs happened to give 1e-4 and over): 1e-3, far under a wrong weight
+        let rounding_of_positions = label == "local_correlation_softmax" || label.contains("corr_with_flow") || label == "local_correlation_with_flow" || label.starts_with("softmax_flow");
         let limit = if rounding_of_positions { 1e-3 } else { 1e-4 };
         println!("{label:28}: max |kernel - plain| {max:.2e}, mean {mean:.2e} (values up to {scale:.2e}, limit {limit:e})");
         if !(max <= limit) { failed.push(format!("{label}: {max:e}")); }
