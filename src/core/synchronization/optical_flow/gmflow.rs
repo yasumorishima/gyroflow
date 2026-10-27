@@ -327,8 +327,6 @@ mod inference {
     // to wrong flow; a kernel that fails to compile comes back as an error of the read, caught here too
     fn coop_works(device: &Device) -> Result<(), String> {
         use super::coop;
-        use burn::tensor::module::conv2d;
-        use burn::tensor::ops::ConvOptions;
         let values = |n: usize, scale: f32| -> Vec<f32> { (0..n).map(|i| ((i * 7919 % 101) as f32 / 50.0 - 1.0) * scale).collect() };
         let check = |what: &str, got: Vec<f32>, want: Vec<f32>| -> Result<(), String> {
             let largest = want.iter().fold(0f32, |m, v| m.max(v.abs()));
@@ -338,29 +336,54 @@ mod inference {
             }
             Ok(())
         };
+        // The references on the CPU, not burn's matmul and conv2d on the GPU: those would compile and autotune burn's
+        // kernels (convolutions above all) at every first start, for this check alone, as the model runs coop.rs
+        // a [batch, m, k] @ b [1, k, n]
+        let matmul = |a: &[f32], b: &[f32], batch: usize, m: usize, k: usize, n: usize| -> Vec<f32> {
+            let mut out = vec![0f32; batch * m * n];
+            for z in 0..batch { for i in 0..m { for j in 0..n {
+                out[(z * m + i) * n + j] = (0..k).map(|l| a[(z * m + i) * k + l] * b[l * n + j]).sum();
+            } } }
+            out
+        };
+        // x [batch, ci, h, w] * w [co, ci, kh, kw], stride 1, zero padding `pad`, no bias
+        let conv = |x: &[f32], w: &[f32], [batch, ci, h, wd]: [usize; 4], [co, kh, kw]: [usize; 3], pad: [usize; 2]| -> Vec<f32> {
+            let (oh, ow) = (h + 2 * pad[0] + 1 - kh, wd + 2 * pad[1] + 1 - kw);
+            let mut out = vec![0f32; batch * co * oh * ow];
+            for z in 0..batch { for o in 0..co { for y in 0..oh { for xx in 0..ow {
+                let mut sum = 0f32;
+                for c in 0..ci { for dy in 0..kh { for dx in 0..kw {
+                    let (iy, ix) = ((y + dy) as isize - pad[0] as isize, (xx + dx) as isize - pad[1] as isize);
+                    if iy < 0 || ix < 0 || iy >= h as isize || ix >= wd as isize { continue; }
+                    sum += x[((z * ci + c) * h + iy as usize) * wd + ix as usize] * w[((o * ci + c) * kh + dy) * kw + dx];
+                } } }
+                out[((z * co + o) * oh + y) * ow + xx] = sum;
+            } } } }
+            out
+        };
         let run = || -> Result<(), String> {
-            let a = Tensor::<3>::from_data(TensorData::new(values(2 * 72 * 40, 1.0), [2, 72, 40]), device);
-            let b = Tensor::<3>::from_data(TensorData::new(values(40 * 136, 0.5), [1, 40, 136]), device);
-            let got = coop::gemm(a.clone(), b.clone(), coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
-            let want = a.matmul(b).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
-            check("matmul [2,72,40] @ [1,40,136]", got, want)?;
-            let x = Tensor::<4>::from_data(TensorData::new(values(2 * 5 * 13 * 17, 1.0), [2, 5, 13, 17]), device);
-            let w = Tensor::<4>::from_data(TensorData::new(values(9 * 5 * 3 * 3, 0.5), [9, 5, 3, 3]), device);
-            let got = coop::conv2d(x.clone(), w.clone(), None, 1, [1, 1], coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
-            let want = conv2d(x, w, None, ConvOptions::new([1, 1], [1, 1], [1, 1], 1)).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
-            check("3x3 convolution 5 -> 9 of [2,5,13,17]", got, want)?;
+            let (av, bv) = (values(2 * 72 * 40, 1.0), values(40 * 136, 0.5));
+            let a = Tensor::<3>::from_data(TensorData::new(av.clone(), [2, 72, 40]), device);
+            let b = Tensor::<3>::from_data(TensorData::new(bv.clone(), [1, 40, 136]), device);
+            let got = coop::gemm(a, b, coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            check("matmul [2,72,40] @ [1,40,136]", got, matmul(&av, &bv, 2, 72, 40, 136))?;
+            let (xv, wv) = (values(2 * 5 * 13 * 17, 1.0), values(9 * 5 * 3 * 3, 0.5));
+            let x = Tensor::<4>::from_data(TensorData::new(xv.clone(), [2, 5, 13, 17]), device);
+            let w = Tensor::<4>::from_data(TensorData::new(wv.clone(), [9, 5, 3, 3]), device);
+            let got = coop::conv2d(x, w, None, 1, [1, 1], coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            check("3x3 convolution 5 -> 9 of [2,5,13,17]", got, conv(&xv, &wv, [2, 5, 13, 17], [9, 3, 3], [1, 1]))?;
             // The other texts the model compiles: whole tiles (no edges, no k guards: most of the model's sizes) and the
             // 1x1 convolutions (the weight shared by a batch of 2)
-            let a = Tensor::<3>::from_data(TensorData::new(values(64 * 32, 1.0), [1, 64, 32]), device);
-            let b = Tensor::<3>::from_data(TensorData::new(values(32 * 128, 0.5), [1, 32, 128]), device);
-            let got = coop::gemm(a.clone(), b.clone(), coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
-            let want = a.matmul(b).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
-            check("matmul [1,64,32] @ [1,32,128]", got, want)?;
-            let x = Tensor::<4>::from_data(TensorData::new(values(2 * 6 * 8 * 16, 1.0), [2, 6, 8, 16]), device);
-            let w = Tensor::<4>::from_data(TensorData::new(values(70 * 6, 0.5), [70, 6, 1, 1]), device);
-            let got = coop::conv2d(x.clone(), w.clone(), None, 1, [0, 0], coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
-            let want = conv2d(x, w, None, ConvOptions::new([1, 1], [0, 0], [1, 1], 1)).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
-            check("1x1 convolution 6 -> 70 of [2,6,8,16]", got, want)?;
+            let (av, bv) = (values(64 * 32, 1.0), values(32 * 128, 0.5));
+            let a = Tensor::<3>::from_data(TensorData::new(av.clone(), [1, 64, 32]), device);
+            let b = Tensor::<3>::from_data(TensorData::new(bv.clone(), [1, 32, 128]), device);
+            let got = coop::gemm(a, b, coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            check("matmul [1,64,32] @ [1,32,128]", got, matmul(&av, &bv, 1, 64, 32, 128))?;
+            let (xv, wv) = (values(2 * 6 * 8 * 16, 1.0), values(70 * 6, 0.5));
+            let x = Tensor::<4>::from_data(TensorData::new(xv.clone(), [2, 6, 8, 16]), device);
+            let w = Tensor::<4>::from_data(TensorData::new(wv.clone(), [70, 6, 1, 1]), device);
+            let got = coop::conv2d(x, w, None, 1, [0, 0], coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            check("1x1 convolution 6 -> 70 of [2,6,8,16]", got, conv(&xv, &wv, [2, 6, 8, 16], [70, 1, 1], [0, 0]))?;
             // Split-window attention (the gathered rows and the scattered output): shifted, windows of 60 positions (an
             // edge in every dimension of both matmuls), against the kernels' own
             // q, k and v from different offsets of the pattern (one sequence scaled would make q k^T symmetric, and a

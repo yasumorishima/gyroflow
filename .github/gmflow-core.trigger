@@ -25,3 +25,4 @@ round 8: fused LayerNorm (+ residual) in the transformer
 round 9: fused GRU gates
 round 10: fused InstanceNorm (+ relu, residual) in the CNN
 round 11: the load timed apart from the first pass (weights, coop check)
+round 12: coop_works against CPU references (no burn autotune at load)
