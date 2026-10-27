@@ -32,6 +32,9 @@ if not rows:
 total = sum(ms for ms, _ in rows)
 print(f"{len(rows) / passes:.0f} launches and {total / passes:.1f} ms of kernel time per pass "
       f"({passes} passes, {unmeasured} launches not measured)")
+# Each distinct full name is a pipeline compiled at the first pass (its shape and comptime arguments are in the name)
+print(f"{len({name for _, name in rows})} distinct kernels (full names), "
+      f"{len({re.split(r'[(<{\s]', name, 1)[0] for _, name in rows})} kernel families")
 for label, key in (("by kernel family", lambda n: re.split(r"[(<{\s]", n, 1)[0]), ("by full name", lambda n: n[:160])):
     agg = defaultdict(lambda: [0, 0.0])
     for ms, name in rows:
