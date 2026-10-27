@@ -28,3 +28,4 @@ round 11: the load timed apart from the first pass (weights, coop check)
 round 12: coop_works against CPU references (no burn autotune at load)
 round 13: softmax_flow in global matching and propagation; a second start measured
 round 14: a passed coop_works kept per GPU, driver and kernel sources
+round 15: GELU in fc2's loads, conv bias + relu as coop writes, the FFN's cat read by fc1
