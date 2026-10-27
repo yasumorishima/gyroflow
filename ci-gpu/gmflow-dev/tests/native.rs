@@ -421,6 +421,26 @@ fn kernels_match_plain() {
             let got = coop::conv2d_act(x, wt, bias, 1, pad, true, coop::wgsl::COOP_DEFAULT);
             check(&format!("coop conv + bias + relu {label}"), got, relu(plain));
         }
+        // A convolution on two maps' channels side by side (coop::conv2d_act_cat, coop::conv_gemm_cat), against coop.rs's
+        // convolution of their concatenation: the motion encoder's 3x3 on 192 + 64 channels (bias, relu) at 1/4, the
+        // GRU's 1x5 and 5x1 on the motion's 126 + 2 channels into 384, and 5 + 3 -> 45 on 37 x 53 (every edge)
+        for (label, nb, c1, c2, co, hh, ww, (kh, kw), epi) in [("3x3 192+64->126", 2usize, 192usize, 64usize, 126usize, h4, w4, (3usize, 3usize), true), ("1x5 126+2->384", 2, 126, 2, 384, h4, w4, (1, 5), false), ("5x1 126+2->384", 2, 126, 2, 384, h4, w4, (5, 1), false), ("3x3 5+3->45", 1, 5, 3, 45, 37, 53, (3, 3), true)] {
+            let (x1, x2) = (rnd([nb, c1, hh, ww], 1.0), rnd([nb, c2, hh, ww], 1.0));
+            let wt = rnd([co, c1 + c2, kh, kw], 0.05);
+            let pad = [kh / 2, kw / 2];
+            let cat = Tensor::cat(vec![x1.clone(), x2.clone()], 1);
+            let (got, want) = if epi {
+                let bias = Tensor::<1>::random([co], Distribution::Normal(0.0, 0.5), &device);
+                let want = coop::conv2d_act(cat, wt.clone(), Some(bias.clone()), 1, pad, true, coop::wgsl::COOP_DEFAULT);
+                (coop::conv2d_act_cat(x1, x2, wt, Some(bias), 1, pad, true, coop::wgsl::COOP_DEFAULT), want)
+            } else {
+                let wm = wt.reshape([1, co, (c1 + c2) * kh * kw]);
+                let want = coop::conv_gemm(wm.clone(), cat, kh, kw, 1, pad[0], pad[1], coop::wgsl::COOP_DEFAULT);
+                let got = coop::conv_gemm_cat(wm, x1, x2, kh, kw, 1, pad[0], pad[1], coop::wgsl::COOP_DEFAULT);
+                (got.reshape([nb, co, hh, ww]), want.reshape([nb, co, hh, ww]))
+            };
+            check(&format!("coop conv, x in two {label}"), got, want);
+        }
     }
     // The factored GRU's gates by gru_gate_kernel against the plain operations of GruFactored::step (burn's sigmoid and
     // tanh), in the layouts of its two halves: 2 z/r terms and q from an extra tensor and a z/r term's (horizontal), 3

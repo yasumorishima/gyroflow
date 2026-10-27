@@ -148,6 +148,19 @@ fn conv_fwd_relu(conv: &Conv2d, x: Tensor<4>, ops: Ops) -> Tensor<4> {
     relu(conv_fwd(conv, x, ops))
 }
 
+/// The padding of a convolution that coop::conv2d_act_cat runs on a concatenation of two maps (coop and `fused`, a
+/// gathered convolution of symmetric padding), or None
+fn cat_padding(conv: &Conv2d, ops: Ops) -> Option<[usize; 2]> {
+    if !(ops.coop && ops.fused && conv.stride[0] == conv.stride[1] && conv.dilation == [1, 1] && conv.groups == 1) {
+        return None;
+    }
+    match conv.padding {
+        PaddingConfig2d::Explicit(t, l, b, r) if t == b && l == r => Some([t, l]),
+        PaddingConfig2d::Valid => Some([0, 0]),
+        _ => None,
+    }
+}
+
 fn conv(channels: [usize; 2], kernel: [usize; 2], stride: usize, bias: bool, device: &Device) -> Conv2d {
     let (ph, pw) = (kernel[0] / 2, kernel[1] / 2);
     Conv2dConfig::new(channels, kernel)
@@ -810,12 +823,18 @@ impl BasicUpdateBlock {
         }
     }
 
-    fn motion(&self, flow: Tensor<4>, corr: Tensor<4>, ops: Ops) -> Tensor<4> {
+    /// The motion features, cat([out, flow], 1) of unimatch, as its two parts (out, flow): with coop and `fused` the
+    /// convolutions that read a concatenation gather its channels from the parts (coop::conv2d_act_cat), so it is not
+    /// made
+    fn motion(&self, flow: Tensor<4>, corr: Tensor<4>, ops: Ops) -> (Tensor<4>, Tensor<4>) {
         let e = &self.encoder;
         let cor = conv_fwd_relu(&e.convc2, conv_fwd_relu(&e.convc1, corr, ops), ops);
         let flo = conv_fwd_relu(&e.convf2, conv_fwd_relu(&e.convf1, flow.clone(), ops), ops);
-        let out = conv_fwd_relu(&e.conv, Tensor::cat(vec![cor, flo], 1), ops);
-        Tensor::cat(vec![out, flow], 1)
+        let out = match cat_padding(&e.conv, ops) {
+            Some(padding) => coop::conv2d_act_cat(cor, flo, e.conv.weight.val(), e.conv.bias.as_ref().map(|b| b.val()), e.conv.stride[0], padding, true, coop::wgsl::COOP_DEFAULT),
+            None => conv_fwd_relu(&e.conv, Tensor::cat(vec![cor, flo], 1), ops),
+        };
+        (out, flow)
     }
 
     fn gru(&self, h: Tensor<4>, x: Tensor<4>, ops: Ops) -> Tensor<4> {
@@ -834,10 +853,11 @@ impl BasicUpdateBlock {
 
     /// One refinement step: the new hidden state and the flow update
     fn forward(&self, net: Tensor<4>, inp: Tensor<4>, corr: Tensor<4>, flow: Tensor<4>, ops: Ops, factored: Option<(&GruFactored, &GruConstants)>) -> (Tensor<4>, Tensor<4>) {
-        let motion = self.motion(flow, corr, ops);
+        let (out, flow) = self.motion(flow, corr, ops);
         let net = match factored {
-            Some((g, c)) => g.step(c, net, motion, ops.conv_gemm(), ops.implicit, ops.fused),
-            None => self.gru(net, Tensor::cat(vec![inp, motion], 1), ops),
+            Some((g, c)) if ops.coop && ops.fused => g.step(c, net, out, Some(flow), ops.conv_gemm(), ops.implicit, ops.fused),
+            Some((g, c)) => g.step(c, net, Tensor::cat(vec![out, flow], 1), None, ops.conv_gemm(), ops.implicit, ops.fused),
+            None => self.gru(net, Tensor::cat(vec![inp, out, flow], 1), ops),
         };
         let delta = conv_fwd(&self.flow_head.conv2, conv_fwd_relu(&self.flow_head.conv1, net.clone(), ops), ops);
         (net, delta)
@@ -934,6 +954,18 @@ fn mmc(w: Tensor<3>, x: Tensor<4>, horizontal: bool, gemm: Gemm, implicit: bool)
     mm(w, gru_cols(x, horizontal), gemm)
 }
 
+/// mmc of cat([x, tail], 1); with coop the columns gathered from both (coop::conv_gemm_cat), not concatenated
+fn mmc_tail(w: Tensor<3>, x: Tensor<4>, tail: Option<Tensor<4>>, horizontal: bool, gemm: Gemm, implicit: bool) -> Tensor<3> {
+    match tail {
+        Some(t) if gemm == Gemm::Coop => {
+            let (kh, kw, ph, pw) = if horizontal { (1, 5, 0, 2) } else { (5, 1, 2, 0) };
+            coop::conv_gemm_cat(w, x, t, kh, kw, 1, ph, pw, coop::wgsl::COOP_DEFAULT)
+        }
+        Some(t) => mmc(w, Tensor::cat(vec![x, t], 1), horizontal, gemm, implicit),
+        None => mmc(w, x, horizontal, gemm, implicit),
+    }
+}
+
 /// What the GRU of every refinement step shares: h0 and inp are the same in all six (unimatch computes them again each
 /// time), so their parts of the convolutions are computed once. [N, C, H*W]
 pub struct GruConstants {
@@ -961,8 +993,15 @@ impl GruFactored {
         }
     }
 
-    /// SepConvGRU(h0, [inp, motion]), the same as `BasicUpdateBlock::gru` up to the order of the sums
-    pub fn step(&self, c: &GruConstants, h0: Tensor<4>, motion: Tensor<4>, gemm: Gemm, implicit: bool, fused: bool) -> Tensor<4> {
+    /// SepConvGRU(h0, [inp, motion]), the same as `BasicUpdateBlock::gru` up to the order of the sums; with `tail` the
+    /// motion is cat([motion, tail], 1), its convolutions gathering from both with coop (coop::conv_gemm_cat)
+    #[allow(clippy::too_many_arguments)]
+    pub fn step(&self, c: &GruConstants, h0: Tensor<4>, motion: Tensor<4>, tail: Option<Tensor<4>>, gemm: Gemm, implicit: bool, fused: bool) -> Tensor<4> {
+        let (motion, tail) = match tail {
+            Some(t) if gemm != Gemm::Coop => (Tensor::cat(vec![motion, t], 1), None),
+            tail => (motion, tail),
+        };
+        let mmc_motion = |w: Tensor<3>, horizontal: bool| mmc_tail(w, motion.clone(), tail.clone(), horizontal, gemm, implicit);
         let [n, ch, hh, ww] = h0.dims();
         let flat = |t: Tensor<4>| t.reshape([n, ch, hh * ww]);
         let map = |t: Tensor<3>| t.reshape([n, ch, hh, ww]);
@@ -970,13 +1009,13 @@ impl GruFactored {
             // The same sums, the gates by kernels::gru_gate: r * h, then the blend with tanh(q), for each half
             use kernels::QFrom;
             let h0f = flat(h0);
-            let m1 = mmc(self.zrq1_m.clone(), motion.clone(), true, gemm, implicit); // [N, 384, L]
+            let m1 = mmc_motion(self.zrq1_m.clone(), true); // [N, 384, L]
             let zr = [(c.zr1.clone(), 0), (m1, 0)];
             let rh = kernels::gru_gate(&zr, None, h0f.clone());
             let q = mmc(self.q1_h.clone(), map(rh), true, gemm, implicit);
             // q + c.q1 + m1 from channel 256
             let h1 = kernels::gru_gate(&zr, Some(((q, 0), Some(c.q1.clone()), [(QFrom::Extra, 0), (QFrom::Zr(1), 256)])), h0f);
-            let m2 = mmc(self.zrq2_m.clone(), motion, false, gemm, implicit);
+            let m2 = mmc_motion(self.zrq2_m.clone(), false);
             let zr = [(mmc(self.zr2_h.clone(), map(h1.clone()), false, gemm, implicit), 0), (c.zrq2.clone(), 0), (m2, 0)];
             let rh = kernels::gru_gate(&zr, None, h1.clone());
             let q = mmc(self.q2_h.clone(), map(rh), false, gemm, implicit);
@@ -985,7 +1024,7 @@ impl GruFactored {
         }
         let one_minus = |z: Tensor<3>| z.neg().add_scalar(1.0);
         // Horizontal
-        let m1 = mmc(self.zrq1_m.clone(), motion.clone(), true, gemm, implicit); // [N, 384, L]
+        let m1 = mmc_motion(self.zrq1_m.clone(), true); // [N, 384, L]
         let zr = c.zr1.clone() + m1.clone().narrow(1, 0, 256);
         let z = sigmoid(zr.clone().narrow(1, 0, 128));
         let r = sigmoid(zr.narrow(1, 128, 128));
@@ -993,7 +1032,7 @@ impl GruFactored {
         let q = tanh(mmc(self.q1_h.clone(), map(r * h0f.clone()), true, gemm, implicit) + c.q1.clone() + m1.narrow(1, 256, 128));
         let h1 = one_minus(z.clone()) * h0f + z * q;
         // Vertical
-        let m2 = mmc(self.zrq2_m.clone(), motion, false, gemm, implicit);
+        let m2 = mmc_motion(self.zrq2_m.clone(), false);
         let zr = mmc(self.zr2_h.clone(), map(h1.clone()), false, gemm, implicit) + c.zrq2.clone().narrow(1, 0, 256) + m2.clone().narrow(1, 0, 256);
         let z = sigmoid(zr.clone().narrow(1, 0, 128));
         let r = sigmoid(zr.narrow(1, 128, 128));
