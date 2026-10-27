@@ -311,7 +311,13 @@ impl TransformerLayer {
                 let [nb, l, _] = x.dims();
                 let per_image = l * mlp.fc1.weight.val().dims()[1] * 4;
                 let chunk = (IM2COL_MAX_BYTES / per_image).max(1);
-                let ffn = |x: Tensor<3>, source: Tensor<3>| norm(norm2, lin(&mlp.fc2, gelu(lin(&mlp.fc1, x, gemm)), gemm), Some(source), fused);
+                // With coop and `fused` the GELU is taken as fc2's matmul reads fc1's output (lin_gelu_in), not as a pass of
+                // its own over the [tokens, 1024] tensor
+                let ffn = |x: Tensor<3>, source: Tensor<3>| {
+                    let hidden = lin(&mlp.fc1, x, gemm);
+                    let out = if gemm == Gemm::Coop && fused { lin_gelu_in(&mlp.fc2, hidden) } else { lin(&mlp.fc2, gelu(hidden), gemm) };
+                    norm(norm2, out, Some(source), fused)
+                };
                 if nb <= chunk {
                     ffn(x, source)
                 } else {
@@ -363,6 +369,18 @@ fn lin(l: &Linear, x: Tensor<3>, gemm: Gemm) -> Tensor<3> {
     let (x, w) = (x.reshape([1, b * n, k]), w.unsqueeze_dim::<3>(0));
     let out = if gemm == Gemm::Coop { coop::gemm(x, w, coop::wgsl::COOP_DEFAULT) } else { kernels::gemm(x, w, None) };
     let out = out.reshape([b, n, d_out]);
+    match &l.bias {
+        Some(bias) => out + bias.val().reshape([1, 1, d_out]),
+        None => out,
+    }
+}
+
+/// lin(l, gelu(x), Coop) with the GELU taken as coop.rs's matmul reads x (coop::gemm_gelu_a)
+fn lin_gelu_in(l: &Linear, x: Tensor<3>) -> Tensor<3> {
+    let [b, n, k] = x.dims();
+    let w = l.weight.val(); // [d_input, d_output]
+    let d_out = w.dims()[1];
+    let out = coop::gemm_gelu_a(x.reshape([1, b * n, k]), w.unsqueeze_dim::<3>(0), coop::wgsl::COOP_DEFAULT).reshape([b, n, d_out]);
     match &l.bias {
         Some(bias) => out + bias.val().reshape([1, 1, d_out]),
         None => out,

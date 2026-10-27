@@ -379,6 +379,20 @@ fn kernels_match_plain() {
             check(&format!("softmax_flow {bn}x{n}x{l} v{vb} sd{sd}"), kernels::softmax_flow(scores, v).unsqueeze_dim::<4>(0), want.unsqueeze_dim::<4>(0));
         }
     }
+    // The FFN's second matmul with the GELU of its input taken as coop.rs reads it (coop::gemm_gelu_a), against burn's
+    // GELU then the same matmul: the bidirectional pass's 1/4 tokens of 1024 channels (vec4 loads of a), and 37 rows of 13
+    // (scalar loads, every edge); inputs of sd 2, so that the GELU's negative side and its tail both matter
+    if coop_offered() {
+        use burn::tensor::activation::gelu;
+        use gmflow_dev::coop;
+        for (rows, k, n) in [(2 * (H / 4) * (W / 4), 1024usize, 128usize), (37, 13, 70)] {
+            let a = Tensor::<3>::random([1, rows, k], Distribution::Normal(0.0, 2.0), &device);
+            let b = Tensor::<3>::random([1, k, n], Distribution::Normal(0.0, 0.05), &device);
+            let want = coop::gemm(gelu(a.clone()), b.clone(), coop::wgsl::COOP_DEFAULT);
+            let got = coop::gemm_gelu_a(a, b, coop::wgsl::COOP_DEFAULT);
+            check(&format!("coop gemm, gelu of a {rows}x{k}x{n}"), got.unsqueeze_dim::<4>(0), want.unsqueeze_dim::<4>(0));
+        }
+    }
     // The factored GRU's gates by gru_gate_kernel against the plain operations of GruFactored::step (burn's sigmoid and
     // tanh), in the layouts of its two halves: 2 z/r terms and q from an extra tensor and a z/r term's (horizontal), 3
     // z/r terms and q from two of theirs (vertical). Pre-activations of sd 3 so that the sigmoid and tanh saturate, the
