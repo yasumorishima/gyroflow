@@ -66,6 +66,8 @@ mod inference {
     // Whether the device GPU holds has cooperative matrices for coop.rs: WGSL kernels and the feature enabled (set by
     // init with the device it returns)
     static COOP_DEVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    // How long the load took, in seconds: the weights onto the GPU, and coop_works (for the log and the tests)
+    static LOAD_TIMES: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
     /// The model on the device with the constants of the input size
     pub struct Runner {
@@ -271,7 +273,9 @@ mod inference {
     fn runner_on(device: &Device) -> Result<std::sync::Arc<Runner>, String> {
         let mut slot = RUNNER.lock();
         if let Some(r) = &*slot { return Ok(r.clone()); }
+        let loading = Instant::now();
         let model = load_model(device)?;
+        let weights_secs = loading.elapsed().as_secs_f64();
         let mut statics = Statics::new(MODEL_H, MODEL_W, device);
         // Without f32 matrix units: convolutions as im2col, their matmuls (and the GRU's and the transformer's linear
         // layers) by kernels::gemm (WGSL on the macOS CI GPU: the linear layers too, 3.08 s a pass against 3.29 s)
@@ -285,10 +289,14 @@ mod inference {
         // Every matmul and convolution on the matrix units through WGSL cooperative matrices (coop.rs) where the device
         // offers them, measured on the Apple GPU of the macOS CI only (the convolutions run once each 121 -> 70 ms): macOS
         // (not iOS, which CI only compiles), and checked against burn on the device first
+        let checking = Instant::now();
         let coop = implicit && cfg!(target_os = "macos") && coop_offered() && match coop_works(device) {
             Ok(()) => true,
             Err(why) => { log::warn!("gmflow: cooperative matrices not used: {}", why); false }
         };
+        let check_secs = checking.elapsed().as_secs_f64();
+        log::info!("gmflow: weights loaded in {:.2} s, cooperative matrices checked in {:.2} s", weights_secs, check_secs);
+        *LOAD_TIMES.lock() = Some((weights_secs, check_secs));
         statics.ops = Ops { conv_im2col: own, own_gemm: gemm, gemm_linear: gemm, fused: own, implicit, coop, ..OPS };
         log::info!("gmflow: convolutions {}", match (own, gemm, implicit) {
             _ if coop => "and linear layers by cooperative-matrix kernels (coop.rs; the 2 outputs of the flow head by kernels::conv_small)",
@@ -403,6 +411,10 @@ mod inference {
             _ => false,
         }
     }
+
+    // How long the load took (the weights, coop_works), for the tests
+    #[cfg(test)]
+    pub fn load_times() -> Option<(f64, f64)> { *LOAD_TIMES.lock() }
 
     // How the convolutions run on the loaded model, for the tests
     #[cfg(test)]
@@ -872,6 +884,11 @@ mod tests {
             let bytes = std::fs::read(dir.join(&name)).unwrap_or_else(|e| panic!("{name}: {e}"));
             bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
         };
+        // The GPU picked and the weights loaded before the first pass, so that its time is the kernels' (compiled, tuned)
+        let started = std::time::Instant::now();
+        inference::prepare().expect("gmflow is not ready");
+        let (weights, check) = inference::load_times().unwrap_or_default();
+        println!("ready in {:.3} s: weights loaded {weights:.3} s, cooperative matrices checked {check:.3} s", started.elapsed().as_secs_f64());
         let mut checked = 0;
         for k in 0.. {
             if !dir.join(format!("pair{k}_torch.f32")).exists() { break; }

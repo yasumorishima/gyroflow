@@ -24,3 +24,4 @@ round 7c: audit fixes (window guard order, coop_works window attention)
 round 8: fused LayerNorm (+ residual) in the transformer
 round 9: fused GRU gates
 round 10: fused InstanceNorm (+ relu, residual) in the CNN
+round 11: the load timed apart from the first pass (weights, coop check)
