@@ -1,0 +1,34 @@
+# Work branch only (never part of #1143): builds the hand-written gmflow (src/core/.../gmflow/model.rs) on its own, without
+# the rest of gyroflow-core, to check it against PyTorch and time it on the CI GPUs quickly
+[package]
+name = "gmflow-dev"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+burn-store = { version = "=0.22.1", default-features = false, features = ["std", "pytorch"] }
+burn-cubecl = { version = "=0.22.1" }
+cubecl = { version = "=0.11.1" }
+# burn's interpolation with a given strategy (interp_diag.rs)
+cubek = { version = "=0.3.1", default-features = false, features = ["interpolate"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+burn = { version = "=0.22.1", default-features = false, features = ["std", "autotune", "fusion", "cubecl", "extension", "wgpu"] }
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+burn = { version = "=0.22.1", default-features = false, features = ["std", "autotune", "fusion", "cubecl", "extension", "vulkan"] }
+
+[dev-dependencies]
+# The CPU preprocessing of Gyroflow (gmflow.rs), which the GPU one must match
+image = { version = "=0.25.10", default-features = false }
+# The WGSL -> MSL translation of wgpu 30 on Metal, run on the logged kernel sources (naga_msl)
+naga = { version = "=30.0.1", features = ["wgsl-in", "msl-out"] }
+
+[features]
+# Native MSL kernels on Metal (cooperative matrices), falling back to WGSL where the device or the compiler lacks it
+msl = ["burn/metal"]
+
+[profile.release]
+debug = false
