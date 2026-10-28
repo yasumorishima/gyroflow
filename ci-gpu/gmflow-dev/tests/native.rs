@@ -1186,7 +1186,7 @@ fn compile_cost() {
                 println!("{label}: not a coop.rs shape ({why})");
                 continue;
             }
-            let src = wgsl::source(shape, COOP_DEFAULT);
+            let src = wgsl::source_with(shape, COOP_DEFAULT, wgsl::Opts::default());
             let bytes = src.len();
             let t0 = Instant::now();
             // As cubecl creates them: trusted, no runtime checks (bounds are the kernel's own)

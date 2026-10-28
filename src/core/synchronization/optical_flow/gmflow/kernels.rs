@@ -771,8 +771,8 @@ fn launch_gemm4(a: CubeTensor, b: CubeTensor, bias: Option<CubeTensor>, tile: Ge
 /// out [N, Co, OH*OW], OH*OW a multiple of 4. Each output is summed over k in the same order as im2col + gemm4. The sizes
 /// are compile-time constants, one kernel per shape (the batch stays a launch dimension), so that the kernel reads none
 /// of cubecl's metadata: naga binds that buffer in device memory where cubecl's own MSL takes it as constant, and with
-/// wgpu-hal patched to bind it as constant this kernel took 17.2 against 27.6 ms on WGSL (the 3x3 256->192 at 1/4,
-/// macOS 15; rounds 6f and 6g). Whether the constants alone give that time is what round 6h measures
+/// wgpu-hal patched to bind it as constant this kernel took 17.2 against 27.6 ms on WGSL (the 3x3 256->192 at 1/4, the
+/// macOS 15 CI GPU)
 #[cube(launch, launch_unchecked)]
 fn conv_gemm4_kernel<F: Float, N: Size>(
     a: &Tensor<F>,                  // [1, Co, K]
@@ -852,8 +852,8 @@ fn conv_gemm4_kernel<F: Float, N: Size>(
         if t < tile_b {
             let mut vb = zv;
             let k = k0 + bkk;
-            // Nested tests, no && (round 6c: naga turns each && of WGSL into branches on a local bool; removing them
-            // alone did not change the time)
+            // Nested tests, no && (naga turns each && of WGSL into branches on a local bool; removing them alone did
+            // not change the time)
             if k < k_n {
                 if n0 + bc < nv {
                     let c = k / khw;

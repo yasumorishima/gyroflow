@@ -81,7 +81,7 @@ fn coop_source() {
     ];
     for (i, (label, shape)) in shapes.iter().enumerate() {
         for (tl, tile) in TILES {
-            let src = wgsl::source(*shape, tile);
+            let src = wgsl::source_with(*shape, tile, wgsl::Opts::default());
             let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{label}, {tl}: {}\n{src}", e.emit_to_string(&src)));
             let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
                 .validate(&module)

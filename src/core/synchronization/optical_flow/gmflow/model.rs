@@ -1119,8 +1119,6 @@ pub struct Gmflow {
 
 /// The size-dependent constants of one input size
 pub struct Statics {
-    pub h: usize,
-    pub w: usize,
     pub eighth: Windows,
     pub quarter: Windows,
     /// ImageNet mean and std, [1, 3, 1, 1]
@@ -1134,8 +1132,6 @@ impl Statics {
         assert!(h % 32 == 0 && w % 32 == 0, "gmflow needs a size divisible by 32 (the 8 window splits at 1/4), got {w}x{h}");
         let c3 = |v: [f32; 3]| Tensor::<4>::from_data(TensorData::new(v.to_vec(), [1, 3, 1, 1]), device);
         Self {
-            h,
-            w,
             eighth: Windows::new(h / 8, w / 8, 2, device),
             quarter: Windows::new(h / 4, w / 4, 8, device),
             mean: c3([0.485, 0.456, 0.406]),

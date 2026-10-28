@@ -42,9 +42,9 @@ pub mod wgsl {
     }
 
     /// The tiling the measurements chose: 64 x 32, k step 16, 128 threads, its 4 simdgroups one above the other (8 x
-    /// 32 fragments each). At the shapes of the model's kernels on the macOS 15 CI GPU (835ae31, ceiling) it was the
-    /// fastest or within 7 % of it at every one, against the 2 x 2 simdgroups of 4 x 4 fragments (64 x 64) chosen in
-    /// round 7a on the large matmuls: the transformer's projections at 1/8 0.52 -> 0.30 ms, the 3x3 and 1x5
+    /// 32 fragments each). At the shapes of the model's kernels on the macOS 15 CI GPU it was the fastest of 8 tilings
+    /// or within 7 % of it at every one, against the 2 x 2 simdgroups of 4 x 4 fragments (64 x 64) chosen first on the
+    /// large matmuls: the transformer's projections at 1/8 0.52 -> 0.30 ms, the 3x3 and 1x5
     /// convolutions 16 and 17 % faster, the FFN's 5 and 8 %, the projections at 1/4 the same
     pub const COOP_DEFAULT: CoopTile = CoopTile { bk: 16, sgr: 4, sgc: 1, fr: 2, fc: 4 };
 
@@ -174,11 +174,6 @@ pub mod wgsl {
         }
     }
 
-    /// The kernel, entry point `main`, bindings a, b (or x), c in that order
-    pub fn source(shape: CoopShape, tile: CoopTile) -> String {
-        source_with(shape, tile, Opts::default())
-    }
-
     /// What a launch does besides c = a @ b. `a_gelu`: the GELU of a taken as each element of a is read (a row-major
     /// matrix only): the FFN's second matmul on the first's output, so that the GELU is not a pass of its own over that
     /// [tokens, 1024] tensor; burn's GELU, x (1 + erf(x / sqrt 2)) / 2, erf by its polyfill (Abramowitz and Stegun
@@ -203,6 +198,7 @@ pub mod wgsl {
         pub kv_swap: usize,
     }
 
+    /// The kernel, entry point `main`, bindings a, b (or x), c, then those of `opts` (bias, a2, x2) in that order
     pub fn source_with(shape: CoopShape, tile: CoopTile, opts: Opts) -> String {
         if let Some(why) = unsupported(shape, tile) {
             panic!("coop gemm: {why}");
@@ -234,7 +230,7 @@ pub mod wgsl {
         emit!("");
         // Every binding read_write although a and b are only read: the layout comes from the shader (a precompiled kernel
         // has no representation to take it from), and cubecl places tensors in shared pages, so a, b and c can be slices
-        // of one wgpu buffer, which wgpu refuses to bind both read-only and read-write (round 7a; cubecl declares its own
+        // of one wgpu buffer, which wgpu refuses to bind both read-only and read-write (cubecl declares its own
         // kernels' bindings all read-write for that reason, backend/wgsl.rs)
         let ty = |v: bool| if v { "array<vec4<f32>>" } else { "array<f32>" };
         emit!("@group(0) @binding(0) var<storage, read_write> a: {};", ty(va));

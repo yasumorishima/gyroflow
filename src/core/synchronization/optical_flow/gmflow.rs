@@ -405,24 +405,24 @@ mod inference {
             let (av, bv) = (values(2 * 72 * 40, 1.0), values(40 * 136, 0.5));
             let a = Tensor::<3>::from_data(TensorData::new(av.clone(), [2, 72, 40]), device);
             let b = Tensor::<3>::from_data(TensorData::new(bv.clone(), [1, 40, 136]), device);
-            let got = coop::gemm(a, b, coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            let got = coop::gemm(a, b, coop::wgsl::COOP_DEFAULT).into_data().try_to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
             check("matmul [2,72,40] @ [1,40,136]", got, matmul(&av, &bv, 2, 72, 40, 136))?;
             let (xv, wv) = (values(2 * 5 * 13 * 17, 1.0), values(9 * 5 * 3 * 3, 0.5));
             let x = Tensor::<4>::from_data(TensorData::new(xv.clone(), [2, 5, 13, 17]), device);
             let w = Tensor::<4>::from_data(TensorData::new(wv.clone(), [9, 5, 3, 3]), device);
-            let got = coop::conv2d(x, w, None, 1, [1, 1], coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            let got = coop::conv2d(x, w, None, 1, [1, 1], coop::wgsl::COOP_DEFAULT).into_data().try_to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
             check("3x3 convolution 5 -> 9 of [2,5,13,17]", got, conv(&xv, &wv, [2, 5, 13, 17], [9, 3, 3], [1, 1]))?;
             // The other texts the model compiles: whole tiles (no edges, no k guards: most of the model's sizes) and the
             // 1x1 convolutions (the weight shared by a batch of 2)
             let (av, bv) = (values(64 * 32, 1.0), values(32 * 128, 0.5));
             let a = Tensor::<3>::from_data(TensorData::new(av.clone(), [1, 64, 32]), device);
             let b = Tensor::<3>::from_data(TensorData::new(bv.clone(), [1, 32, 128]), device);
-            let got = coop::gemm(a, b, coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            let got = coop::gemm(a, b, coop::wgsl::COOP_DEFAULT).into_data().try_to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
             check("matmul [1,64,32] @ [1,32,128]", got, matmul(&av, &bv, 1, 64, 32, 128))?;
             let (xv, wv) = (values(2 * 6 * 8 * 16, 1.0), values(70 * 6, 0.5));
             let x = Tensor::<4>::from_data(TensorData::new(xv.clone(), [2, 6, 8, 16]), device);
             let w = Tensor::<4>::from_data(TensorData::new(wv.clone(), [70, 6, 1, 1]), device);
-            let got = coop::conv2d(x, w, None, 1, [0, 0], coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            let got = coop::conv2d(x, w, None, 1, [0, 0], coop::wgsl::COOP_DEFAULT).into_data().try_to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
             check("1x1 convolution 6 -> 70 of [2,6,8,16]", got, conv(&xv, &wv, [2, 6, 8, 16], [70, 1, 1], [0, 0]))?;
             // Split-window attention (the gathered rows and the scattered output): shifted, windows of 60 positions (an
             // edge in every dimension of both matmuls), against the kernels' own
@@ -430,8 +430,8 @@ mod inference {
             // transposed scores matrix would pass)
             let tokens = |skip: usize, scale: f32| Tensor::<3>::from_data(TensorData::new(values(2 * 12 * 20 * 36 + skip, scale).split_off(skip), [2, 12 * 20, 36]), device);
             let (q, k, v) = (tokens(0, 1.0), tokens(13, 0.7), tokens(29, 0.5));
-            let got = coop::window_attention(q.clone(), k.clone(), v.clone(), 12, 20, 2, true, coop::wgsl::COOP_DEFAULT).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
-            let want = super::kernels::window_attention(q, k, v, 12, 20, 2, true).into_data().to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            let got = coop::window_attention(q.clone(), k.clone(), v.clone(), 12, 20, 2, true, coop::wgsl::COOP_DEFAULT).into_data().try_to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
+            let want = super::kernels::window_attention(q, k, v, 12, 20, 2, true).into_data().try_to_vec::<f32>().map_err(|e| format!("{e:?}"))?;
             check("shifted window attention of [2,240,36] in 2x2 windows", got, want)
         };
         // What this cannot catch: a wgpu error raised where cubecl records the launch (binding, dispatch) panics on cubecl's
@@ -622,13 +622,6 @@ mod inference {
     pub fn forward(in0: Vec<f32>, in1: Vec<f32>) -> Result<Vec<f32>, String> {
         let shape = [1usize, 3, MODEL_H, MODEL_W];
         run(|r, device| r.model.forward(Tensor::from_data(TensorData::new(in0, shape), device), Tensor::from_data(TensorData::new(in1, shape), device), &r.statics))
-    }
-
-    // The letterbox of the GPU for a test: [1, 3, MODEL_H, MODEL_W]
-    #[cfg(test)]
-    pub fn model_input_of(img: &GrayImage) -> Result<Vec<f32>, String> {
-        let f = frame(img);
-        run(|_, device| model_input(&f, device))
     }
 
     // One pass on a device of the caller's (tests: a GPU set up with smaller limits), weights loaded for it
