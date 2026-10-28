@@ -119,6 +119,19 @@ fn conv_fwd(conv: &Conv2d, x: Tensor<4>, ops: Ops) -> Tensor<4> {
             return coop::conv2d(x, conv.weight.val(), conv.bias.as_ref().map(|b| b.val()), conv.stride[0], padding, coop::wgsl::COOP_DEFAULT);
         }
     }
+    // 1x1 convolutions by the implicit GEMM kernel too with the own matmul: burn's convolution autotunes its matmul at the
+    // first pass, which compiled and timed candidate kernels for minutes on an NVIDIA GPU through Vulkan (a Tesla T4: 190 of
+    // the 211 s of a first start)
+    if ops.own_gemm && kh == 1 && kw == 1 && conv.stride[0] == conv.stride[1] && conv.dilation == [1, 1] && conv.groups == 1 {
+        let padding = match conv.padding {
+            PaddingConfig2d::Explicit(t, l, b, r) if t == b && l == r => Some([t, l]),
+            PaddingConfig2d::Valid => Some([0, 0]),
+            _ => None,
+        };
+        if let Some(padding) = padding {
+            return kernels::conv2d_implicit(x, conv.weight.val(), conv.bias.as_ref().map(|b| b.val()), conv.stride[0], padding);
+        }
+    }
     if !ops.conv_im2col || (kh == 1 && kw == 1) || conv.stride[0] != conv.stride[1] { return conv.forward(x); }
     match conv.padding {
         PaddingConfig2d::Explicit(t, l, b, r) if t == b && l == r => {
@@ -389,15 +402,14 @@ fn norm(n: &LayerNorm, x: Tensor<3>, residual: Option<Tensor<3>>, fused: bool) -
     }
 }
 
-/// Coop stays Coop, anything else is burn's: for the matmuls that kernels::gemm never ran (the propagation, the global
-/// correlation), so that the configurations without coop run them as before
-fn coop_or_burn(gemm: Gemm) -> Gemm {
-    if gemm == Gemm::Coop { Gemm::Coop } else { Gemm::Burn }
-}
-
-/// a [B, M, K] @ b [B, K, N]: burn's matmul, or coop::gemm with Coop (Own: burn's, kernels::gemm is not used here)
+/// a [B, M, K] @ b [B, K, N]: coop::gemm with Coop, kernels::gemm with Own (burn's matmul autotunes at the first pass:
+/// minutes of compiling candidate kernels on an NVIDIA GPU through Vulkan), burn's matmul otherwise
 fn bmm(a: Tensor<3>, b: Tensor<3>, gemm: Gemm) -> Tensor<3> {
-    if gemm == Gemm::Coop { coop::gemm(a, b, coop::wgsl::COOP_DEFAULT) } else { a.matmul(b) }
+    match gemm {
+        Gemm::Coop => coop::gemm(a, b, coop::wgsl::COOP_DEFAULT),
+        Gemm::Own => kernels::gemm(a, b, None),
+        Gemm::Burn => a.matmul(b),
+    }
 }
 
 /// A linear layer on [B, L, C]: burn's, or kernels::gemm or coop::gemm on the B * L rows at once (as burn folds them)
@@ -723,7 +735,7 @@ impl SelfAttnPropagation {
     /// (kernels::softmax_flow), burn's otherwise
     fn global(&self, feature0: Tensor<4>, flow: Tensor<4>, gemm: Gemm, fused: bool) -> Tensor<4> {
         let [b, c, h, w] = feature0.dims();
-        let g = coop_or_burn(gemm);
+        let g = gemm;
         let q = lin(&self.q_proj, feature0.reshape([b, c, h * w]).swap_dims(1, 2), g);
         let k = lin(&self.k_proj, q.clone(), g);
         let v = flow.reshape([b, 2, h * w]).swap_dims(1, 2);
@@ -736,7 +748,7 @@ impl SelfAttnPropagation {
     /// zeros (score 0, still in the softmax) and a flow of zeros
     fn local(&self, feature0: Tensor<4>, flow: Tensor<4>, r: usize, with_kernels: bool, gemm: Gemm) -> Tensor<4> {
         let [b, c, h, w] = feature0.dims();
-        let g = coop_or_burn(gemm);
+        let g = gemm;
         let tokens = feature0.reshape([b, c, h * w]).swap_dims(1, 2);
         let as_map = |t: Tensor<3>| t.swap_dims(1, 2).reshape([b, c, h, w]);
         let q = as_map(lin(&self.q_proj, tokens.clone(), g));
