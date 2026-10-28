@@ -285,11 +285,11 @@ mod inference {
         // layers) by kernels::gemm (WGSL on the macOS CI GPU: the linear layers too, 3.08 s a pass against 3.29 s)
         let own = im2col_is_faster(device);
         let gemm = own && gemm_fits(device);
-        // The convolutions of more than 1x1 by implicit GEMM instead of im2col + kernels::gemm: measured on Apple GPUs
-        // only (WGSL on the macOS 14 CI GPU: 1.67 -> 1.35 s a pass), so not on the AMD and Intel GPUs of Intel Macs. It
-        // needs the sizes as compile-time constants there (kernels::conv_gemm4_kernel: naga binds cubecl's metadata in
-        // device memory on Metal)
-        let implicit = gemm && cfg!(target_vendor = "apple") && on_apple_gpu();
+        // The convolutions of more than 1x1 by implicit GEMM instead of im2col + kernels::gemm, where it was measured:
+        // Apple GPUs (WGSL on the macOS 14 CI GPU: 1.67 -> 1.35 s a pass; it needs the sizes as compile-time constants
+        // there, kernels::conv_gemm4_kernel: naga binds cubecl's metadata in device memory on Metal) and NVIDIA GPUs
+        // through Vulkan (SPIR-V on a Tesla T4: 0.412 -> 0.343 s a pass). Not on AMD, Intel or mobile GPUs, unmeasured
+        let implicit = gemm && ((cfg!(target_vendor = "apple") && on_apple_gpu()) || on_nvidia_gpu());
         // Every matmul and convolution on the matrix units through WGSL cooperative matrices (coop.rs) where the device
         // offers them, measured on the Apple GPU of the macOS CI only (the convolutions run once each 121 -> 70 ms): macOS
         // (not iOS, which CI only compiles), and checked on the device first (coop_works; once per GPU, driver and kernels)
@@ -318,6 +318,11 @@ mod inference {
     // Paravirtual device), not an AMD or Intel GPU of an Intel Mac
     fn on_apple_gpu() -> bool {
         gpu().map(|(_, name)| name.starts_with("wgpu: Apple")).unwrap_or(false)
+    }
+
+    // The adapter's PCI vendor is NVIDIA's (ADAPTER ends with vendor:device)
+    fn on_nvidia_gpu() -> bool {
+        ADAPTER.get().map(|a| a.rsplit(" | ").next().is_some_and(|ids| ids.starts_with("10de:"))).unwrap_or(false)
     }
 
     // A passed coop_works is kept in the kernel cache's directory with what it held for: the adapter (its driver too) and
