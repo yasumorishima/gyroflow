@@ -30,3 +30,4 @@ round 13: softmax_flow in global matching and propagation; a second start measur
 round 14: a passed coop_works kept per GPU, driver and kernel sources
 round 15: GELU in fc2's loads, conv bias + relu as coop writes, the FFN's cat read by fc1
 round 16: the refinement's cats read in place, cross-attention without swap_halves, coop tiling 64 x 32
+round 17: implicit GEMM on NVIDIA; 1x1 convs and the correlation/propagation matmuls on the own kernels (no autotune)
