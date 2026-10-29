@@ -5,7 +5,7 @@ name: gmflow core
 
 on:
   push:
-    branches: ['cand/gmflow-merge-2']
+    branches: ['cand/gmflow-rebase-1']
   workflow_dispatch:
 
 permissions:
